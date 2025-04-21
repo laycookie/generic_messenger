@@ -1,9 +1,9 @@
-use std::sync::Arc;
-
 use auth::AuthStore;
 use iced::{window, Element, Task};
-use pages::{chat::MessangerWindow, Login, MyAppMessage, Page};
-use smol::lock::RwLock;
+use pages::{
+    chat::{Message as ChatMessage, MessangerWindow},
+    Login, MyAppMessage, Page,
+};
 
 mod auth;
 mod pages;
@@ -23,24 +23,29 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 struct App {
+    auth_store: AuthStore,
     memoryless_page: Box<dyn Page>,
 }
 impl Default for App {
     fn default() -> Self {
         let auth_store = AuthStore::new("./LoginInfo".into());
-        let is_store_empty = auth_store.is_empty();
-        let auth_store = Arc::new(RwLock::new(auth_store));
 
         let memoryless_page: Box<dyn Page>;
-        if is_store_empty {
-            memoryless_page = Box::new(Login::new(auth_store.clone()));
+        if auth_store.is_empty() {
+            memoryless_page = Box::new(Login::new());
         } else {
-            let m =
-                smol::block_on(async { MessangerWindow::new(auth_store.clone()).await.unwrap() });
+            let m = smol::block_on(async {
+                MessangerWindow::new(auth_store.get_messangers().to_vec())
+                    .await
+                    .unwrap()
+            });
             memoryless_page = Box::new(m);
         }
 
-        Self { memoryless_page }
+        Self {
+            memoryless_page,
+            auth_store,
+        }
     }
 }
 impl App {
@@ -48,13 +53,30 @@ impl App {
         "record"
     }
     fn update(&mut self, message: MyAppMessage) -> impl Into<Task<MyAppMessage>> {
-        match self.memoryless_page.update(message) {
-            pages::UpdateResult::Page(page) => {
-                self.memoryless_page = page;
+        match message {
+            MyAppMessage::OpenChat(chat) => {
+                self.auth_store.save_to_disk();
+                self.memoryless_page = Box::new(chat);
                 Task::none()
             }
-            pages::UpdateResult::Task(task) => task,
-            pages::UpdateResult::None => Task::none(),
+            MyAppMessage::AddAuth(auth) => {
+                self.auth_store.add_auth(auth.into());
+                let m = MessangerWindow::new(self.auth_store.get_messangers().to_vec());
+                Task::perform(async move { m.await.unwrap() }, |chat| {
+                    MyAppMessage::OpenChat(chat)
+                })
+            }
+            MyAppMessage::LoadConversation(msgs_store) => {
+                let a = self.auth_store.get_messangers()[0].clone().auth;
+                Task::perform(
+                    async move {
+                        let pq = a.param_query().unwrap();
+                        pq.get_messanges(msgs_store, None).await.unwrap()
+                    },
+                    |f| MyAppMessage::Chat(ChatMessage::OpenConversation(f)),
+                )
+            }
+            _ => self.memoryless_page.update(message),
         }
     }
     fn view(&self, _window: window::Id) -> Element<MyAppMessage> {

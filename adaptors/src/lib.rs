@@ -1,4 +1,4 @@
-use std::error::Error;
+use std::{error::Error, fmt::Debug};
 
 use async_trait::async_trait;
 use types::{Message, MsgsStore, User};
@@ -24,6 +24,13 @@ impl PartialEq for dyn Messanger {
         format!("{}{}", self.name(), self.auth()) == format!("{}{}", other.name(), other.auth())
     }
 }
+impl Debug for dyn Messanger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Messanger")
+            .field("Service", &self.name())
+            .finish()
+    }
+}
 
 // TODO: Remove the async trait when we will be able to create safe objects out
 // of traits with async functions
@@ -36,7 +43,7 @@ pub trait MessangerQuery {
 }
 
 #[async_trait]
-pub trait ParameterizedMessangerQuery {
+pub trait ParameterizedMessangerQuery: Send + Sync {
     async fn get_messanges(
         &self,
         msgs_location: MsgsStore,

@@ -1,8 +1,8 @@
 use std::{collections::HashMap, error::Error, fmt::Debug, sync::Arc};
 
-use crate::AuthStore;
+use crate::auth::Messanger;
 
-use super::{MyAppMessage, Page, UpdateResult};
+use super::{MyAppMessage, Page};
 use adaptors::types::{Message as ChatMessage, MsgsStore, User};
 use futures::{future::try_join_all, try_join};
 use iced::{
@@ -11,14 +11,13 @@ use iced::{
         scrollable::{Direction, Scrollbar},
         Button, Column, Scrollable, Text, TextInput,
     },
-    Alignment, ContentFit, Length,
+    Alignment, ContentFit, Length, Task,
 };
-use smol::lock::RwLock;
 
 #[derive(Debug, Clone)]
 pub enum Message {
     OpenContacts,
-    OpenConversation(MsgsStore),
+    OpenConversation(Vec<ChatMessage>),
 }
 
 // TODO: Automate
@@ -30,7 +29,6 @@ impl Into<MyAppMessage> for Message {
 //
 #[derive(Clone)]
 pub struct MessangerWindow {
-    auth_store: Arc<RwLock<AuthStore>>,
     main: Main,
     messangers_data: Vec<MsngrData>,
 }
@@ -60,12 +58,7 @@ enum Main {
 }
 
 impl MessangerWindow {
-    pub async fn new(
-        auth_store: Arc<RwLock<AuthStore>>,
-    ) -> Result<Self, Arc<dyn Error + Sync + Send>> {
-        let store = auth_store.read().await;
-        let m = store.get_messangers();
-
+    pub async fn new(m: Vec<Messanger>) -> Result<Self, Arc<dyn Error + Sync + Send>> {
         let reqs = m.iter().map(async move |m| {
             let q = m.auth.query().unwrap();
             try_join!(
@@ -88,10 +81,7 @@ impl MessangerWindow {
             })
             .collect::<Vec<_>>();
 
-        drop(store);
-
         let window = MessangerWindow {
-            auth_store,
             main: Main::Contacts,
             messangers_data: msngrs,
         };
@@ -101,24 +91,17 @@ impl MessangerWindow {
 }
 
 impl Page for MessangerWindow {
-    fn update(&mut self, message: MyAppMessage) -> UpdateResult<MyAppMessage> {
+    fn update(&mut self, message: MyAppMessage) -> Task<MyAppMessage> {
         if let MyAppMessage::Chat(message) = message {
             match message {
-                Message::OpenConversation(msgs_store) => {
-                    smol::block_on(async {
-                        let auths = self.auth_store.read().await;
-                        let a = &auths.get_messangers()[0].auth;
-                        let pq = a.param_query().unwrap();
-
-                        let mess = pq.get_messanges(msgs_store, None).await.unwrap();
-                        self.main = Main::Chat { messages: mess };
-                    });
+                Message::OpenConversation(mess) => {
+                    self.main = Main::Chat { messages: mess };
                 }
                 Message::OpenContacts => self.main = Main::Contacts,
             }
         }
 
-        UpdateResult::None
+        Task::none()
     }
 
     fn view(&self) -> iced::Element<MyAppMessage> {
@@ -161,7 +144,7 @@ impl Page for MessangerWindow {
                     .map(|i| {
                         Button::new(i.name.as_str())
                             .width(Length::Fill)
-                            .on_press(Message::OpenConversation(i.to_owned()).into())
+                            .on_press(MyAppMessage::LoadConversation(i.to_owned()).into())
                     })
                     .fold(Column::new(), |column, widget| column.push(widget))
             ]

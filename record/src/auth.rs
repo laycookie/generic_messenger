@@ -4,13 +4,15 @@ use std::{
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::PathBuf,
     str::FromStr,
+    sync::Arc,
 };
 
 use crate::pages::login::Platform;
 
 // TODO: Check why this req. pub
+#[derive(Clone)]
 pub(crate) struct Messanger {
-    pub(crate) auth: Box<dyn Auth>,
+    pub(crate) auth: Arc<dyn Auth>,
     save_to_disk: bool,
 }
 
@@ -43,8 +45,8 @@ impl<'a> AuthStore {
             };
 
             // In theory should never return false
-            let auth: Box<dyn Auth> = match Platform::from_str(platform).unwrap() {
-                Platform::Discord => Box::new(Discord::new(token)),
+            let auth: Arc<dyn Auth> = match Platform::from_str(platform).unwrap() {
+                Platform::Discord => Arc::new(Discord::new(token)),
                 Platform::Test => todo!(),
             };
 
@@ -90,7 +92,7 @@ impl<'a> AuthStore {
         self.messangers.is_empty()
     }
 
-    fn contains_auth(&self, auth: &Box<dyn Auth>) -> bool {
+    fn contains_auth(&self, auth: &Arc<dyn Auth>) -> bool {
         for i in self.get_messangers() {
             if &i.auth == auth {
                 return true;
@@ -107,7 +109,7 @@ impl<'a> AuthStore {
     //     self.auth_change_listeners.push(callback);
     // }
 
-    pub fn add_auth(&mut self, auth: Box<dyn Auth>) -> bool {
+    pub fn add_auth(&mut self, auth: Arc<dyn Auth>) -> bool {
         if !self.contains_auth(&auth) {
             self.messangers.push(Messanger {
                 auth,
