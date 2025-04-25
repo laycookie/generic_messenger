@@ -1,8 +1,8 @@
-use std::{collections::HashMap, error::Error, fmt::Debug, sync::Arc};
+use std::{error::Error, fmt::Debug, sync::Arc};
 
-use crate::auth::Messanger;
+use crate::{auth::Messanger, AuthStore};
 
-use super::{MyAppMessage, Page};
+use super::MyAppMessage;
 use adaptors::types::{Message as ChatMessage, MsgsStore, User};
 use futures::{future::try_join_all, try_join};
 use iced::{
@@ -17,7 +17,8 @@ use iced::{
 #[derive(Debug, Clone)]
 pub enum Message {
     OpenContacts,
-    OpenConversation(Vec<ChatMessage>),
+    LoadConversation(MsgsStore, Vec<ChatMessage>),
+    OpenConversation(MsgsStore),
 }
 
 // TODO: Automate
@@ -48,17 +49,19 @@ struct MsngrData {
     contacts: Vec<User>,
     conversations: Vec<MsgsStore>,
     guilds: Vec<MsgsStore>,
-    chat: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
 enum Main {
     Contacts,
-    Chat { messages: Vec<ChatMessage> },
+    Chat {
+        _location: MsgsStore,
+        messages: Vec<ChatMessage>,
+    },
 }
 
 impl MessangerWindow {
-    pub async fn new(m: Vec<Messanger>) -> Result<Self, Arc<dyn Error + Sync + Send>> {
+    pub(crate) async fn new(m: Vec<Messanger>) -> Result<Self, Arc<dyn Error + Sync + Send>> {
         let reqs = m.iter().map(async move |m| {
             let q = m.auth.query().unwrap();
             try_join!(
@@ -77,7 +80,6 @@ impl MessangerWindow {
                 contacts,
                 conversations,
                 guilds,
-                chat: HashMap::new(),
             })
             .collect::<Vec<_>>();
 
@@ -90,21 +92,49 @@ impl MessangerWindow {
     }
 }
 
-impl Page for MessangerWindow {
-    fn update(&mut self, message: MyAppMessage) -> Task<MyAppMessage> {
-        if let MyAppMessage::Chat(message) = message {
-            match message {
-                Message::OpenConversation(mess) => {
-                    self.main = Main::Chat { messages: mess };
+pub enum Action {
+    None,
+    Run(Task<Message>),
+}
+
+impl MessangerWindow {
+    // impl PageT<Message, Action> for MessangerWindow {
+    pub(crate) fn update(&mut self, message: Message, auth_store: &AuthStore) -> Action {
+        match message {
+            Message::LoadConversation(msgs_store, mess) => {
+                self.main = Main::Chat {
+                    _location: msgs_store,
+                    messages: mess,
+                };
+                return Action::None;
+            }
+            Message::OpenConversation(msgs_store) => {
+                for messanger in auth_store.get_messangers() {
+                    let auth = messanger.auth.clone();
+                    let msgs_store = msgs_store.clone();
+                    if msgs_store.origin_uuid == auth.uuid() {
+                        return Action::Run(Task::perform(
+                            async move {
+                                let pq = auth.param_query().unwrap();
+                                (
+                                    msgs_store.clone(),
+                                    pq.get_messanges(&msgs_store, None).await.unwrap(),
+                                )
+                            },
+                            |(msgs_store, mess)| Message::LoadConversation(msgs_store, mess),
+                        ));
+                    }
                 }
-                Message::OpenContacts => self.main = Main::Contacts,
+                return Action::None;
+            }
+            Message::OpenContacts => {
+                self.main = Main::Contacts;
+                Action::None
             }
         }
-
-        Task::none()
     }
 
-    fn view(&self) -> iced::Element<MyAppMessage> {
+    pub(crate) fn view(&self) -> iced::Element<Message> {
         let options = row![Text::new(&self.messangers_data[0].profile.username)];
 
         let navbar = Scrollable::new(
@@ -136,7 +166,7 @@ impl Page for MessangerWindow {
                         .width(Length::Fill)
                         .align_x(Alignment::Center)
                 )
-                .on_press(MyAppMessage::Chat(Message::OpenContacts))
+                .on_press(Message::OpenContacts)
                 .width(Length::Fill),
                 self.messangers_data[0]
                     .conversations
@@ -144,7 +174,7 @@ impl Page for MessangerWindow {
                     .map(|i| {
                         Button::new(i.name.as_str())
                             .width(Length::Fill)
-                            .on_press(MyAppMessage::LoadConversation(i.to_owned()).into())
+                            .on_press(Message::OpenConversation(i.to_owned()).into())
                     })
                     .fold(Column::new(), |column, widget| column.push(widget))
             ]
@@ -166,7 +196,7 @@ impl Page for MessangerWindow {
                         .fold(Column::new(), |column, widget| column.push(widget)),
                 )
             }
-            Main::Chat { messages } => {
+            Main::Chat { messages, .. } => {
                 let chat = Column::new();
                 let chat = chat.push(
                     Scrollable::new(
@@ -185,3 +215,4 @@ impl Page for MessangerWindow {
         column![options, row![navbar, sidebar, main]].into()
     }
 }
+

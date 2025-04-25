@@ -47,7 +47,18 @@ impl MessangerQuery for Discord {
 
         let conversations = channels
             .iter()
-            .map(|channel| channel.into())
+            .map(|channel| MsgsStore {
+                origin_uuid: self.uuid,
+                id: channel.id.clone(),
+                name: channel
+                    .clone()
+                    .name
+                    .unwrap_or(match channel.recipients.get(0) {
+                        Some(test) => test.username.clone(),
+                        None => "Fix later".to_string(),
+                    }),
+                icon: None,
+            })
             .collect::<Vec<_>>();
 
         *self.dms.write().unwrap() = channels;
@@ -65,6 +76,7 @@ impl MessangerQuery for Discord {
         let a = guilds.iter().map(async move |g| {
             let Some(hash) = &g.icon else {
                 return MsgsStore {
+                    origin_uuid: self.uuid,
                     id: g.id.clone(),
                     name: g.name.clone(),
                     icon: None,
@@ -83,6 +95,7 @@ impl MessangerQuery for Discord {
             .await;
 
             MsgsStore {
+                origin_uuid: self.uuid,
                 // hash: None,
                 id: g.id.clone(),
                 name: g.name.clone(),
@@ -104,7 +117,7 @@ impl MessangerQuery for Discord {
 impl ParameterizedMessangerQuery for Discord {
     async fn get_messanges(
         &self,
-        msgs_location: MsgsStore,
+        msgs_location: &MsgsStore,
         load_from_msg: Option<GlobalMessage>,
     ) -> Result<Vec<GlobalMessage>, Box<dyn Error + Sync + Send>> {
         let before = match load_from_msg {

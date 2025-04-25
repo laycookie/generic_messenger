@@ -3,10 +3,8 @@ use iced::{
     widget::{column, combo_box::State, Button, Column, ComboBox, Container, TextInput},
     Alignment, Element, Task,
 };
-use std::{error, fmt::Display, sync::Arc};
+use std::{fmt::Display, sync::Arc};
 use strum::EnumString;
-
-use super::{chat::MessangerWindow, MyAppMessage, Page, UpdateResult};
 
 // TODO: Make adapters handle the functionality of this enum
 #[derive(Debug, Clone, EnumString)]
@@ -48,19 +46,22 @@ pub enum Message {
     PlatformInput(Platform),
     TokenInput(String),
     SubmitToken,
+    LoginSuccess(Arc<dyn Messanger>),
 }
-// TODO: Automate
-impl Into<MyAppMessage> for Message {
-    fn into(self) -> MyAppMessage {
-        MyAppMessage::Login(self)
-    }
-}
-//
 
+pub enum Action {
+    None,
+    Run(Task<Message>),
+    Login(Arc<dyn Messanger>),
+}
+
+#[derive(Debug, Clone)]
 pub struct Login {
     platform: State<Platform>,
     selected_platform: Platform,
     token: String,
+    // TODO: Display error
+    _error: Option<String>,
 }
 impl Login {
     pub fn new() -> Self {
@@ -70,34 +71,46 @@ impl Login {
             platform: service,
             selected_platform: Platform::Test,
             token: String::new(),
+            _error: None,
         }
     }
 }
-impl Page for Login {
-    fn update(&mut self, message: MyAppMessage) -> Task<MyAppMessage> {
-        if let MyAppMessage::Login(message) = message {
-            match message {
-                Message::PlatformInput(platform) => self.selected_platform = platform,
-                Message::TokenInput(change) => self.token = change,
-                Message::SubmitToken => {
-                    // TODO: Disable submit button until the operation ether
-                    let auth = self.selected_platform.to_messanger(self.token.clone());
-                    return Task::perform(async { auth }, |auth| MyAppMessage::AddAuth(auth));
-                }
+
+impl Login {
+    pub(crate) fn update(&mut self, message: Message) -> Action {
+        match message {
+            Message::PlatformInput(platform) => {
+                self.selected_platform = platform;
+            }
+            Message::TokenInput(change) => {
+                self.token = change;
+            }
+            Message::SubmitToken => {
+                // TODO: Disable submit button until the operation ether
+                let platform = self.selected_platform.clone();
+                let token = self.token.clone();
+
+                let messanger = platform.to_messanger(token);
+                return Action::Run(Task::future(
+                    async move { Message::LoginSuccess(messanger) },
+                ));
+            }
+            Message::LoginSuccess(messenger) => {
+                return Action::Login(messenger);
             }
         }
 
-        Task::none()
+        Action::None
     }
 
-    fn view(&self) -> Element<MyAppMessage> {
+    pub(crate) fn view(&self) -> iced::Element<Message> {
         let width = 360.0;
 
         let select_platform = ComboBox::new(
             &self.platform,
             "Platform",
             Some(&self.selected_platform),
-            |platform| MyAppMessage::Login(Message::PlatformInput(platform)),
+            |platform| Message::PlatformInput(platform),
         );
 
         let auth_input = self
@@ -107,7 +120,7 @@ impl Page for Login {
             .filter_map(|method| match method {
                 LoginMethods::Token => Some(Element::from(
                     TextInput::new("Token", self.token.as_str())
-                        .on_input(|text| MyAppMessage::Login(Message::TokenInput(text))),
+                        .on_input(|text| Message::TokenInput(text)),
                 )),
                 LoginMethods::Unkown => None,
             })
@@ -117,7 +130,7 @@ impl Page for Login {
             "Login",
             select_platform,
             auth_input,
-            Button::new("Submit").on_press(MyAppMessage::Login(Message::SubmitToken))
+            Button::new("Submit").on_press(Message::SubmitToken)
         ]
         .width(iced::Length::Fixed(width))
         .align_x(Alignment::Center)
@@ -131,3 +144,4 @@ impl Page for Login {
             .into()
     }
 }
+

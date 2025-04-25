@@ -1,4 +1,4 @@
-use crate::types::{Message as GlobalMessage, MsgsStore, User as GlobalUser};
+use crate::types::{Message as GlobalMessage, User as GlobalUser};
 use serde::Deserialize;
 use serde_repr::Deserialize_repr;
 
@@ -117,19 +117,6 @@ pub struct Channel {
     pub(crate) name: Option<String>,
     pub(crate) recipients: Vec<Recipient>,
 }
-impl From<&Channel> for MsgsStore {
-    fn from(val: &Channel) -> Self {
-        MsgsStore {
-            // hash: None,
-            id: val.id.clone(),
-            name: val.clone().name.unwrap_or(match val.recipients.get(0) {
-                Some(test) => test.username.clone(),
-                None => "Fix later".to_string(),
-            }),
-            icon: None,
-        }
-    }
-}
 
 #[derive(Deserialize, Debug)]
 pub struct CountDetails {
@@ -234,13 +221,3 @@ pub struct Guild {
     // pub incidents_data: Option<IncidentsData>,
 }
 
-impl Into<MsgsStore> for &Guild {
-    fn into(self) -> MsgsStore {
-        MsgsStore {
-            // hash: None,
-            id: self.id.clone(),
-            name: self.name.clone(),
-            icon: None,
-        }
-    }
-}

@@ -10,3 +10,4 @@ serde_repr = "0.1.19"
 futures = "0.3.31"
 async-trait = "0.1.83"
 macro = { path = "../macro" }
+uuid = { version = "1.16.0", features = ["v4"] }

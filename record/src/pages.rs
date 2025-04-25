@@ -1,32 +1,19 @@
 pub mod chat;
 pub mod login;
 
-use std::{fmt::Debug, sync::Arc};
-
-use adaptors::{types::MsgsStore, Messanger};
-use chat::{Message as MessangerMessage, MessangerWindow};
-use iced::Task;
+use chat::Message as MessangerMessage;
 pub use login::Login;
 use login::Message as LoginMessage;
 
-#[derive(Debug, Clone)]
+use crate::Page;
+
+#[derive(Debug)]
 pub enum MyAppMessage {
     // Actions
-    AddAuth(Arc<dyn Messanger>),
-    LoadConversation(MsgsStore),
-    OpenChat(MessangerWindow),
+    OpenPage(Page),
+    AuthDiskSync,
     // Pages
     Login(LoginMessage),
     Chat(MessangerMessage),
 }
 
-pub enum UpdateResult<M> {
-    Page(Box<dyn Page>),
-    Task(Task<M>),
-    None,
-}
-
-pub trait Page {
-    fn update(&mut self, message: MyAppMessage) -> Task<MyAppMessage>;
-    fn view(&self) -> iced::Element<MyAppMessage>;
-}

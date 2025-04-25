@@ -8,4 +8,3 @@ adaptors = { path = "../adaptors" }
 iced = { version = "0.13.1",  features = ["image"] }
 strum = { version = "0.27.1", features = ["derive"] }
 futures = "0.3.31"
-smol = "2.0.2"

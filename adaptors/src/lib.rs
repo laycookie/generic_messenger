@@ -1,16 +1,19 @@
-use std::{error::Error, fmt::Debug};
+use std::error::Error;
+use std::fmt::Debug;
 
 use async_trait::async_trait;
 use types::{Message, MsgsStore, User};
+use uuid::Uuid;
 
 pub mod discord;
 mod network;
 pub mod types;
 
-pub trait Messanger: Send + Sync {
+pub trait Messanger: Send + Sync + Debug {
     // ID & Auth
     fn name(&self) -> String;
     fn auth(&self) -> String;
+    fn uuid(&self) -> Uuid;
     // Features - TODO: Replace when up-casting will become stable https://github.com/rust-lang/rust/issues/65991
     fn query(&self) -> Option<&dyn MessangerQuery> {
         None
@@ -22,13 +25,6 @@ pub trait Messanger: Send + Sync {
 impl PartialEq for dyn Messanger {
     fn eq(&self, other: &Self) -> bool {
         format!("{}{}", self.name(), self.auth()) == format!("{}{}", other.name(), other.auth())
-    }
-}
-impl Debug for dyn Messanger {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Messanger")
-            .field("Service", &self.name())
-            .finish()
     }
 }
 
@@ -43,10 +39,11 @@ pub trait MessangerQuery {
 }
 
 #[async_trait]
-pub trait ParameterizedMessangerQuery: Send + Sync {
+pub trait ParameterizedMessangerQuery {
     async fn get_messanges(
         &self,
-        msgs_location: MsgsStore,
+        msgs_location: &MsgsStore,
         load_from_msg: Option<Message>,
     ) -> Result<Vec<Message>, Box<dyn Error + Sync + Send>>;
 }
+
