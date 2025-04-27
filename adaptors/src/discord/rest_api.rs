@@ -1,16 +1,17 @@
 use async_trait::async_trait;
 use futures::future::join_all;
+use serde_json::json;
 use std::error::Error;
 
 use crate::{
     MessangerQuery, ParameterizedMessangerQuery,
     network::{cache_download, http_request},
-    types::{Message as GlobalMessage, MsgsStore, User},
+    types::{Message as GlobalMessage, Store, User},
 };
 
 use super::{
     Discord,
-    json_structs::{Channel, Friend, Guild, Message, Profile},
+    json_structs::{Channel, CreateMessage, Friend, Guild, Message, Profile},
 };
 
 impl Discord {
@@ -38,7 +39,7 @@ impl MessangerQuery for Discord {
         .await?;
         Ok(friends.iter().map(|friend| friend.clone().into()).collect())
     }
-    async fn get_conversation(&self) -> Result<Vec<MsgsStore>, Box<dyn Error + Sync + Send>> {
+    async fn get_conversation(&self) -> Result<Vec<Store>, Box<dyn Error + Sync + Send>> {
         let channels = http_request::<Vec<Channel>>(
             surf::get("https://discord.com/api/v10/users/@me/channels"),
             self.get_auth_header(),
@@ -47,8 +48,9 @@ impl MessangerQuery for Discord {
 
         let conversations = channels
             .iter()
-            .map(|channel| MsgsStore {
+            .map(|channel| Store {
                 origin_uuid: self.uuid,
+                hash: None,
                 id: channel.id.clone(),
                 name: channel
                     .clone()
@@ -66,7 +68,7 @@ impl MessangerQuery for Discord {
 
         Ok(conversations)
     }
-    async fn get_guilds(&self) -> Result<Vec<MsgsStore>, Box<dyn Error + Sync + Send>> {
+    async fn get_guilds(&self) -> Result<Vec<Store>, Box<dyn Error + Sync + Send>> {
         let guilds = http_request::<Vec<Guild>>(
             surf::get("https://discord.com/api/v10/users/@me/guilds"),
             self.get_auth_header(),
@@ -75,8 +77,9 @@ impl MessangerQuery for Discord {
 
         let a = guilds.iter().map(async move |g| {
             let Some(hash) = &g.icon else {
-                return MsgsStore {
+                return Store {
                     origin_uuid: self.uuid,
+                    hash: None,
                     id: g.id.clone(),
                     name: g.name.clone(),
                     icon: None,
@@ -94,9 +97,9 @@ impl MessangerQuery for Discord {
             )
             .await;
 
-            MsgsStore {
+            Store {
                 origin_uuid: self.uuid,
-                // hash: None,
+                hash: None,
                 id: g.id.clone(),
                 name: g.name.clone(),
                 icon: match icon {
@@ -115,9 +118,11 @@ impl MessangerQuery for Discord {
 
 #[async_trait]
 impl ParameterizedMessangerQuery for Discord {
+    // Docs: https://discord.com/developers/docs/resources/channel#get-channel
+    // https://discord.com/developers/docs/resources/message#get-channel-message
     async fn get_messanges(
         &self,
-        msgs_location: &MsgsStore,
+        msgs_location: &Store,
         load_from_msg: Option<GlobalMessage>,
     ) -> Result<Vec<GlobalMessage>, Box<dyn Error + Sync + Send>> {
         let before = match load_from_msg {
@@ -134,6 +139,42 @@ impl ParameterizedMessangerQuery for Discord {
         )
         .await?;
 
-        Ok(messages.iter().map(|message| message.into()).collect())
+        Ok(messages
+            .iter()
+            .map(|message| GlobalMessage {
+                id: message.id.clone(),
+                sender: msgs_location.clone(),
+                text: message.content.clone(),
+            })
+            .collect())
+    }
+
+    // Docs: https://discord.com/developers/docs/resources/message#create-message
+    async fn send_message(
+        &self,
+        location: &Store,
+        contents: String,
+    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+        let message = CreateMessage {
+            content: Some(contents),
+            nonce: None,
+            enforce_nonce: None,
+            tts: Some(false),
+            flags: Some(0),
+            mobile_network_type: None,
+        };
+
+        let req = http_request::<Vec<Message>>(
+            surf::post(format!(
+                "https://discord.com/api/v9/channels/{}/messages",
+                location.id,
+            ))
+            .body_json(&message)
+            .unwrap(),
+            self.get_auth_header(),
+        )
+        .await;
+
+        Ok(())
     }
 }

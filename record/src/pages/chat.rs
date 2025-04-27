@@ -1,9 +1,11 @@
 use std::{error::Error, fmt::Debug, sync::Arc};
 
-use crate::{auth::Messanger, AuthStore};
+use crate::AuthStore;
 
-use super::MyAppMessage;
-use adaptors::types::{Message as ChatMessage, MsgsStore, User};
+use adaptors::{
+    types::{Message as ChatMessage, Store, User},
+    Messanger as Auth,
+};
 use futures::{future::try_join_all, try_join};
 use iced::{
     widget::{
@@ -15,55 +17,52 @@ use iced::{
 };
 
 #[derive(Debug, Clone)]
-pub enum Message {
-    OpenContacts,
-    LoadConversation(MsgsStore, Vec<ChatMessage>),
-    OpenConversation(MsgsStore),
+struct MessangerData {
+    profile: User,
+    contacts: Vec<User>,
+    conversations: Vec<Store>,
+    guilds: Vec<Store>,
 }
 
-// TODO: Automate
-impl Into<MyAppMessage> for Message {
-    fn into(self) -> MyAppMessage {
-        MyAppMessage::Chat(self)
-    }
+#[derive(Debug, Clone)]
+pub(crate) enum Message {
+    OpenScreen(Screen),
+    LoadConversation(Store),
+    MessageInput(String),
+    MessageSend,
 }
-//
-#[derive(Clone)]
+
+#[derive(Debug, Clone)]
+enum Screen {
+    Contacts,
+    Chat {
+        auth: Arc<dyn Auth>,
+        meta_data: Store,
+        messages: Vec<ChatMessage>,
+        msg: String,
+    },
+}
+
 pub struct MessangerWindow {
-    main: Main,
-    messangers_data: Vec<MsngrData>,
+    screen: Screen,
+    messangers_data: Vec<MessangerData>,
 }
 impl Debug for MessangerWindow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MessangerWindow")
             .field("auth_store", &"TODO: Find a way to print this")
-            .field("main", &self.main)
+            .field("main", &self.screen)
             .field("messangers_data", &self.messangers_data)
             .finish()
     }
 }
 
-#[derive(Debug, Clone)]
-struct MsngrData {
-    profile: User,
-    contacts: Vec<User>,
-    conversations: Vec<MsgsStore>,
-    guilds: Vec<MsgsStore>,
-}
-
-#[derive(Debug, Clone)]
-enum Main {
-    Contacts,
-    Chat {
-        _location: MsgsStore,
-        messages: Vec<ChatMessage>,
-    },
-}
-
 impl MessangerWindow {
-    pub(crate) async fn new(m: Vec<Messanger>) -> Result<Self, Arc<dyn Error + Sync + Send>> {
-        let reqs = m.iter().map(async move |m| {
-            let q = m.auth.query().unwrap();
+    pub(crate) async fn new(
+        auths: Vec<Arc<dyn Auth>>,
+    ) -> Result<Self, Arc<dyn Error + Sync + Send>> {
+        let reqs = auths.iter().map(async move |auth| {
+            let q = auth.query().unwrap();
             try_join!(
                 q.get_profile(),
                 q.get_conversation(),
@@ -72,10 +71,10 @@ impl MessangerWindow {
             )
         });
 
-        let msngrs = try_join_all(reqs)
+        let messangers_data = try_join_all(reqs)
             .await?
             .into_iter()
-            .map(|(profile, conversations, contacts, guilds)| MsngrData {
+            .map(|(profile, conversations, contacts, guilds)| MessangerData {
                 profile,
                 contacts,
                 conversations,
@@ -84,8 +83,8 @@ impl MessangerWindow {
             .collect::<Vec<_>>();
 
         let window = MessangerWindow {
-            main: Main::Contacts,
-            messangers_data: msngrs,
+            screen: Screen::Contacts,
+            messangers_data,
         };
 
         Ok(window)
@@ -98,38 +97,72 @@ pub enum Action {
 }
 
 impl MessangerWindow {
-    // impl PageT<Message, Action> for MessangerWindow {
     pub(crate) fn update(&mut self, message: Message, auth_store: &AuthStore) -> Action {
         match message {
-            Message::LoadConversation(msgs_store, mess) => {
-                self.main = Main::Chat {
-                    _location: msgs_store,
-                    messages: mess,
+            Message::OpenScreen(screen) => {
+                self.screen = screen;
+                return Action::None;
+            }
+            Message::LoadConversation(msgs_store) => {
+                let auth = auth_store
+                    .get_auths()
+                    .into_iter()
+                    .find(|auth| msgs_store.origin_uuid == auth.uuid())
+                    .clone();
+
+                if let Some(auth) = auth {
+                    let future = async move {
+                        let msgs = {
+                            let pq = auth.param_query().unwrap();
+                            pq.get_messanges(&msgs_store, None).await.unwrap()
+                        };
+
+                        (auth, msgs_store, msgs)
+                    };
+
+                    return Action::Run(Task::perform(future, |(auth, msgs_store, mess)| {
+                        Message::OpenScreen(Screen::Chat {
+                            auth,
+                            meta_data: msgs_store,
+                            messages: mess,
+                            msg: String::new(),
+                        })
+                    }));
                 };
-                return Action::None;
-            }
-            Message::OpenConversation(msgs_store) => {
-                for messanger in auth_store.get_messangers() {
-                    let auth = messanger.auth.clone();
-                    let msgs_store = msgs_store.clone();
-                    if msgs_store.origin_uuid == auth.uuid() {
-                        return Action::Run(Task::perform(
-                            async move {
-                                let pq = auth.param_query().unwrap();
-                                (
-                                    msgs_store.clone(),
-                                    pq.get_messanges(&msgs_store, None).await.unwrap(),
-                                )
-                            },
-                            |(msgs_store, mess)| Message::LoadConversation(msgs_store, mess),
-                        ));
-                    }
-                }
-                return Action::None;
-            }
-            Message::OpenContacts => {
-                self.main = Main::Contacts;
+
                 Action::None
+            }
+            Message::MessageInput(change) => {
+                let Screen::Chat { msg, .. } = &mut self.screen else {
+                    return Action::None;
+                };
+                *msg = change;
+                Action::None
+            }
+            Message::MessageSend => {
+                let Screen::Chat {
+                    auth,
+                    meta_data,
+                    msg,
+                    ..
+                } = &mut self.screen
+                else {
+                    return Action::None;
+                };
+
+                let auth = auth.clone();
+                let meta_data = meta_data.clone();
+                let contents = msg.clone();
+                let future = async move {
+                    let b = auth.param_query().unwrap();
+                    b.send_message(&meta_data, contents).await.unwrap();
+                    ()
+                };
+
+                // TODO: Make this better (Probably reverse the order)
+                Action::Run(Task::perform(future, |_| {
+                    Message::MessageInput(String::new())
+                }))
             }
         }
     }
@@ -166,7 +199,7 @@ impl MessangerWindow {
                         .width(Length::Fill)
                         .align_x(Alignment::Center)
                 )
-                .on_press(Message::OpenContacts)
+                .on_press(Message::OpenScreen(Screen::Contacts))
                 .width(Length::Fill),
                 self.messangers_data[0]
                     .conversations
@@ -174,7 +207,7 @@ impl MessangerWindow {
                     .map(|i| {
                         Button::new(i.name.as_str())
                             .width(Length::Fill)
-                            .on_press(Message::OpenConversation(i.to_owned()).into())
+                            .on_press(Message::LoadConversation(i.to_owned()).into())
                     })
                     .fold(Column::new(), |column, widget| column.push(widget))
             ]
@@ -184,8 +217,8 @@ impl MessangerWindow {
             Scrollbar::default().width(7).scroller_width(7),
         ));
 
-        let main = match &self.main {
-            Main::Contacts => {
+        let main = match &self.screen {
+            Screen::Contacts => {
                 let widget = Column::new();
                 let widget = widget.push(TextInput::new("Search", ""));
                 widget.push(
@@ -196,7 +229,7 @@ impl MessangerWindow {
                         .fold(Column::new(), |column, widget| column.push(widget)),
                 )
             }
-            Main::Chat { messages, .. } => {
+            Screen::Chat { messages, msg, .. } => {
                 let chat = Column::new();
                 let chat = chat.push(
                     Scrollable::new(
@@ -207,7 +240,11 @@ impl MessangerWindow {
                     )
                     .height(Length::Shrink),
                 );
-                let chat = chat.push(TextInput::new("New msg...", ""));
+                let chat = chat.push(
+                    TextInput::new("New msg...", msg)
+                        .on_input(|change| Message::MessageInput(change))
+                        .on_submit(Message::MessageSend),
+                );
                 chat
             }
         };
@@ -215,4 +252,3 @@ impl MessangerWindow {
         column![options, row![navbar, sidebar, main]].into()
     }
 }
-

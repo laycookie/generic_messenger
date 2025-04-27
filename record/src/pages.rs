@@ -8,7 +8,7 @@ use login::Message as LoginMessage;
 use crate::Page;
 
 #[derive(Debug)]
-pub enum MyAppMessage {
+pub(crate) enum MyAppMessage {
     // Actions
     OpenPage(Page),
     AuthDiskSync,
@@ -16,4 +16,3 @@ pub enum MyAppMessage {
     Login(LoginMessage),
     Chat(MessangerMessage),
 }
-

@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt::Debug;
 
 use async_trait::async_trait;
-use types::{Message, MsgsStore, User};
+use types::{Message, Store, User};
 use uuid::Uuid;
 
 pub mod discord;
@@ -34,16 +34,20 @@ impl PartialEq for dyn Messanger {
 pub trait MessangerQuery {
     async fn get_profile(&self) -> Result<User, Box<dyn Error + Sync + Send>>; // Fetch client profile
     async fn get_contacts(&self) -> Result<Vec<User>, Box<dyn Error + Sync + Send>>; // Users from friend list etc
-    async fn get_conversation(&self) -> Result<Vec<MsgsStore>, Box<dyn Error + Sync + Send>>; // List of DMs
-    async fn get_guilds(&self) -> Result<Vec<MsgsStore>, Box<dyn Error + Sync + Send>>; // Large groups that can have over a 100 people in them.
+    async fn get_conversation(&self) -> Result<Vec<Store>, Box<dyn Error + Sync + Send>>; // List of DMs
+    async fn get_guilds(&self) -> Result<Vec<Store>, Box<dyn Error + Sync + Send>>; // Large groups that can have over a 100 people in them.
 }
 
 #[async_trait]
 pub trait ParameterizedMessangerQuery {
     async fn get_messanges(
         &self,
-        msgs_location: &MsgsStore,
+        msgs_location: &Store,
         load_from_msg: Option<Message>,
     ) -> Result<Vec<Message>, Box<dyn Error + Sync + Send>>;
+    async fn send_message(
+        &self,
+        location: &Store,
+        contents: String,
+    ) -> Result<(), Box<dyn Error + Sync + Send>>;
 }
-

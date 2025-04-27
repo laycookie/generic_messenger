@@ -16,12 +16,9 @@ pub(crate) struct Messanger {
     save_to_disk: bool,
 }
 
-// TODO Switch this to an async closures when we will update
-// type AuthChangeCallback = dyn Fn(&[Messanger]) -> Pin<Box<dyn Future<Output = ()>>>;
 pub(super) struct AuthStore {
     messangers: Vec<Messanger>,
     file: File,
-    // auth_change_listeners: Vec<Box<AuthChangeCallback>>,
 }
 
 impl<'a> AuthStore {
@@ -79,15 +76,6 @@ impl<'a> AuthStore {
         });
     }
 
-    // pub fn dispatch_callbacks(&self) {
-    //     smol::block_on(async {
-    //         for c in self.auth_change_listeners.iter() {
-    //             let messangers = self.get_messangers();
-    //             c(messangers).await;
-    //         }
-    //     });
-    // }
-
     pub fn is_empty(&self) -> bool {
         self.messangers.is_empty()
     }
@@ -101,13 +89,15 @@ impl<'a> AuthStore {
         false
     }
 
+    pub fn get_auths(&self) -> Vec<Arc<dyn Auth>> {
+        self.messangers
+            .iter()
+            .map(|m| m.auth.to_owned())
+            .collect::<Vec<_>>()
+    }
     pub fn get_messangers(&self) -> &[Messanger] {
         &self.messangers[..]
     }
-
-    // pub fn add_listner(&mut self, callback: Box<AuthChangeCallback>) {
-    //     self.auth_change_listeners.push(callback);
-    // }
 
     pub fn add_auth(&mut self, auth: Arc<dyn Auth>) -> bool {
         if !self.contains_auth(&auth) {
@@ -131,13 +121,4 @@ impl<'a> AuthStore {
         }
         self.sync_disk();
     }
-
-    // pub fn retain<F>(&mut self, f: F)
-    // where
-    //     F: FnMut(&Messanger) -> bool,
-    // {
-    //     self.messangers.retain(f);
-    //     self.save_on_disk();
-    //     self.dispatch_callbacks();
-    // }
 }

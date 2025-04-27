@@ -15,7 +15,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Dirty hack, fix later
             if mem::discriminant(&app.page) == mem::discriminant(&Page::Todo) {
-                let messangers = app.auth_store.get_messangers().to_vec();
+                let messangers = app.auth_store.get_auths();
                 (
                     app,
                     window_task.then(|_| Task::none()).chain(Task::perform(
@@ -89,7 +89,7 @@ impl App {
                     pages::login::Action::Login(messenger) => {
                         self.auth_store.add_auth(messenger);
 
-                        let messangers = self.auth_store.get_messangers().to_vec();
+                        let messangers = self.auth_store.get_auths();
                         Task::perform(async { MessangerWindow::new(messangers).await }, |chat| {
                             match chat {
                                 Ok(chat) => MyAppMessage::OpenPage(Page::Chat(chat)),
@@ -119,4 +119,3 @@ impl App {
         }
     }
 }
-

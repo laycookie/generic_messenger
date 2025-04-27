@@ -1,5 +1,5 @@
-use crate::types::{Message as GlobalMessage, User as GlobalUser};
-use serde::Deserialize;
+use crate::types::User as GlobalUser;
+use serde::{Deserialize, Serialize};
 use serde_repr::Deserialize_repr;
 
 // === Users ===
@@ -145,14 +145,14 @@ pub struct Reaction {
 #[derive(Deserialize, Debug)]
 pub struct Message {
     // attachments: Vec<String>,
-    author: User,
+    pub author: User,
     // channel_id: String,
     // components: Vec<String>,
-    content: String,
+    pub content: String,
     // edited_timestamp: Option<String>,
     // embeds: Vec<u32>,
     // flags: u32,
-    id: String,
+    pub id: String,
     // mention_everyone: bool,
     // mention_roles: Vec<String>,
     // mentions: Vec<String>,
@@ -163,14 +163,35 @@ pub struct Message {
     // type: u32,
 }
 
-impl From<&Message> for GlobalMessage {
-    fn from(value: &Message) -> Self {
-        Self {
-            id: value.id.clone(),
-            sender: (&value.author).into(),
-            text: value.content.clone(),
-        }
-    }
+#[derive(Debug, Serialize)]
+pub enum MobileNetworkType {
+    Unkown,
+    _2G,
+    _3G,
+    _4G,
+    _5G,
+}
+// https://discord.com/developers/docs/resources/message#create-message-jsonform-params
+#[derive(Debug, Serialize)]
+pub struct CreateMessage {
+    pub mobile_network_type: Option<MobileNetworkType>, // Not in the official docs. but is a thing
+    pub nonce: Option<String>, // Can be used to verify a message was sent (up to 25 characters). Value will appear in the Message Create event.
+    pub enforce_nonce: Option<bool>, // If true, checks nonce uniqueness
+    pub tts: Option<bool>,     // True if this is a TTS message
+    pub content: Option<String>, // Up to 2000 characters
+    //
+    // embeds: Option<Vec<Embed>>,                // Up to 10 rich embeds (max 6000 chars total)
+    // allowed_mentions: Option<AllowedMentions>, // Who can be mentioned
+    // message_reference: Option<MessageReference>, // Reply or forward
+    // components: Option<Vec<Component>>,        // Components to include with the message
+    // sticker_ids: Option<Vec<Snowflake>>,        // IDs of up to 3 stickers
+    // files: Option<Vec<FileContent>>,            // Files being sent
+    // payload_json: Option<String>,               // JSON-encoded body for multipart/form-data
+    // attachments: Option<Vec<Attachment>>,       // Attachments (filename, description)
+    //
+    pub flags: Option<u32>, // Bitfield (only certain flags allowed)
+
+                            // poll: Option<Poll>, // Poll object
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -220,4 +241,3 @@ pub struct Guild {
     // pub safety_alerts_channel_id: Option<String>,  // Snowflake
     // pub incidents_data: Option<IncidentsData>,
 }
-
