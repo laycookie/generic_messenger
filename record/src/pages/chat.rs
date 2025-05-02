@@ -11,6 +11,7 @@ use iced::{
     widget::{
         column, container, image, row,
         scrollable::{Direction, Scrollbar},
+        text::LineHeight,
         Button, Column, Scrollable, Text, TextInput,
     },
     Alignment, ContentFit, Length, Task,
@@ -229,23 +230,30 @@ impl MessangerWindow {
                         .fold(Column::new(), |column, widget| column.push(widget)),
                 )
             }
-            Screen::Chat { messages, msg, .. } => {
-                let chat = Column::new();
-                let chat = chat.push(
-                    Scrollable::new(
-                        messages
-                            .iter()
-                            .map(|msg| Text::from(msg.text.as_str()))
-                            .fold(Column::new(), |column, widget| column.push(widget)),
-                    )
-                    .height(Length::Shrink),
-                );
-                let chat = chat.push(
-                    TextInput::new("New msg...", msg)
-                        .on_input(|change| Message::MessageInput(change))
-                        .on_submit(Message::MessageSend),
-                );
-                chat
+            Screen::Chat {
+                messages,
+                msg,
+                meta_data,
+                ..
+            } => {
+                let meta_data = row![Text::new(meta_data.name.clone())];
+
+                let chat = Scrollable::new(
+                    messages
+                        .iter()
+                        .rev()
+                        .map(|msg| Text::from(msg.text.as_str()))
+                        .fold(Column::new(), |column, widget| column.push(widget)),
+                )
+                .anchor_bottom()
+                .height(Length::Fill);
+
+                let message_box = TextInput::new("New msg...", msg)
+                    .on_input(|change| Message::MessageInput(change))
+                    .on_submit(Message::MessageSend)
+                    .line_height(LineHeight::Absolute(20.into()));
+
+                column![meta_data, chat, message_box].into()
             }
         };
 
