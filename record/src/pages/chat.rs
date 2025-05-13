@@ -12,10 +12,11 @@ use iced::{
         column, container, image, row,
         scrollable::{Direction, Scrollbar},
         text::LineHeight,
-        Button, Column, Scrollable, Text, TextInput,
+        Button, Column, Scrollable, Text, TextInput, Responsive
     },
     Alignment, ContentFit, Length, Task,
 };
+use widgets::divider;
 
 #[derive(Debug, Clone)]
 struct MessangerData {
@@ -27,6 +28,7 @@ struct MessangerData {
 
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
+    DividerChange(f32),
     OpenScreen(Screen),
     LoadConversation(Store),
     MessageInput(String),
@@ -47,6 +49,7 @@ enum Screen {
 pub struct MessangerWindow {
     screen: Screen,
     messangers_data: Vec<MessangerData>,
+    sidebar_width: f32,
 }
 impl Debug for MessangerWindow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -86,6 +89,7 @@ impl MessangerWindow {
         let window = MessangerWindow {
             screen: Screen::Contacts,
             messangers_data,
+            sidebar_width: 168.0,
         };
 
         Ok(window)
@@ -100,9 +104,16 @@ pub enum Action {
 impl MessangerWindow {
     pub(crate) fn update(&mut self, message: Message, auth_store: &AuthStore) -> Action {
         match message {
+            Message::DividerChange(val) => {
+                if (self.sidebar_width + val > 300.0) | (self.sidebar_width + val < 100.0) {
+                    return Action::None;
+                }
+                self.sidebar_width += val;
+                Action::None
+            }
             Message::OpenScreen(screen) => {
                 self.screen = screen;
-                return Action::None;
+                Action::None
             }
             Message::LoadConversation(msgs_store) => {
                 let auth = auth_store
@@ -192,71 +203,78 @@ impl MessangerWindow {
         .direction(Direction::Vertical(
             Scrollbar::default().width(0).scroller_width(0),
         ));
-
-        let sidebar = Scrollable::new(
-            column![
-                Button::new(
-                    container("Contacts")
-                        .width(Length::Fill)
-                        .align_x(Alignment::Center)
-                )
-                .on_press(Message::OpenScreen(Screen::Contacts))
-                .width(Length::Fill),
-                self.messangers_data[0]
-                    .conversations
-                    .iter()
-                    .map(|i| {
-                        Button::new(i.name.as_str())
+        let window = Responsive::new(move |size| {
+            let sidebar = Scrollable::new(
+                column![
+                    Button::new(
+                        container("Contacts")
                             .width(Length::Fill)
-                            .on_press(Message::LoadConversation(i.to_owned()).into())
-                    })
-                    .fold(Column::new(), |column, widget| column.push(widget))
-            ]
-            .width(168),
-        )
-        .direction(Direction::Vertical(
-            Scrollbar::default().width(7).scroller_width(7),
-        ));
-
-        let main = match &self.screen {
-            Screen::Contacts => {
-                let widget = Column::new();
-                let widget = widget.push(TextInput::new("Search", ""));
-                widget.push(
+                            .align_x(Alignment::Center)
+                    )
+                    .on_press(Message::OpenScreen(Screen::Contacts))
+                    .width(Length::Fill),
                     self.messangers_data[0]
-                        .contacts
+                        .conversations
                         .iter()
-                        .map(|i| Text::from(i.username.as_str()))
-                        .fold(Column::new(), |column, widget| column.push(widget)),
-                )
-            }
-            Screen::Chat {
-                messages,
-                msg,
-                meta_data,
-                ..
-            } => {
-                let meta_data = row![Text::new(meta_data.name.clone())];
+                        .map(|i| {
+                            Button::new(i.name.as_str())
+                                .width(Length::Fill)
+                                .on_press(Message::LoadConversation(i.to_owned()).into())
+                        })
+                        .fold(Column::new(), |column, widget| column.push(widget))
+                ]
+                .width(self.sidebar_width),
+            )
+            .direction(Direction::Vertical(
+                Scrollbar::default().width(7).scroller_width(7),
+            ));
 
-                let chat = Scrollable::new(
-                    messages
-                        .iter()
-                        .rev()
-                        .map(|msg| Text::from(msg.text.as_str()))
-                        .fold(Column::new(), |column, widget| column.push(widget)),
-                )
-                .anchor_bottom()
-                .height(Length::Fill);
+            let main = match &self.screen {
+                Screen::Contacts => {
+                    let widget = Column::new();
+                    let widget = widget.push(TextInput::new("Search", ""));
+                    widget.push(
+                        self.messangers_data[0]
+                            .contacts
+                            .iter()
+                            .map(|i| Text::from(i.username.as_str()))
+                            .fold(Column::new(), |column, widget| column.push(widget)),
+                    )
+                }
+                Screen::Chat {
+                    messages,
+                    msg,
+                    meta_data,
+                    ..
+                } => {
+                    let meta_data = row![Text::new(meta_data.name.clone())];
 
-                let message_box = TextInput::new("New msg...", msg)
-                    .on_input(|change| Message::MessageInput(change))
-                    .on_submit(Message::MessageSend)
-                    .line_height(LineHeight::Absolute(20.into()));
+                    let chat = Scrollable::new(
+                        messages
+                            .iter()
+                            .rev()
+                            .map(|msg| Text::from(msg.text.as_str()))
+                            .fold(Column::new(), |column, widget| column.push(widget)),
+                    )
+                    .anchor_bottom()
+                    .height(Length::Fill);
 
-                column![meta_data, chat, message_box].into()
-            }
-        };
+                    let message_box = TextInput::new("New msg...", msg)
+                        .on_input(|change| Message::MessageInput(change))
+                        .on_submit(Message::MessageSend)
+                        .line_height(LineHeight::Absolute(20.into()));
 
-        column![options, row![navbar, sidebar, main]].into()
+                    column![meta_data, chat, message_box].into()
+                }
+            };
+            row![
+                sidebar,
+                divider::Divider::new(10.0, size.height, Message::DividerChange),
+                main
+            ]
+            .into()
+        });
+
+        column![options, row![navbar, window]].into()
     }
 }
