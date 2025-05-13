@@ -12,7 +12,7 @@ use iced::{
         column, container, image, row,
         scrollable::{Direction, Scrollbar},
         text::LineHeight,
-        Button, Column, Scrollable, Text, TextInput, Responsive
+        Button, Column, Responsive, Scrollable, Text, TextInput,
     },
     Alignment, ContentFit, Length, Task,
 };
@@ -37,7 +37,9 @@ pub(crate) enum Message {
 
 #[derive(Debug, Clone)]
 enum Screen {
-    Contacts,
+    Contacts {
+        search_input: String,
+    },
     Chat {
         auth: Arc<dyn Auth>,
         meta_data: Store,
@@ -87,7 +89,9 @@ impl MessangerWindow {
             .collect::<Vec<_>>();
 
         let window = MessangerWindow {
-            screen: Screen::Contacts,
+            screen: Screen::Contacts {
+                search_input: String::new(),
+            },
             messangers_data,
             sidebar_width: 168.0,
         };
@@ -145,10 +149,14 @@ impl MessangerWindow {
                 Action::None
             }
             Message::MessageInput(change) => {
-                let Screen::Chat { msg, .. } = &mut self.screen else {
-                    return Action::None;
-                };
-                *msg = change;
+                match &mut self.screen {
+                    Screen::Chat { msg, .. } => {
+                        *msg = change;
+                    }
+                    Screen::Contacts { search_input } => {
+                        *search_input = change;
+                    }
+                }
                 Action::None
             }
             Message::MessageSend => {
@@ -211,7 +219,9 @@ impl MessangerWindow {
                             .width(Length::Fill)
                             .align_x(Alignment::Center)
                     )
-                    .on_press(Message::OpenScreen(Screen::Contacts))
+                    .on_press(Message::OpenScreen(Screen::Contacts {
+                        search_input: String::new()
+                    }))
                     .width(Length::Fill),
                     self.messangers_data[0]
                         .conversations
@@ -230,14 +240,21 @@ impl MessangerWindow {
             ));
 
             let main = match &self.screen {
-                Screen::Contacts => {
+                Screen::Contacts { search_input } => {
                     let widget = Column::new();
-                    let widget = widget.push(TextInput::new("Search", ""));
+                    let widget = widget.push(
+                        TextInput::new("Search", search_input).on_input(Message::MessageInput),
+                    );
                     widget.push(
                         self.messangers_data[0]
                             .contacts
                             .iter()
-                            .map(|i| Text::from(i.username.as_str()))
+                            .filter_map(|i| {
+                                if search_input.is_empty() || i.username.to_lowercase().contains(search_input.to_lowercase().as_str()) {
+                                    return Some(Text::from(i.username.as_str()))
+                                } 
+                                None
+                            })
                             .fold(Column::new(), |column, widget| column.push(widget)),
                     )
                 }
@@ -257,10 +274,11 @@ impl MessangerWindow {
                             .fold(Column::new(), |column, widget| column.push(widget)),
                     )
                     .anchor_bottom()
+                    .width(Length::Fill)
                     .height(Length::Fill);
 
                     let message_box = TextInput::new("New msg...", msg)
-                        .on_input(|change| Message::MessageInput(change))
+                        .on_input(Message::MessageInput)
                         .on_submit(Message::MessageSend)
                         .line_height(LineHeight::Absolute(20.into()));
 
