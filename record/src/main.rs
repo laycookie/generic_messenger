@@ -11,7 +11,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     iced::daemon(App::title(), App::update, App::view)
         .run_with(|| {
             let app = App::default();
-            let (_window_id, window_task) = window::open({window::Settings::default()});
+            let (_window_id, window_task) = window::open(window::Settings::default());
 
             // Dirty hack, fix later
             if mem::discriminant(&app.page) == mem::discriminant(&Page::Todo) {
