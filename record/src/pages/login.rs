@@ -1,7 +1,7 @@
 use adaptors::{discord::Discord, Messanger};
 use iced::{
     widget::{column, combo_box::State, Button, Column, ComboBox, Container, TextInput},
-    Alignment, Element, Task,
+    Alignment, Task,
 };
 use std::{fmt::Display, sync::Arc};
 use strum::EnumString;
@@ -24,7 +24,10 @@ impl Platform {
     pub fn to_messanger(&self, auth: String) -> Arc<dyn Messanger> {
         match self {
             Self::Discord => Arc::new(Discord::new(&auth)),
-            Self::Test => todo!(),
+            Self::Test => {
+                println!("Testing");
+                todo!()
+            }
         }
     }
     fn get_login_methods(&self) -> Vec<LoginMethods> {
@@ -118,10 +121,10 @@ impl Login {
             .get_login_methods()
             .iter()
             .filter_map(|method| match method {
-                LoginMethods::Token => Some(Element::from(
+                LoginMethods::Token => Some(
                     TextInput::new("Token", self.token.as_str())
                         .on_input(|text| Message::TokenInput(text)),
-                )),
+                ),
                 LoginMethods::Unkown => None,
             })
             .fold(Column::new(), |column, widget| column.push(widget));
@@ -144,4 +147,3 @@ impl Login {
             .into()
     }
 }
-

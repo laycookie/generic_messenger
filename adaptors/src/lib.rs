@@ -1,5 +1,5 @@
-use std::error::Error;
 use std::fmt::Debug;
+use std::{error::Error, sync::Arc};
 
 use async_trait::async_trait;
 use types::{Message, Store, User};
@@ -19,6 +19,9 @@ pub trait Messanger: Send + Sync + Debug {
         None
     }
     fn param_query(&self) -> Option<&dyn ParameterizedMessangerQuery> {
+        None
+    }
+    fn socket(&self) -> Option<&dyn Socket> {
         None
     }
 }
@@ -50,4 +53,15 @@ pub trait ParameterizedMessangerQuery {
         location: &Store,
         contents: String,
     ) -> Result<(), Box<dyn Error + Sync + Send>>;
+}
+
+// === Sockets
+#[async_trait]
+pub trait TestStream {
+    async fn next(&self) -> usize;
+}
+
+#[async_trait]
+pub trait Socket {
+    async fn get_stream(&self) -> Arc<dyn TestStream + Send + Sync>;
 }

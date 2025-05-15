@@ -6,7 +6,10 @@ use adaptors::{
     types::{Message as ChatMessage, Store, User},
     Messanger as Auth,
 };
-use futures::{future::try_join_all, try_join};
+use futures::{
+    future::{join_all, try_join_all},
+    try_join,
+};
 use iced::{
     widget::{
         column, container, image, row,
@@ -67,6 +70,15 @@ impl MessangerWindow {
     pub(crate) async fn new(
         auths: Vec<Arc<dyn Auth>>,
     ) -> Result<Self, Arc<dyn Error + Sync + Send>> {
+        // let stream = auths
+        //     .iter()
+        //     .map(async move |a| {
+        //         let socket = a.socket().unwrap();
+        //         socket.get_stream().await
+        //     })
+        //     .collect::<Vec<_>>();
+        // let temp = join_all(stream).await;
+
         let reqs = auths.iter().map(async move |auth| {
             let q = auth.query().unwrap();
             try_join!(
