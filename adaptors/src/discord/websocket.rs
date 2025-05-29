@@ -19,30 +19,40 @@ struct DiscordStream {
 
 #[async_trait]
 impl TestStream for DiscordStream {
-    async fn next(&self) -> usize {
+    async fn next(&self) -> Option<usize> {
         let mut unlock = self.stream.lock().await;
-        let test = unlock.next().await;
-        if let Some(val) = test {
-            println!("{:#?}", val);
+        let msg = unlock.next().await?;
+
+        match msg {
+            Ok(Message::Text(text)) => {
+                println!("Text: {}", text);
+                return Some(2);
+            }
+            Ok(Message::Close(frame)) => {
+                println!("Disconnected: {:?}", frame);
+                return None;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                return None;
+            }
         }
 
-        1
+        None
     }
 }
 
 #[async_trait]
 impl Socket for Discord {
     async fn get_stream(&self) -> Arc<dyn TestStream + Send + Sync> {
-        // TODO: Upgrade to use TLS
         let gateway_url = "wss://gateway.discord.gg/?encoding=json&v=9";
         let (mut socket, response) = connect_async(gateway_url)
             .await
             .expect("Failed to connect to Discord gateway");
 
-        println!("Connected to Discord gateway");
         println!("Response HTTP code: {}", response.status());
 
-        // Read hello message
         if let Some(Ok(msg)) = socket.next().await {
             println!("Received: {}", msg);
         }
@@ -65,24 +75,6 @@ impl Socket for Discord {
             .send(Message::Text(identify_payload.to_string().into()))
             .await
             .expect("Failed to send identify payload");
-
-        // Example loop to read messages
-        // while let Some(msg) = socket.next().await {
-        //     match msg {
-        //         Ok(Message::Text(text)) => {
-        //             println!("Text: {}", text)
-        //         }
-        //         Ok(Message::Close(frame)) => {
-        //             println!("Disconnected: {:?}", frame);
-        //             break;
-        //         }
-        //         Ok(_) => {}
-        //         Err(e) => {
-        //             eprintln!("Error: {}", e);
-        //             break;
-        //         }
-        //     }
-        // }
 
         let stream = DiscordStream {
             stream: socket.into(),
