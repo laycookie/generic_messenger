@@ -22,13 +22,10 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let messangers = app.auth_store.get_auths();
                 (
                     app,
-                    window_task
-                        .then(|_| Task::none())
-                        .chain(Task::perform(
-                            async move { MessangerWindow::new(messangers).await.unwrap() },
-                            |m| MyAppMessage::OpenPage(Page::Chat(m)),
-                        ))
-                        .chain(Task::done(MyAppMessage::SocketConnect)),
+                    window_task.then(|_| Task::none()).chain(Task::perform(
+                        async move { MessangerWindow::new(messangers).await.unwrap() },
+                        |m| MyAppMessage::OpenPage(Page::Chat(m)),
+                    )),
                 )
             } else {
                 (app, window_task.then(|_| Task::none()))
@@ -101,7 +98,7 @@ impl App {
                 socket::SocketEvent::Connect(socket_connection) => {
                     println!("Socket connected");
                     self.socket = Some(socket_connection);
-                    Task::none()
+                    Task::done(MyAppMessage::SocketConnect)
                 }
                 socket::SocketEvent::Echo(t) => {
                     println!("{t}");
@@ -149,6 +146,6 @@ impl App {
         }
     }
     fn subscription(&self) -> Subscription<MyAppMessage> {
-        Subscription::run(SocketConnection::connect).map(|t| MyAppMessage::SocketEvent(t))
+        Subscription::run(SocketConnection::new).map(|t| MyAppMessage::SocketEvent(t))
     }
 }

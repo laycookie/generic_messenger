@@ -58,7 +58,7 @@ pub trait ParameterizedMessangerQuery {
 // === Sockets
 #[async_trait]
 pub trait TestStream {
-    async fn next(&self) -> usize;
+    async fn next(&self) -> Option<usize>;
 }
 
 #[async_trait]
