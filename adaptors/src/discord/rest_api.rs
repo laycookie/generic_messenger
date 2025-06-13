@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use futures::future::join_all;
-use std::error::Error;
+use std::{error::Error, sync::Arc};
 
 use crate::{
-    MessangerQuery, ParameterizedMessangerQuery,
+    Messanger, MessangerQuery, ParameterizedMessangerQuery,
     network::{cache_download, http_request},
     types::{Message as GlobalMessage, Store, User},
 };
@@ -20,7 +20,7 @@ impl Discord {
 }
 
 #[async_trait]
-impl MessangerQuery for Discord {
+impl MessangerQuery for Arc<Discord> {
     async fn get_profile(&self) -> Result<User, Box<dyn Error + Sync + Send>> {
         let profile = http_request::<Profile>(
             surf::get("https://discord.com/api/v9/users/@me"),
@@ -48,7 +48,7 @@ impl MessangerQuery for Discord {
         let conversations = channels
             .iter()
             .map(|channel| Store {
-                origin_uuid: self.uuid,
+                origin_uid: self.id(),
                 hash: None,
                 id: channel.id.clone(),
                 name: channel
@@ -77,7 +77,7 @@ impl MessangerQuery for Discord {
         let a = guilds.iter().map(async move |g| {
             let Some(hash) = &g.icon else {
                 return Store {
-                    origin_uuid: self.uuid,
+                    origin_uid: self.id(),
                     hash: None,
                     id: g.id.clone(),
                     name: g.name.clone(),
@@ -97,7 +97,7 @@ impl MessangerQuery for Discord {
             .await;
 
             Store {
-                origin_uuid: self.uuid,
+                origin_uid: self.id(),
                 hash: None,
                 id: g.id.clone(),
                 name: g.name.clone(),

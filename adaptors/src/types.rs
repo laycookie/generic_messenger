@@ -1,7 +1,5 @@
 use std::path::PathBuf;
 
-use uuid::Uuid;
-
 // Legacy
 #[derive(Debug, Clone)]
 pub struct User {
@@ -12,7 +10,7 @@ pub struct User {
 // New
 #[derive(Debug, Clone)]
 pub struct Store {
-    pub origin_uuid: Uuid,
+    pub origin_uid: String,          // Unique id of obj that emitted this Store
     pub(crate) hash: Option<String>, // Used in cases where ID can change
     pub(crate) id: String,           // ID of a location
     pub name: String,
