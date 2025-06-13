@@ -6,10 +6,7 @@ use adaptors::{
     types::{Message as ChatMessage, Store, User},
     Messanger as Auth,
 };
-use futures::{
-    future::{join_all, try_join_all},
-    try_join,
-};
+use futures::{future::try_join_all, try_join};
 use iced::{
     widget::{
         column, container, image, row,
@@ -262,9 +259,13 @@ impl MessangerWindow {
                             .contacts
                             .iter()
                             .filter_map(|i| {
-                                if search_input.is_empty() || i.username.to_lowercase().contains(search_input.to_lowercase().as_str()) {
-                                    return Some(Text::from(i.username.as_str()))
-                                } 
+                                if search_input.is_empty()
+                                    || i.username
+                                        .to_lowercase()
+                                        .contains(search_input.to_lowercase().as_str())
+                                {
+                                    return Some(Text::from(i.username.as_str()));
+                                }
                                 None
                             })
                             .fold(Column::new(), |column, widget| column.push(widget)),

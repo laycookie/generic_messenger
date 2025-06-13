@@ -1,85 +1,78 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use async_tungstenite::{
-    WebSocketStream,
-    async_std::{ConnectStream, connect_async},
-    tungstenite::Message,
-};
-use futures::{StreamExt, lock::Mutex};
+use async_tungstenite::tungstenite::Message;
+use futures::StreamExt;
+use serde::Deserialize;
 use serde_json::json;
+use serde_repr::Deserialize_repr;
 
-use crate::{Socket, TestStream};
+use crate::Socket;
 
 use super::Discord;
 
-struct DiscordStream {
-    stream: Mutex<WebSocketStream<ConnectStream>>,
+#[repr(u8)]
+#[derive(Debug, Deserialize_repr)]
+enum Opcode {
+    Dispatch = 0,
+    Heartbeat = 1,
+    Identify = 2,
+    Hello = 10,
 }
 
-#[async_trait]
-impl TestStream for DiscordStream {
-    async fn next(&self) -> Option<usize> {
-        let mut unlock = self.stream.lock().await;
-        let msg = unlock.next().await?;
-
-        match msg {
-            Ok(Message::Text(text)) => {
-                println!("Text: {}", text);
-                return Some(2);
-            }
-            Ok(Message::Close(frame)) => {
-                println!("Disconnected: {:?}", frame);
-                return None;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                return None;
-            }
-        }
-
-        None
-    }
+#[derive(Debug, Deserialize)]
+struct GateawayPayload {
+    // Event type
+    t: Option<String>,
+    // Sequence numbers
+    s: Option<u32>,
+    op: Opcode,
+    // data
+    d: serde_json::Value,
 }
 
 #[async_trait]
 impl Socket for Discord {
-    async fn get_stream(&self) -> Arc<dyn TestStream + Send + Sync> {
-        let gateway_url = "wss://gateway.discord.gg/?encoding=json&v=9";
-        let (mut socket, response) = connect_async(gateway_url)
-            .await
-            .expect("Failed to connect to Discord gateway");
+    async fn next(&self) -> Option<usize> {
+        let mut stream = self.socket.lock().await;
+        let stream = stream.as_mut()?;
 
-        println!("Response HTTP code: {}", response.status());
-
-        if let Some(Ok(msg)) = socket.next().await {
-            println!("Received: {}", msg);
-        }
-
-        // Send Identify payload
-        let identify_payload = json!({
-            "op": 2,
-            "d": {
-                "token": self.token,
-                "intents": self.intents,
-                "properties": {
-                    "$os": "Linux",
-                    "$browser": "Firefox",
-                    "$device": ""
-                }
+        let json = match stream.next().await? {
+            Ok(Message::Text(text)) => serde_json::from_str::<GateawayPayload>(&text).unwrap(),
+            Ok(Message::Close(frame)) => {
+                println!("Disconnected: {:?}", frame);
+                return None;
             }
-        });
+            Ok(_) => todo!(),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                return None;
+            }
+        };
+        println!("Received: {:#?}", json);
 
-        socket
-            .send(Message::Text(identify_payload.to_string().into()))
-            .await
-            .expect("Failed to send identify payload");
-
-        let stream = DiscordStream {
-            stream: socket.into(),
+        match json.op {
+            Opcode::Hello => {
+                println!("Identify self");
+                // Send Identify payload
+                let identify_payload = json!({
+                    "op": 2,
+                    "d": {
+                        "token": self.token,
+                        "intents": self.intents,
+                        "properties": {
+                            "$os": "Linux",
+                            "$browser": "Firefox",
+                            "$device": ""
+                        }
+                    }
+                });
+                stream
+                    .send(Message::Text(identify_payload.to_string().into()))
+                    .await
+                    .expect("Failed to send identify payload");
+            }
+            _ => {}
         };
 
-        Arc::new(stream)
+        Some(1)
     }
 }
