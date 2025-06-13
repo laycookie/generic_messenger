@@ -9,7 +9,6 @@ use async_tungstenite::{
     async_std::{ConnectStream, connect_async},
 };
 use futures::lock::Mutex;
-use uuid::Uuid;
 
 use crate::{Messanger, MessangerQuery, ParameterizedMessangerQuery, Socket};
 
@@ -19,7 +18,7 @@ pub mod websocket;
 
 pub struct Discord {
     // Metadata
-    uuid: Uuid,
+    // uuid: Uuid,
     token: String, // TODO: Make it secure
     intents: u32,
 
@@ -32,7 +31,7 @@ pub struct Discord {
 impl Discord {
     pub fn new(token: &str) -> Arc<dyn Messanger> {
         Arc::new(Arc::new(Discord {
-            uuid: Uuid::new_v4(),
+            // uuid: Uuid::new_v4(),
             token: token.into(),
             intents: 161789, // 32767,
 
@@ -51,25 +50,22 @@ impl Debug for Discord {
 
 #[async_trait]
 impl Messanger for Arc<Discord> {
+    fn id(&self) -> String {
+        String::from(self.name().to_owned() + &self.token)
+    }
     // === Unifi a bit ===
-    fn name(&self) -> String {
+    fn name(&self) -> &'static str {
         "Discord".into()
     }
     fn auth(&self) -> String {
         self.token.clone()
     }
-    fn uuid(&self) -> Uuid {
-        self.uuid
-    }
-
-    // ===
     fn query(&self) -> Option<&dyn MessangerQuery> {
-        Some(&**self)
+        Some(&*self)
     }
     fn param_query(&self) -> Option<&dyn ParameterizedMessangerQuery> {
         Some(&**self)
     }
-
     async fn socket(&self) -> Option<Weak<dyn Socket + Send + Sync>> {
         let mut socket = self.socket.lock().await;
 

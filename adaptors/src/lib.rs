@@ -4,7 +4,6 @@ use std::sync::Weak;
 
 use async_trait::async_trait;
 use types::{Message, Store, User};
-use uuid::Uuid;
 
 pub mod discord;
 mod network;
@@ -12,10 +11,9 @@ pub mod types;
 
 #[async_trait]
 pub trait Messanger: Send + Sync + Debug {
-    // ID & Auth
-    fn name(&self) -> String;
+    fn id(&self) -> String;
+    fn name(&self) -> &'static str;
     fn auth(&self) -> String;
-    fn uuid(&self) -> Uuid;
     // TODO: Potentially make this look nicer?
     fn query(&self) -> Option<&dyn MessangerQuery> {
         None
@@ -29,7 +27,7 @@ pub trait Messanger: Send + Sync + Debug {
 }
 impl PartialEq for dyn Messanger {
     fn eq(&self, other: &Self) -> bool {
-        format!("{}{}", self.name(), self.auth()) == format!("{}{}", other.name(), other.auth())
+        format!("{}", self.id()) == format!("{}", other.id())
     }
 }
 

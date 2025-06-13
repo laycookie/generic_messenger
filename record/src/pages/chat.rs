@@ -132,7 +132,7 @@ impl MessangerWindow {
                 let auth = auth_store
                     .get_auths()
                     .into_iter()
-                    .find(|auth| msgs_store.origin_uuid == auth.uuid())
+                    .find(|auth| msgs_store.origin_uid == auth.id())
                     .clone();
 
                 if let Some(auth) = auth {
