@@ -1,7 +1,7 @@
 use std::mem;
 
 use auth::AuthStore;
-use futures::{channel::mpsc::Sender, SinkExt};
+use futures::channel::mpsc::Sender;
 use iced::{window, Element, Subscription, Task};
 use pages::{chat::MessangerWindow, Login, MyAppMessage};
 use socket::{ReciverEvent, SocketConnection};

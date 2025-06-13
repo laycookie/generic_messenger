@@ -1,5 +1,6 @@
+use std::error::Error;
 use std::fmt::Debug;
-use std::{error::Error, sync::Arc};
+use std::sync::Weak;
 
 use async_trait::async_trait;
 use types::{Message, Store, User};
@@ -9,19 +10,20 @@ pub mod discord;
 mod network;
 pub mod types;
 
+#[async_trait]
 pub trait Messanger: Send + Sync + Debug {
     // ID & Auth
     fn name(&self) -> String;
     fn auth(&self) -> String;
     fn uuid(&self) -> Uuid;
-    // Features - TODO: Replace when up-casting will become stable https://github.com/rust-lang/rust/issues/65991
+    // TODO: Potentially make this look nicer?
     fn query(&self) -> Option<&dyn MessangerQuery> {
         None
     }
     fn param_query(&self) -> Option<&dyn ParameterizedMessangerQuery> {
         None
     }
-    fn socket(&self) -> Option<&dyn Socket> {
+    async fn socket(&self) -> Option<Weak<dyn Socket + Send + Sync>> {
         None
     }
 }
@@ -57,11 +59,6 @@ pub trait ParameterizedMessangerQuery {
 
 // === Sockets
 #[async_trait]
-pub trait TestStream {
-    async fn next(&self) -> Option<usize>;
-}
-
-#[async_trait]
 pub trait Socket {
-    async fn get_stream(&self) -> Arc<dyn TestStream + Send + Sync>;
+    async fn next(&self) -> Option<usize>;
 }

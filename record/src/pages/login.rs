@@ -23,7 +23,7 @@ impl Display for Platform {
 impl Platform {
     pub fn to_messanger(&self, auth: String) -> Arc<dyn Messanger> {
         match self {
-            Self::Discord => Arc::new(Discord::new(&auth)),
+            Self::Discord => Discord::new(&auth),
             Self::Test => {
                 println!("Testing");
                 todo!()

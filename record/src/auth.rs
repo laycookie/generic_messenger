@@ -43,7 +43,7 @@ impl<'a> AuthStore {
 
             // In theory should never return false
             let auth: Arc<dyn Auth> = match Platform::from_str(platform).unwrap() {
-                Platform::Discord => Arc::new(Discord::new(token)),
+                Platform::Discord => Discord::new(token),
                 Platform::Test => todo!(),
             };
 
