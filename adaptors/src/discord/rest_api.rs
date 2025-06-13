@@ -47,25 +47,72 @@ impl MessangerQuery for Arc<Discord> {
 
         let conversations = channels
             .iter()
-            .map(|channel| Store {
-                origin_uid: self.id(),
-                hash: None,
-                id: channel.id.clone(),
-                name: channel
-                    .clone()
-                    .name
-                    .unwrap_or(match channel.recipients.get(0) {
-                        Some(test) => test.username.clone(),
-                        None => "Fix later".to_string(),
-                    }),
-                icon: None,
+            .map(async move |channel| {
+                let mut data = Store {
+                    origin_uid: self.id(),
+                    hash: None,
+                    id: channel.id.clone(),
+                    name: channel
+                        .clone()
+                        .name
+                        .unwrap_or(match channel.recipients.get(0) {
+                            Some(test) => test.username.clone(),
+                            None => "Fix later".to_string(),
+                        }),
+                    icon: None,
+                };
+
+                if let Some(hash) = &channel.icon {
+                    let icon = cache_download(
+                        format!(
+                            "https://cdn.discordapp.com/channel-icons/{}/{}.webp?size=80&quality=lossless",
+                            channel.id, hash
+                        ),
+                        format!("./cache/imgs/channels/discord/{}", channel.id).into(),
+                        format!("{}.webp", hash),
+                    )
+                    .await;
+                    match icon {
+                        Ok(path) => {
+                            data.icon = Some(path);
+                            return data;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to download icon for channel: {}\n{}", data.name, e);
+                        }
+                    };
+                }
+
+                let first_recipients = &channel.recipients[0];
+                if let Some(hash) = &first_recipients.avatar {
+                    let icon = cache_download(
+                        format!(
+                            "https://cdn.discordapp.com/avatars/{}/{}.webp?size=80&quality=lossless",
+                            first_recipients.id, hash
+                        ),
+                        format!("./cache/imgs/users/discord/{}", channel.id).into(),
+                        format!("{}.webp", hash),
+                    )
+                    .await;
+                    match icon {
+                        Ok(path) => {
+                            data.icon = Some(path);
+                            return data;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to download icon for channel: {}\n{}", data.name, e);
+                        }
+                    };
+                };
+
+                data
             })
             .collect::<Vec<_>>();
+        let b = join_all(conversations).await;
 
         *self.dms.write().unwrap() = channels;
-        // self.dms.set(channels);
 
-        Ok(conversations)
+        Ok(b)
     }
     async fn get_guilds(&self) -> Result<Vec<Store>, Box<dyn Error + Sync + Send>> {
         let guilds = http_request::<Vec<Guild>>(
@@ -74,27 +121,25 @@ impl MessangerQuery for Arc<Discord> {
         )
         .await?;
 
-        let a = guilds.iter().map(async move |g| {
-            let Some(hash) = &g.icon else {
-                return Store {
-                    origin_uid: self.id(),
-                    hash: None,
-                    id: g.id.clone(),
-                    name: g.name.clone(),
-                    icon: None,
-                };
-            };
-
-            // TODO: Deal with this possibly failing
-            let icon = cache_download(
-                format!(
-                    "https://cdn.discordapp.com/icons/{}/{}.webp?size=80&quality=lossless",
-                    g.id, hash
-                ),
-                format!("./cache/discord/guilds/{}/imgs/", g.id).into(),
-                format!("{}.webp", hash),
-            )
-            .await;
+        let g = guilds.iter().map(async move |g| {
+            let icon = g.icon.as_ref().map(async move |hash| {
+                let icon = cache_download(
+                    format!(
+                        "https://cdn.discordapp.com/icons/{}/{}.webp?size=80&quality=lossless",
+                        g.id, hash
+                    ),
+                    format!("./cache/imgs/guilds/discord/{}", g.id).into(),
+                    format!("{}.webp", hash),
+                )
+                .await;
+                match icon {
+                    Ok(path) => Some(path),
+                    Err(e) => {
+                        eprintln!("Failed to download icon for guild: {}\n{}", g.name, e);
+                        None
+                    }
+                }
+            });
 
             Store {
                 origin_uid: self.id(),
@@ -102,16 +147,13 @@ impl MessangerQuery for Arc<Discord> {
                 id: g.id.clone(),
                 name: g.name.clone(),
                 icon: match icon {
-                    Ok(path) => Some(path),
-                    Err(e) => {
-                        eprintln!("Failed to download icon for guild: {}\n{}", g.name, e);
-                        None
-                    }
+                    Some(icon) => icon.await,
+                    None => None,
                 },
             }
         });
 
-        Ok(join_all(a).await)
+        Ok(join_all(g).await)
     }
 }
 

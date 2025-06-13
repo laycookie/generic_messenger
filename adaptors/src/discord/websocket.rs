@@ -47,7 +47,7 @@ impl Socket for Discord {
                 return None;
             }
         };
-        println!("Received: {:#?}", json);
+        // println!("Received: {:#?}", json);
 
         match json.op {
             Opcode::Hello => {
