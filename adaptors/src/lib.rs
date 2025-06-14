@@ -14,7 +14,7 @@ pub trait Messanger: Send + Sync + Debug {
     fn id(&self) -> String;
     fn name(&self) -> &'static str;
     fn auth(&self) -> String;
-    // TODO: Potentially make this look nicer?
+
     fn query(&self) -> Option<&dyn MessangerQuery> {
         None
     }
@@ -31,8 +31,6 @@ impl PartialEq for dyn Messanger {
     }
 }
 
-// TODO: Remove the async trait when we will be able to create safe objects out
-// of traits with async functions
 #[async_trait]
 pub trait MessangerQuery {
     async fn get_profile(&self) -> Result<User, Box<dyn Error + Sync + Send>>; // Fetch client profile

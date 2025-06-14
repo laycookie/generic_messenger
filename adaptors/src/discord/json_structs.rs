@@ -76,12 +76,12 @@ impl From<Friend> for GlobalUser {
 }
 #[derive(Deserialize, Debug, Clone)]
 pub struct Recipient {
-    // avatar: Option<String>,
+    pub(crate) avatar: Option<String>,
     // avatar_decoration_data: Option<String>,
     // clan: Option<String>,
     // discriminator: String,
     // global_name: Option<String>,
-    // id: String,
+    pub(crate) id: String,
     // public_flags: i32,
     pub(crate) username: String,
 }
@@ -112,7 +112,7 @@ pub struct Channel {
     // #[serde(rename = "type")]
     // channel_type: ChannelTypes,
     // flags: i32,
-    // pub(crate) icon: Option<String>,
+    pub(crate) icon: Option<String>,
     pub last_message_id: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) recipients: Vec<Recipient>,

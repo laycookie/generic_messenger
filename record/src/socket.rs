@@ -75,7 +75,6 @@ impl Stream for SocketConnection {
 
             // The stream got closed
             if let Poll::Ready(val) = stream.next().poll_unpin(cx) {
-                println!("PULLING: {:?}", val.is_some());
                 return val.is_some();
             };
 
