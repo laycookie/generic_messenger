@@ -152,8 +152,10 @@ impl MessangerQuery for Arc<Discord> {
                 },
             }
         });
+        let b = join_all(g).await;
+        *self.guilds.write().unwrap() = guilds;
 
-        Ok(join_all(g).await)
+        Ok(b)
     }
 }
 

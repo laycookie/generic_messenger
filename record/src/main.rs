@@ -85,23 +85,19 @@ impl App {
                 self.auth_store.save_to_disk();
                 Task::none()
             }
-            MyAppMessage::SocketConnect => {
-                let mut socket = self.socket.clone().unwrap();
-                let auths = self.auth_store.get_auths();
-                auths.iter().for_each(|auth| {
-                    let temp = socket.try_send(ReciverEvent::Connection(auth.clone()));
-                });
-
-                Task::none()
-            }
             MyAppMessage::SocketEvent(event) => match event {
-                socket::SocketEvent::Connect(socket_connection) => {
+                socket::SocketEvent::Connect(mut socket_connection) => {
                     println!("Socket connected");
+                    let auths = self.auth_store.get_auths();
+                    auths.iter().for_each(|auth| {
+                        let _temp =
+                            socket_connection.try_send(ReciverEvent::Connection(auth.clone()));
+                    });
                     self.socket = Some(socket_connection);
-                    Task::done(MyAppMessage::SocketConnect)
+                    Task::none()
                 }
-                socket::SocketEvent::Echo(t) => {
-                    println!("{t}");
+                socket::SocketEvent::Message(t) => {
+                    println!("Rec: {:?}", t);
                     Task::none()
                 }
             },
