@@ -92,7 +92,7 @@ impl Stream for SocketConnection {
             }
         });
         self.ready_events.extend(new_events);
-
+    
         cx.waker().wake_by_ref();
         return Poll::Pending;
     }

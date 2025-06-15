@@ -11,6 +11,7 @@ use async_tungstenite::{
 use futures::lock::Mutex;
 
 use crate::{Messanger, MessangerQuery, ParameterizedMessangerQuery, Socket};
+use crate::discord::websocket::DiscordSocket;
 
 pub mod json_structs;
 pub mod rest_api;
@@ -20,9 +21,8 @@ pub struct Discord {
     // Metadata
     token: String, // TODO: Make it secure
     intents: u32,
-
     // Owned data
-    socket: Mutex<Option<WebSocketStream<ConnectStream>>>,
+    socket: Mutex<DiscordSocket>,
     // Cache
     dms: RwLock<Vec<json_structs::Channel>>,
     guilds: RwLock<Vec<json_structs::Guild>>,
@@ -33,9 +33,7 @@ impl Discord {
         Arc::new(Arc::new(Discord {
             token: token.into(),
             intents: 161789, // 32767,
-
-            socket: None.into(),
-
+            socket: Mutex::new(DiscordSocket::new()),
             dms: RwLock::new(Vec::new()),
             guilds: RwLock::new(Vec::new()),
         }))
@@ -69,7 +67,7 @@ impl Messanger for Arc<Discord> {
     async fn socket(&self) -> Option<Weak<dyn Socket + Send + Sync>> {
         let mut socket = self.socket.lock().await;
 
-        if socket.is_none() {
+        if socket.websocket.is_none() {
             let gateway_url = "wss://gateway.discord.gg/?encoding=json&v=9";
             let (stream, response) = connect_async(gateway_url)
                 .await
@@ -77,7 +75,7 @@ impl Messanger for Arc<Discord> {
 
             println!("Response HTTP code: {}", response.status());
 
-            *socket = Some(stream);
+            socket.websocket = Some(stream);
         };
         Some(Arc::<Discord>::downgrade(&self) as Weak<dyn Socket + Send + Sync>)
     }
