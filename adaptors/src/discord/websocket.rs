@@ -1,13 +1,13 @@
-use std::time::Duration;
 use async_trait::async_trait;
+use async_tungstenite::WebSocketStream;
 use async_tungstenite::async_std::ConnectStream;
 use async_tungstenite::tungstenite::Message;
-use async_tungstenite::WebSocketStream;
-use futures::lock::Mutex;
 use futures::StreamExt;
+use futures::lock::Mutex;
 use serde::Deserialize;
 use serde_json::json;
 use serde_repr::Deserialize_repr;
+use std::time::Duration;
 
 use crate::{Socket, SocketUpdate};
 
@@ -28,13 +28,13 @@ enum Opcode {
 
 pub(super) struct DiscordSocket {
     pub websocket: Option<WebSocketStream<ConnectStream>>,
-    pub heart_beat_interval: Option<Duration>
+    pub heart_beat_interval: Option<Duration>,
 }
 impl DiscordSocket {
     pub fn new() -> Self {
         DiscordSocket {
             websocket: None.into(),
-            heart_beat_interval: None
+            heart_beat_interval: None,
         }
     }
 }
@@ -55,8 +55,7 @@ impl Socket for Discord {
     async fn next(&self) -> Option<SocketUpdate> {
         let mut discord_stream = self.socket.lock().await;
         // let stream = discord_stream.websocket.as_mut()?;
-        
-        
+
         let json = match discord_stream.websocket.as_mut()?.next().await? {
             Ok(Message::Text(text)) => serde_json::from_str::<GateawayPayload>(&text).unwrap(),
             Ok(Message::Close(frame)) => {
@@ -71,16 +70,16 @@ impl Socket for Discord {
         };
         // println!("Received: {:#?}", json);
         println!("Received: {:#?}", json.op);
-        
-        
-        
+
         match json.op {
             Opcode::Hello => {
                 println!("{:#?}", json);
-                discord_stream.heart_beat_interval = json.d.get("heartbeat_interval")
+                discord_stream.heart_beat_interval = json
+                    .d
+                    .get("heartbeat_interval")
                     .and_then(|v| v.as_u64())
                     .map(Duration::from_millis);
-                
+
                 // Send Identify payload
                 let identify_payload = json!({
                     "op": 2,
@@ -94,7 +93,9 @@ impl Socket for Discord {
                         }
                     }
                 });
-                discord_stream.websocket.as_mut()?
+                discord_stream
+                    .websocket
+                    .as_mut()?
                     .send(Message::Text(identify_payload.to_string().into()))
                     .await
                     .expect("Failed to send identify payload");
@@ -117,7 +118,7 @@ impl Socket for Discord {
                     _ => eprintln!("Unkown event_name recived: {:?}", event_name),
                 }
             }
-            _=> {}
+            _ => {}
         };
 
         Some(SocketUpdate::Skip)

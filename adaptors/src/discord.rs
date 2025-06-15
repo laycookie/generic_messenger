@@ -10,8 +10,8 @@ use async_tungstenite::{
 };
 use futures::lock::Mutex;
 
-use crate::{Messanger, MessangerQuery, ParameterizedMessangerQuery, Socket};
 use crate::discord::websocket::DiscordSocket;
+use crate::{Messanger, MessangerQuery, ParameterizedMessangerQuery, Socket};
 
 pub mod json_structs;
 pub mod rest_api;
