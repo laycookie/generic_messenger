@@ -54,7 +54,12 @@ pub trait ParameterizedMessangerQuery {
 }
 
 // === Sockets
+#[derive(Debug)]
+pub enum SocketUpdate {
+    MessageCreated,
+    Skip,
+}
 #[async_trait]
 pub trait Socket {
-    async fn next(&self) -> Option<usize>;
+    async fn next(&self) -> Option<SocketUpdate>;
 }

@@ -18,7 +18,6 @@ pub mod websocket;
 
 pub struct Discord {
     // Metadata
-    // uuid: Uuid,
     token: String, // TODO: Make it secure
     intents: u32,
 
@@ -26,18 +25,19 @@ pub struct Discord {
     socket: Mutex<Option<WebSocketStream<ConnectStream>>>,
     // Cache
     dms: RwLock<Vec<json_structs::Channel>>,
+    guilds: RwLock<Vec<json_structs::Guild>>,
 }
 
 impl Discord {
     pub fn new(token: &str) -> Arc<dyn Messanger> {
         Arc::new(Arc::new(Discord {
-            // uuid: Uuid::new_v4(),
             token: token.into(),
             intents: 161789, // 32767,
 
             socket: None.into(),
 
             dms: RwLock::new(Vec::new()),
+            guilds: RwLock::new(Vec::new()),
         }))
     }
 }

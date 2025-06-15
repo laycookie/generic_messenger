@@ -13,7 +13,6 @@ pub(crate) enum MyAppMessage {
     // Actions
     OpenPage(Page),
     AuthDiskSync,
-    SocketConnect,
     SocketEvent(SocketEvent),
     // Pages
     Login(LoginMessage),

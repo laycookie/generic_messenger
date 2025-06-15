@@ -3,7 +3,7 @@ use std::{
     task::Poll,
 };
 
-use adaptors::{Messanger as Auth, Socket};
+use adaptors::{Messanger as Auth, Socket, SocketUpdate};
 use futures::{
     channel::mpsc::{self, Receiver, Sender},
     FutureExt, Stream, StreamExt,
@@ -16,18 +16,20 @@ pub enum ReciverEvent {
 #[derive(Debug)]
 pub enum SocketEvent {
     Connect(Sender<ReciverEvent>),
-    Echo(usize),
+    Message(SocketUpdate),
 }
 
 pub struct SocketConnection {
     receiver: Option<Receiver<ReciverEvent>>,
     active_streams: Vec<Weak<dyn Socket + Send + Sync>>,
+    ready_events: Vec<SocketUpdate>,
 }
 impl SocketConnection {
     pub fn new() -> Self {
         SocketConnection {
             receiver: None,
             active_streams: Vec::new(),
+            ready_events: Vec::new(),
         }
     }
 }
@@ -66,6 +68,12 @@ impl Stream for SocketConnection {
             }
         };
 
+        // Return events, before fetching new ones
+        if let Some(e) = self.ready_events.pop() {
+            return Poll::Ready(Some(SocketEvent::Message(e)));
+        }
+
+        let mut new_events = Vec::with_capacity(self.active_streams.len());
         self.active_streams.retain(|stream| {
             // Underlying messenger got dropped.
             let Some(stream) = stream.upgrade() else {
@@ -73,13 +81,17 @@ impl Stream for SocketConnection {
                 return false;
             };
 
-            // The stream got closed
-            if let Poll::Ready(val) = stream.next().poll_unpin(cx) {
-                return val.is_some();
-            };
-
-            true
+            let mut next = stream.next();
+            match next.poll_unpin(cx) {
+                Poll::Ready(Some(update)) => {
+                    new_events.push(update);
+                    true
+                }
+                Poll::Ready(None) => false, // The stream got closed
+                Poll::Pending => true,
+            }
         });
+        self.ready_events.extend(new_events);
 
         cx.waker().wake_by_ref();
         return Poll::Pending;
