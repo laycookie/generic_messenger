@@ -14,7 +14,7 @@ use iced::{
         text::LineHeight,
         Button, Column, Responsive, Scrollable, Text, TextInput,
     },
-    Alignment, ContentFit, Length, Task,
+    Alignment, ContentFit, Length, Padding, Task,
 };
 use widgets::divider;
 
@@ -236,9 +236,19 @@ impl MessangerWindow {
                         .conversations
                         .iter()
                         .map(|i| {
-                            Button::new(i.name.as_str())
-                                .width(Length::Fill)
-                                .on_press(Message::LoadConversation(i.to_owned()).into())
+                            Button::new({
+                                let image = match &i.icon {
+                                    Some(icon) => image(icon),
+                                    None => image("./public/imgs/placeholder.jpg"),
+                                };
+                                row![
+                                    container(image.height(Length::Fixed(28.0)))
+                                        .padding(Padding::new(0.0).right(10.0)),
+                                    i.name.as_str()
+                                ]
+                            })
+                            .width(Length::Fill)
+                            .on_press(Message::LoadConversation(i.to_owned()).into())
                         })
                         .fold(Column::new(), |column, widget| column.push(widget))
                 ]
