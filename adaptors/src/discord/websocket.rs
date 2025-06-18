@@ -3,13 +3,15 @@ use async_tungstenite::WebSocketStream;
 use async_tungstenite::async_std::ConnectStream;
 use async_tungstenite::tungstenite::Message;
 use futures::StreamExt;
-use futures::lock::Mutex;
 use serde::Deserialize;
 use serde_json::json;
 use serde_repr::Deserialize_repr;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use crate::{Socket, SocketUpdate};
+use crate::{
+    Socket, SocketUpdate,
+    types::{Identifier, Msg, Usr},
+};
 
 use super::Discord;
 
@@ -54,7 +56,6 @@ struct GateawayPayload {
 impl Socket for Discord {
     async fn next(&self) -> Option<SocketUpdate> {
         let mut discord_stream = self.socket.lock().await;
-        // let stream = discord_stream.websocket.as_mut()?;
 
         let json = match discord_stream.websocket.as_mut()?.next().await? {
             Ok(Message::Text(text)) => serde_json::from_str::<GateawayPayload>(&text).unwrap(),
@@ -73,7 +74,6 @@ impl Socket for Discord {
 
         match json.op {
             Opcode::Hello => {
-                println!("{:#?}", json);
                 discord_stream.heart_beat_interval = json
                     .d
                     .get("heartbeat_interval")
@@ -112,8 +112,55 @@ impl Socket for Discord {
                         println!("something something")
                     }
                     "MESSAGE_CREATE" => {
-                        println!("{:#?}", json.d);
-                        return Some(SocketUpdate::MessageCreated);
+                        let channel_id = json
+                            .d
+                            .get("channel_id")
+                            .and_then(|id| Some(id.to_string()))
+                            .unwrap();
+                        let msg_id = json
+                            .d
+                            .get("id")
+                            .and_then(|id| Some(id.to_string()))
+                            .unwrap();
+
+                        let text = json
+                            .d
+                            .get("content")
+                            .and_then(|id| Some(id.to_string()))
+                            .unwrap();
+
+                        let author = json.d.get("author").unwrap();
+                        let author_id = author
+                            .get("id")
+                            .and_then(|id| Some(id.to_string()))
+                            .unwrap();
+                        let author_name = author
+                            .get("username")
+                            .and_then(|username| Some(username.to_string()))
+                            .unwrap();
+
+                        return Some(SocketUpdate::MessageCreated {
+                            channel: Identifier {
+                                id: channel_id.to_owned(),
+                                hash: None,
+                                data: (),
+                            },
+                            msg: Identifier {
+                                id: msg_id,
+                                hash: None,
+                                data: Msg {
+                                    author: Identifier {
+                                        id: author_id,
+                                        hash: None,
+                                        data: Usr {
+                                            name: author_name,
+                                            icon: None, // TODO:
+                                        },
+                                    },
+                                    text,
+                                },
+                            },
+                        });
                     }
                     _ => eprintln!("Unkown event_name recived: {:?}", event_name),
                 }

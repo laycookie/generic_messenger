@@ -3,7 +3,7 @@ use std::{error::Error, fmt::Debug, sync::Arc};
 use crate::AuthStore;
 
 use adaptors::{
-    types::{Message as ChatMessage, Store, User},
+    types::{Chan, Identifier, Msg, Server, Usr},
     Messanger as Auth,
 };
 use futures::{future::try_join_all, try_join};
@@ -20,30 +20,31 @@ use widgets::divider;
 
 #[derive(Debug, Clone)]
 struct MessangerData {
-    profile: User,
-    contacts: Vec<User>,
-    conversations: Vec<Store>,
-    guilds: Vec<Store>,
+    uid: String,
+    profile: Identifier<Usr>,
+    contacts: Vec<Identifier<Usr>>,
+    conversations: Vec<Identifier<Chan>>,
+    guilds: Vec<Identifier<Server>>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
     DividerChange(f32),
     OpenScreen(Screen),
-    LoadConversation(Store),
+    LoadConversation { uid: String, chan: Identifier<Chan> },
     MessageInput(String),
     MessageSend,
 }
 
 #[derive(Debug, Clone)]
-enum Screen {
+pub(crate) enum Screen {
     Contacts {
         search_input: String,
     },
     Chat {
         auth: Arc<dyn Auth>,
-        meta_data: Store,
-        messages: Vec<ChatMessage>,
+        meta_data: Identifier<Chan>,
+        messages: Vec<Identifier<Msg>>,
         msg: String,
     },
 }
@@ -67,18 +68,10 @@ impl MessangerWindow {
     pub(crate) async fn new(
         auths: Vec<Arc<dyn Auth>>,
     ) -> Result<Self, Arc<dyn Error + Sync + Send>> {
-        // let stream = auths
-        //     .iter()
-        //     .map(async move |a| {
-        //         let socket = a.socket().unwrap();
-        //         socket.get_stream().await
-        //     })
-        //     .collect::<Vec<_>>();
-        // let temp = join_all(stream).await;
-
         let reqs = auths.iter().map(async move |auth| {
             let q = auth.query().unwrap();
             try_join!(
+                async { Ok(auth.id()) },
                 q.get_profile(),
                 q.get_conversation(),
                 q.get_contacts(),
@@ -89,12 +82,15 @@ impl MessangerWindow {
         let messangers_data = try_join_all(reqs)
             .await?
             .into_iter()
-            .map(|(profile, conversations, contacts, guilds)| MessangerData {
-                profile,
-                contacts,
-                conversations,
-                guilds,
-            })
+            .map(
+                |(uid, profile, conversations, contacts, guilds)| MessangerData {
+                    uid,
+                    profile,
+                    contacts,
+                    conversations,
+                    guilds,
+                },
+            )
             .collect::<Vec<_>>();
 
         let window = MessangerWindow {
@@ -128,27 +124,27 @@ impl MessangerWindow {
                 self.screen = screen;
                 Action::None
             }
-            Message::LoadConversation(msgs_store) => {
+            Message::LoadConversation { uid, chan } => {
                 let auth = auth_store
                     .get_auths()
                     .into_iter()
-                    .find(|auth| msgs_store.origin_uid == auth.id())
+                    .find(|auth| uid == auth.id())
                     .clone();
 
                 if let Some(auth) = auth {
                     let future = async move {
                         let msgs = {
                             let pq = auth.param_query().unwrap();
-                            pq.get_messanges(&msgs_store, None).await.unwrap()
+                            pq.get_messanges(&chan, None).await.unwrap()
                         };
 
-                        (auth, msgs_store, msgs)
+                        (auth, chan, msgs)
                     };
 
-                    return Action::Run(Task::perform(future, |(auth, msgs_store, mess)| {
+                    return Action::Run(Task::perform(future, |(auth, chan, mess)| {
                         Message::OpenScreen(Screen::Chat {
                             auth,
-                            meta_data: msgs_store,
+                            meta_data: chan,
                             messages: mess,
                             msg: String::new(),
                         })
@@ -197,29 +193,32 @@ impl MessangerWindow {
     }
 
     pub(crate) fn view(&self) -> iced::Element<Message> {
-        let options = row![Text::new(&self.messangers_data[0].profile.username)];
+        let options = row![Text::new(&self.messangers_data[0].profile.data.name)];
 
         let navbar = Scrollable::new(
-            self.messangers_data[0]
-                .guilds
+            self.messangers_data
                 .iter()
-                .map(|i| {
-                    let image = match &i.icon {
-                        Some(icon) => image(icon),
-                        None => image("./public/imgs/placeholder.jpg"),
-                    };
-                    Button::new(
-                        image
-                            .height(Length::Fixed(48.0))
-                            .width(Length::Fixed(48.0))
-                            .content_fit(ContentFit::Cover),
-                    )
+                .map(|messanger_data| {
+                    messanger_data.guilds.iter().map(|i| {
+                        let image = match &i.data.icon {
+                            Some(icon) => image(icon),
+                            None => image("./public/imgs/placeholder.jpg"),
+                        };
+                        Button::new(
+                            image
+                                .height(Length::Fixed(48.0))
+                                .width(Length::Fixed(48.0))
+                                .content_fit(ContentFit::Cover),
+                        )
+                    })
                 })
+                .flatten()
                 .fold(Column::new(), |column, widget| column.push(widget)),
         )
         .direction(Direction::Vertical(
             Scrollbar::default().width(0).scroller_width(0),
         ));
+
         let window = Responsive::new(move |size| {
             let sidebar = Scrollable::new(
                 column![
@@ -232,23 +231,30 @@ impl MessangerWindow {
                         search_input: String::new()
                     }))
                     .width(Length::Fill),
+                    // TODO: Make it read from all of them
                     self.messangers_data[0]
                         .conversations
                         .iter()
                         .map(|i| {
                             Button::new({
-                                let image = match &i.icon {
+                                let image = match &i.data.icon {
                                     Some(icon) => image(icon),
                                     None => image("./public/imgs/placeholder.jpg"),
                                 };
                                 row![
                                     container(image.height(Length::Fixed(28.0)))
                                         .padding(Padding::new(0.0).right(10.0)),
-                                    i.name.as_str()
+                                    i.data.name.as_str()
                                 ]
                             })
                             .width(Length::Fill)
-                            .on_press(Message::LoadConversation(i.to_owned()).into())
+                            .on_press(
+                                Message::LoadConversation {
+                                    uid: self.messangers_data[0].uid.clone(), // TODO
+                                    chan: i.to_owned(),
+                                }
+                                .into(),
+                            )
                         })
                         .fold(Column::new(), |column, widget| column.push(widget))
                 ]
@@ -270,11 +276,12 @@ impl MessangerWindow {
                             .iter()
                             .filter_map(|i| {
                                 if search_input.is_empty()
-                                    || i.username
+                                    || i.data
+                                        .name
                                         .to_lowercase()
                                         .contains(search_input.to_lowercase().as_str())
                                 {
-                                    return Some(Text::from(i.username.as_str()));
+                                    return Some(Text::from(i.data.name.as_str()));
                                 }
                                 None
                             })
@@ -287,13 +294,13 @@ impl MessangerWindow {
                     meta_data,
                     ..
                 } => {
-                    let meta_data = row![Text::new(meta_data.name.clone())];
+                    let meta_data = row![Text::new(meta_data.data.name.clone())];
 
                     let chat = Scrollable::new(
                         messages
                             .iter()
                             .rev()
-                            .map(|msg| Text::from(msg.text.as_str()))
+                            .map(|msg| Text::from(msg.data.text.as_str()))
                             .fold(Column::new(), |column, widget| column.push(widget)),
                     )
                     .anchor_bottom()

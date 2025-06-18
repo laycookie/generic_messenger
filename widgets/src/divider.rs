@@ -93,7 +93,6 @@ where
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerPressed { .. }) => {
-                
                 //Imma leave these commented for println for later purpose
                 if let Some(cursor_position) = cursor.position_over(layout.bounds()) {
                     foo.is_dragging = true;

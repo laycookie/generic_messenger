@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use futures::future::join_all;
-use std::{error::Error, sync::Arc};
+use std::error::Error;
 
 use crate::{
-    Messanger, MessangerQuery, ParameterizedMessangerQuery,
+    MessangerQuery, ParameterizedMessangerQuery,
     network::{cache_download, http_request},
-    types::{Message as GlobalMessage, Store, User},
+    types::{Chan, Identifier, Msg, Server, Usr},
 };
 
 use super::{
@@ -20,25 +20,45 @@ impl Discord {
 }
 
 #[async_trait]
-impl MessangerQuery for Arc<Discord> {
-    async fn get_profile(&self) -> Result<User, Box<dyn Error + Sync + Send>> {
+impl MessangerQuery for Discord {
+    async fn get_profile(&self) -> Result<Identifier<Usr>, Box<dyn Error + Sync + Send>> {
         let profile = http_request::<Profile>(
             surf::get("https://discord.com/api/v9/users/@me"),
             self.get_auth_header(),
         )
         .await?;
 
-        Ok(profile.into())
+        Ok(Identifier {
+            id: profile.id.clone(),
+            hash: None,
+            data: Usr {
+                name: profile.username.clone(),
+                icon: None,
+            },
+        })
     }
-    async fn get_contacts(&self) -> Result<Vec<User>, Box<dyn Error + Sync + Send>> {
+    async fn get_contacts(&self) -> Result<Vec<Identifier<Usr>>, Box<dyn Error + Sync + Send>> {
         let friends = http_request::<Vec<Friend>>(
             surf::get("https://discord.com/api/v9/users/@me/relationships"),
             self.get_auth_header(),
         )
         .await?;
-        Ok(friends.iter().map(|friend| friend.clone().into()).collect())
+        println!("Friends: {:?}", friends);
+        Ok(friends
+            .iter()
+            .map(|friend| Identifier {
+                id: friend.id.clone(),
+                hash: None,
+                data: Usr {
+                    name: friend.user.username.clone(),
+                    icon: None,
+                },
+            })
+            .collect())
     }
-    async fn get_conversation(&self) -> Result<Vec<Store>, Box<dyn Error + Sync + Send>> {
+    async fn get_conversation(
+        &self,
+    ) -> Result<Vec<Identifier<Chan>>, Box<dyn Error + Sync + Send>> {
         let channels = http_request::<Vec<Channel>>(
             surf::get("https://discord.com/api/v10/users/@me/channels"),
             self.get_auth_header(),
@@ -48,20 +68,23 @@ impl MessangerQuery for Arc<Discord> {
         let conversations = channels
             .iter()
             .map(async move |channel| {
-                let mut data = Store {
-                    origin_uid: self.id(),
-                    hash: None,
+                let mut id = Identifier {
                     id: channel.id.clone(),
-                    name: channel
-                        .clone()
-                        .name
-                        .unwrap_or(match channel.recipients.get(0) {
-                            Some(test) => test.username.clone(),
-                            None => "Fix later".to_string(),
+                    hash: None,
+                    data: Chan {
+                        name: channel
+                              .clone()
+                              .name
+                              .unwrap_or(match channel.recipients.get(0) {
+                                    Some(test) => test.username.clone(),
+                                    None => "Fix later".to_string(),
                         }),
-                    icon: None,
+                        icon: None,
+                        particepents: Vec::new(),
+                    }
                 };
 
+                // If channel has icon, insert that, and return it
                 if let Some(hash) = &channel.icon {
                     let icon = cache_download(
                         format!(
@@ -74,15 +97,16 @@ impl MessangerQuery for Arc<Discord> {
                     .await;
                     match icon {
                         Ok(path) => {
-                            data.icon = Some(path);
-                            return data;
+                            id.data.icon = Some(path);
+                            return id;
                         }
                         Err(e) => {
-                            eprintln!("Failed to download icon for channel: {}\n{}", data.name, e);
+                            eprintln!("Failed to download icon for channel: {}\n{}", id.data.name, e);
                         }
                     };
                 }
 
+                // If first recipient has a profile picture, insert that, and return
                 let first_recipients = &channel.recipients[0];
                 if let Some(hash) = &first_recipients.avatar {
                     let icon = cache_download(
@@ -96,16 +120,16 @@ impl MessangerQuery for Arc<Discord> {
                     .await;
                     match icon {
                         Ok(path) => {
-                            data.icon = Some(path);
-                            return data;
+                            id.data.icon = Some(path);
+                            return id;
                         }
                         Err(e) => {
-                            eprintln!("Failed to download icon for channel: {}\n{}", data.name, e);
+                            eprintln!("Failed to download icon for channel: {}\n{}", id.data.name, e);
                         }
                     };
                 };
 
-                data
+                id
             })
             .collect::<Vec<_>>();
         let b = join_all(conversations).await;
@@ -114,7 +138,7 @@ impl MessangerQuery for Arc<Discord> {
 
         Ok(b)
     }
-    async fn get_guilds(&self) -> Result<Vec<Store>, Box<dyn Error + Sync + Send>> {
+    async fn get_guilds(&self) -> Result<Vec<Identifier<Server>>, Box<dyn Error + Sync + Send>> {
         let guilds = http_request::<Vec<Guild>>(
             surf::get("https://discord.com/api/v10/users/@me/guilds"),
             self.get_auth_header(),
@@ -141,14 +165,15 @@ impl MessangerQuery for Arc<Discord> {
                 }
             });
 
-            Store {
-                origin_uid: self.id(),
-                hash: None,
+            Identifier {
                 id: g.id.clone(),
-                name: g.name.clone(),
-                icon: match icon {
-                    Some(icon) => icon.await,
-                    None => None,
+                hash: None,
+                data: Server {
+                    name: g.name.clone(),
+                    icon: match icon {
+                        Some(icon) => icon.await,
+                        None => None,
+                    },
                 },
             }
         });
@@ -165,9 +190,9 @@ impl ParameterizedMessangerQuery for Discord {
     // https://discord.com/developers/docs/resources/message#get-channel-message
     async fn get_messanges(
         &self,
-        msgs_location: &Store,
-        load_from_msg: Option<GlobalMessage>,
-    ) -> Result<Vec<GlobalMessage>, Box<dyn Error + Sync + Send>> {
+        msgs_location: &Identifier<Chan>,
+        load_from_msg: Option<Identifier<Msg>>,
+    ) -> Result<Vec<Identifier<Msg>>, Box<dyn Error + Sync + Send>> {
         let before = match load_from_msg {
             Some(msg) => format!("?{}", msg.id),
             None => "".to_string(),
@@ -184,10 +209,20 @@ impl ParameterizedMessangerQuery for Discord {
 
         Ok(messages
             .iter()
-            .map(|message| GlobalMessage {
+            .map(|message| Identifier {
                 id: message.id.clone(),
-                sender: msgs_location.clone(),
-                text: message.content.clone(),
+                hash: None,
+                data: Msg {
+                    author: Identifier {
+                        id: message.author.id.clone(),
+                        hash: None,
+                        data: Usr {
+                            name: message.author.username.clone(),
+                            icon: None, // TODO
+                        },
+                    },
+                    text: message.content.clone(),
+                },
             })
             .collect())
     }
@@ -195,7 +230,7 @@ impl ParameterizedMessangerQuery for Discord {
     // Docs: https://discord.com/developers/docs/resources/message#create-message
     async fn send_message(
         &self,
-        location: &Store,
+        location: &Identifier<Chan>,
         contents: String,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
         let message = CreateMessage {

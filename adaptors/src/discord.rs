@@ -4,10 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use async_tungstenite::{
-    WebSocketStream,
-    async_std::{ConnectStream, connect_async},
-};
+use async_tungstenite::async_std::connect_async;
 use futures::lock::Mutex;
 
 use crate::discord::websocket::DiscordSocket;
@@ -38,6 +35,12 @@ impl Discord {
             guilds: RwLock::new(Vec::new()),
         }))
     }
+    fn id(&self) -> String {
+        String::from(self.name().to_owned() + &self.token)
+    }
+    fn name(&self) -> &'static str {
+        "Discord".into()
+    }
 }
 
 impl Debug for Discord {
@@ -49,17 +52,17 @@ impl Debug for Discord {
 #[async_trait]
 impl Messanger for Arc<Discord> {
     fn id(&self) -> String {
-        String::from(self.name().to_owned() + &self.token)
+        (**self).id()
     }
-    // === Unifi a bit ===
+    // === Unify a bit ===
     fn name(&self) -> &'static str {
-        "Discord".into()
+        (**self).name()
     }
     fn auth(&self) -> String {
         self.token.clone()
     }
     fn query(&self) -> Option<&dyn MessangerQuery> {
-        Some(&*self)
+        Some(&**self)
     }
     fn param_query(&self) -> Option<&dyn ParameterizedMessangerQuery> {
         Some(&**self)

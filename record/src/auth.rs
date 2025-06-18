@@ -72,7 +72,7 @@ impl<'a> AuthStore {
             }
 
             let auth = messangers.auth.as_ref();
-            writeln!(self.file, "{}:{}", auth.name(), auth.id()).unwrap();
+            writeln!(self.file, "{}:{}", auth.name(), auth.auth()).unwrap();
         });
     }
 

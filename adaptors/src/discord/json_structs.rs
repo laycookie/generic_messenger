@@ -1,4 +1,3 @@
-use crate::types::User as GlobalUser;
 use serde::{Deserialize, Serialize};
 use serde_repr::Deserialize_repr;
 
@@ -18,7 +17,7 @@ pub struct Profile {
     // email: String,
     // flags: i32,
     // global_name: String,
-    id: String,
+    pub id: String,
     // linked_users: Vec<String>,
     // locale: String,
     // mfa_enabled: bool,
@@ -26,54 +25,30 @@ pub struct Profile {
     // phone: Option<String>,
     // premium_type: i32,
     // public_flags: i32,
-    username: String,
+    pub username: String,
     // verified: bool,
-}
-impl From<Profile> for GlobalUser {
-    fn from(val: Profile) -> Self {
-        GlobalUser {
-            id: val.id,
-            username: val.username,
-        }
-    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct User {
-    // avatar: Option<String>,
+    pub avatar: Option<String>,
     // avatar_decoration_data: Option<String>,
     // clan: Option<String>,
     // discriminator: String,
-    id: String,
-    username: String,
-}
-
-impl From<&User> for GlobalUser {
-    fn from(val: &User) -> Self {
-        GlobalUser {
-            id: val.id.clone(),
-            username: val.username.clone(),
-        }
-    }
+    pub id: String,
+    pub username: String,
 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct Friend {
-    id: String,
+    pub id: String,
     // is_spam_request: bool,
     // nickname: Option<String>,
     // since: String,
     // type: i32,
-    user: User,
+    pub user: User,
 }
-impl From<Friend> for GlobalUser {
-    fn from(val: Friend) -> Self {
-        GlobalUser {
-            id: val.id.clone(),
-            username: val.user.username.clone(),
-        }
-    }
-}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Recipient {
     pub(crate) avatar: Option<String>,
