@@ -232,30 +232,32 @@ impl MessangerWindow {
                     }))
                     .width(Length::Fill),
                     // TODO: Make it read from all of them
-                    self.messangers_data[0]
-                        .conversations
+                    self.messangers_data
                         .iter()
-                        .map(|i| {
-                            Button::new({
-                                let image = match &i.data.icon {
-                                    Some(icon) => image(icon),
-                                    None => image("./public/imgs/placeholder.jpg"),
-                                };
-                                row![
-                                    container(image.height(Length::Fixed(28.0)))
-                                        .padding(Padding::new(0.0).right(10.0)),
-                                    i.data.name.as_str()
-                                ]
+                        .map(|messanger_data| {
+                            messanger_data.conversations.iter().map(|i| {
+                                Button::new({
+                                    let image = match &i.data.icon {
+                                        Some(icon) => image(icon),
+                                        None => image("./public/imgs/placeholder.jpg"),
+                                    };
+                                    row![
+                                        container(image.height(Length::Fixed(28.0)))
+                                            .padding(Padding::new(0.0).right(10.0)),
+                                        i.data.name.as_str()
+                                    ]
+                                })
+                                .width(Length::Fill)
+                                .on_press(
+                                    Message::LoadConversation {
+                                        uid: messanger_data.uid.clone(), // TODO
+                                        chan: i.to_owned(),
+                                    }
+                                    .into(),
+                                )
                             })
-                            .width(Length::Fill)
-                            .on_press(
-                                Message::LoadConversation {
-                                    uid: self.messangers_data[0].uid.clone(), // TODO
-                                    chan: i.to_owned(),
-                                }
-                                .into(),
-                            )
                         })
+                        .flatten()
                         .fold(Column::new(), |column, widget| column.push(widget))
                 ]
                 .width(self.sidebar_width),
