@@ -97,7 +97,7 @@ impl App {
                     Task::none()
                 }
                 socket::SocketEvent::Message(t) => {
-                    println!("Rec: {:?}", t);
+                    // println!("Rec: {:?}", t);
                     Task::none()
                 }
             },

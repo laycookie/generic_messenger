@@ -41,6 +41,8 @@ impl Stream for SocketConnection {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
+        let mut is_last_future_ready = true;
+
         let Some(ref mut reciever) = self.receiver else {
             let (sender, receiver) = mpsc::channel::<ReciverEvent>(128);
             self.receiver = Some(receiver);
@@ -66,7 +68,11 @@ impl Stream for SocketConnection {
                     }
                 }
             }
-        };
+        }
+        else {
+            is_last_future_ready = false;
+        }
+
 
         // Return events, before fetching new ones
         if let Some(e) = self.ready_events.pop() {
@@ -85,15 +91,22 @@ impl Stream for SocketConnection {
             match next.poll_unpin(cx) {
                 Poll::Ready(Some(update)) => {
                     new_events.push(update);
+                    is_last_future_ready = true;
                     true
                 }
                 Poll::Ready(None) => false, // The stream got closed
-                Poll::Pending => true,
+                Poll::Pending =>{
+                    is_last_future_ready = false;
+                    true
+                },
             }
         });
         self.ready_events.extend(new_events);
 
-        cx.waker().wake_by_ref();
-        return Poll::Pending;
+
+        if is_last_future_ready {
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
     }
 }
