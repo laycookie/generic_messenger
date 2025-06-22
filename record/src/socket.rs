@@ -1,12 +1,11 @@
-use std::{
-    sync::{Arc, Weak},
-    task::Poll,
-};
-
 use adaptors::{Messanger as Auth, Socket, SocketUpdate};
 use futures::{
     channel::mpsc::{self, Receiver, Sender},
     FutureExt, Stream, StreamExt,
+};
+use std::{
+    sync::{Arc, Weak},
+    task::Poll,
 };
 
 pub enum ReciverEvent {
@@ -41,8 +40,6 @@ impl Stream for SocketConnection {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        let mut is_last_future_ready = true;
-
         let Some(ref mut reciever) = self.receiver else {
             let (sender, receiver) = mpsc::channel::<ReciverEvent>(128);
             self.receiver = Some(receiver);
@@ -69,15 +66,6 @@ impl Stream for SocketConnection {
                 }
             }
         }
-        else {
-            is_last_future_ready = false;
-        }
-
-
-        // Return events, before fetching new ones
-        if let Some(e) = self.ready_events.pop() {
-            return Poll::Ready(Some(SocketEvent::Message(e)));
-        }
 
         let mut new_events = Vec::with_capacity(self.active_streams.len());
         self.active_streams.retain(|stream| {
@@ -91,21 +79,16 @@ impl Stream for SocketConnection {
             match next.poll_unpin(cx) {
                 Poll::Ready(Some(update)) => {
                     new_events.push(update);
-                    is_last_future_ready = true;
                     true
                 }
                 Poll::Ready(None) => false, // The stream got closed
-                Poll::Pending =>{
-                    is_last_future_ready = false;
-                    true
-                },
+                Poll::Pending => true,
             }
         });
         self.ready_events.extend(new_events);
-
-
-        if is_last_future_ready {
-            cx.waker().wake_by_ref();
+        // Return events, before fetching new ones
+        if let Some(e) = self.ready_events.pop() {
+            return Poll::Ready(Some(SocketEvent::Message(e)));
         }
         Poll::Pending
     }
