@@ -46,6 +46,7 @@ enum LoginMethods {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    ToggleButtonState,
     PlatformInput(Platform),
     TokenInput(String),
     SubmitToken,
@@ -65,6 +66,7 @@ pub struct Login {
     token: String,
     // TODO: Display error
     _error: Option<String>,
+    button_state: bool,
 }
 impl Login {
     pub fn new() -> Self {
@@ -75,6 +77,7 @@ impl Login {
             selected_platform: Platform::Test,
             token: String::new(),
             _error: None,
+            button_state: true,
         }
     }
 }
@@ -82,6 +85,9 @@ impl Login {
 impl Login {
     pub(crate) fn update(&mut self, message: Message) -> Action {
         match message {
+            Message::ToggleButtonState => {
+                self.button_state = true;
+            }
             Message::PlatformInput(platform) => {
                 self.selected_platform = platform;
             }
@@ -90,6 +96,7 @@ impl Login {
             }
             Message::SubmitToken => {
                 // TODO: Disable submit button until the operation ether
+                self.button_state = false;
                 let platform = self.selected_platform.clone();
                 let token = self.token.clone();
 
@@ -133,7 +140,15 @@ impl Login {
             "Login",
             select_platform,
             auth_input,
-            Button::new("Submit").on_press(Message::SubmitToken)
+            Button::new("Submit")
+                .on_press_maybe(self.button_state.then_some(Message::SubmitToken))
+                .style(|theme, status| {
+                    iced::widget::button::Style::default().with_background(if self.button_state {
+                        iced::Background::Color(iced::Color::from_rgba(1.0, 1.0, 1.0, 1.0))
+                    } else {
+                        iced::Background::Color(iced::Color::from_rgba(1.0, 1.0, 1.0, 0.5))
+                    })
+                })
         ]
         .width(iced::Length::Fixed(width))
         .align_x(Alignment::Center)
