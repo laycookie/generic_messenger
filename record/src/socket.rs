@@ -61,11 +61,7 @@ impl Stream for SocketsInterface {
                     }
                 }
             }
-        }
-        else {
-            is_last_future_ready = false;
-        }
-
+        };
 
         if let Some(e) = self.ready_events.pop() {
             return Poll::Ready(Some(e));
@@ -85,10 +81,7 @@ impl Stream for SocketsInterface {
                     true
                 }
                 Poll::Ready(None) => false, // The stream got closed
-                Poll::Pending =>{
-                    is_last_future_ready = false;
-                    true
-                },
+                Poll::Pending => true,
             }
         });
         if new_events.len() > 0 {
