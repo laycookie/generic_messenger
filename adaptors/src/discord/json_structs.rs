@@ -169,9 +169,10 @@ pub struct CreateMessage {
                             // poll: Option<Poll>, // Poll object
 }
 
+// https://discord.com/developers/docs/resources/guild#guild-object
 #[derive(Debug, Deserialize, Clone)]
 pub struct Guild {
-    pub id: String, // Snowflake (usually a string for large numbers)
+    pub id: String,
     pub name: String,
     pub icon: Option<String>,
     // pub icon_hash: Option<String>,

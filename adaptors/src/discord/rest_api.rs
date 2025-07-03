@@ -209,6 +209,7 @@ impl ParameterizedMessangerQuery for Discord {
 
         Ok(messages
             .iter()
+            .rev()
             .map(|message| Identifier {
                 id: message.id.clone(),
                 hash: None,
