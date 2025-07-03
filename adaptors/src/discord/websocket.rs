@@ -6,10 +6,10 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use serde_repr::Deserialize_repr;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use crate::{
-    Socket, SocketUpdate,
+    Socket, SocketEvent,
     types::{Identifier, Msg, Usr},
 };
 
@@ -29,13 +29,13 @@ enum Opcode {
 }
 
 pub(super) struct DiscordSocket {
-    pub websocket: Option<WebSocketStream<ConnectStream>>,
+    pub websocket: WebSocketStream<ConnectStream>,
     pub heart_beat_interval: Option<Duration>,
 }
 impl DiscordSocket {
-    pub fn new() -> Self {
+    pub fn new(websocket: WebSocketStream<ConnectStream>) -> Self {
         DiscordSocket {
-            websocket: None.into(),
+            websocket,
             heart_beat_interval: None,
         }
     }
@@ -54,18 +54,21 @@ struct GateawayPayload {
 
 #[async_trait]
 impl Socket for Discord {
-    async fn next(&self) -> Option<SocketUpdate> {
-        let mut discord_stream = self.socket.lock().await;
+    async fn next(&self) -> Option<SocketEvent> {
+        let mut socket = self.socket.lock().await;
+        let discord_stream = socket.as_mut()?;
 
-        let json = match discord_stream.websocket.as_mut()?.next().await? {
+        let json = match discord_stream.websocket.next().await? {
             Ok(Message::Text(text)) => serde_json::from_str::<GateawayPayload>(&text).unwrap(),
             Ok(Message::Close(frame)) => {
                 println!("Disconnected: {:?}", frame);
+                *socket = None;
                 return None;
             }
             Ok(_) => todo!(),
             Err(e) => {
                 eprintln!("Error: {}", e);
+                *socket = None;
                 return None;
             }
         };
@@ -95,7 +98,6 @@ impl Socket for Discord {
                 });
                 discord_stream
                     .websocket
-                    .as_mut()?
                     .send(Message::Text(identify_payload.to_string().into()))
                     .await
                     .expect("Failed to send identify payload");
@@ -115,31 +117,31 @@ impl Socket for Discord {
                         let channel_id = json
                             .d
                             .get("channel_id")
-                            .and_then(|id| Some(id.to_string()))
+                            .and_then(|id| id.as_str().map(|s| s.to_string()))
                             .unwrap();
                         let msg_id = json
                             .d
                             .get("id")
-                            .and_then(|id| Some(id.to_string()))
+                            .and_then(|id| id.as_str().map(|s| s.to_string()))
                             .unwrap();
 
                         let text = json
                             .d
                             .get("content")
-                            .and_then(|id| Some(id.to_string()))
+                            .and_then(|id| id.as_str().map(|s| s.to_string()))
                             .unwrap();
 
                         let author = json.d.get("author").unwrap();
                         let author_id = author
                             .get("id")
-                            .and_then(|id| Some(id.to_string()))
+                            .and_then(|id| id.as_str().map(|s| s.to_string()))
                             .unwrap();
                         let author_name = author
                             .get("username")
-                            .and_then(|username| Some(username.to_string()))
+                            .and_then(|username| username.as_str().map(|s| s.to_string()))
                             .unwrap();
 
-                        return Some(SocketUpdate::MessageCreated {
+                        return Some(SocketEvent::MessageCreated {
                             channel: Identifier {
                                 id: channel_id.to_owned(),
                                 hash: None,
@@ -168,6 +170,6 @@ impl Socket for Discord {
             _ => {}
         };
 
-        Some(SocketUpdate::Skip)
+        Some(SocketEvent::Skip)
     }
 }

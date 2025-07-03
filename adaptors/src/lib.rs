@@ -56,14 +56,15 @@ pub trait ParameterizedMessangerQuery {
 
 // === Sockets
 #[derive(Debug)]
-pub enum SocketUpdate {
+pub enum SocketEvent {
     MessageCreated {
         channel: Identifier<()>,
         msg: Identifier<Msg>,
     },
+    Disconected,
     Skip,
 }
 #[async_trait]
 pub trait Socket {
-    async fn next(&self) -> Option<SocketUpdate>;
+    async fn next(&self) -> Option<SocketEvent>;
 }

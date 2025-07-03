@@ -70,7 +70,7 @@ pub struct Login {
 }
 impl Login {
     pub fn new() -> Self {
-        // TODO: Automate addition of new enum varients in here
+        // TODO: Automate addition of new enum variants in here
         let service = State::new(vec![Platform::Discord, Platform::Test]);
         Self {
             platform: service,
