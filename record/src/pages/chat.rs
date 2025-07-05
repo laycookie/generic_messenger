@@ -3,17 +3,16 @@ use std::{borrow::Borrow, fmt::Debug, sync::Arc};
 use crate::messanger_unifier::{MessangerHandle, Messangers};
 
 use adaptors::{
-    types::{Chan, Identifier, Msg},
     Messanger as Auth,
+    types::{Chan, Identifier, Msg},
 };
 use iced::{
+    Alignment, ContentFit, Length, Padding, Task,
     widget::{
-        column, container, image, row,
+        Button, Column, Responsive, Scrollable, Text, TextInput, column, container, image, row,
         scrollable::{Direction, Scrollbar},
         text::LineHeight,
-        Button, Column, Responsive, Scrollable, Text, TextInput,
     },
-    Alignment, ContentFit, Length, Padding, Task,
 };
 use widgets::divider;
 
@@ -21,8 +20,8 @@ use widgets::divider;
 pub(crate) enum Message {
     ChangeMain(Main),
     DividerChange(f32),
-    MessageInput(String),
-    MessageSend,
+    MsgInput(String),
+    MsgSend,
     // ===
     UpdateChat {
         handle: MessangerHandle,
@@ -99,7 +98,9 @@ impl MessengingWindow {
                 };
                 let interface = interface.to_owned();
 
-                if let Some(messanger) = messengers.data_from_handle(handle) && messanger.chats.get(chan.borrow()).is_some() {
+                if let Some(messanger) = messengers.data_from_handle(handle)
+                    && messanger.chats.contains_key(chan.borrow())
+                {
                     return Action::Run(Task::done(Message::ChangeMain(Main::Chat {
                         interface,
                         meta_data: chan,
@@ -132,7 +133,7 @@ impl MessengingWindow {
                     }),
                 )
             }
-            Message::MessageInput(change) => {
+            Message::MsgInput(change) => {
                 match &mut self.main {
                     Main::Chat { msg_box: msg, .. } => {
                         *msg = change;
@@ -143,7 +144,7 @@ impl MessengingWindow {
                 }
                 Action::None
             }
-            Message::MessageSend => {
+            Message::MsgSend => {
                 let Main::Chat {
                     interface,
                     // auth,
@@ -164,7 +165,7 @@ impl MessengingWindow {
                         let param = auth.param_query().unwrap();
                         param.send_message(&meta_data, contents).await.unwrap();
                     })
-                    .then(|_| Task::done(Message::MessageInput(String::new()))),
+                    .then(|_| Task::done(Message::MsgInput(String::new()))),
                 )
             }
         }
@@ -182,24 +183,21 @@ impl MessengingWindow {
         })];
 
         let navbar = Scrollable::new({
-            let guilds = messengers
-                .data_iter()
-                .map(|data| {
-                    data.guilds.iter().map(|i| {
-                        let image = match &i.data.icon {
-                            Some(icon) => image(icon),
-                            None => image("./public/imgs/placeholder.jpg"),
-                        };
-                        Button::new(
-                            image
-                                .height(Length::Fixed(48.0))
-                                .width(Length::Fixed(48.0))
-                                .content_fit(ContentFit::Cover),
-                        )
-                        .into()
-                    })
+            let guilds = messengers.data_iter().flat_map(|data| {
+                data.guilds.iter().map(|i| {
+                    let image = match &i.data.icon {
+                        Some(icon) => image(icon),
+                        None => image("./public/imgs/placeholder.jpg"),
+                    };
+                    Button::new(
+                        image
+                            .height(Length::Fixed(48.0))
+                            .width(Length::Fixed(48.0))
+                            .content_fit(ContentFit::Cover),
+                    )
+                    .into()
                 })
-                .flatten();
+            });
 
             Column::with_children(guilds)
         })
@@ -223,7 +221,7 @@ impl MessengingWindow {
                     messengers
                         .data_iter()
                         .zip(messengers.interface_iter())
-                        .map(|(data, (m_handle, _))| {
+                        .flat_map(|(data, (m_handle, _))| {
                             data.conversations.iter().map(|conversation| {
                                 Button::new({
                                     let image = match &conversation.data.icon {
@@ -241,12 +239,10 @@ impl MessengingWindow {
                                     Message::LoadConversation {
                                         handle: *m_handle, // TODO
                                         conversation: conversation.to_owned(),
-                                    }
-                                    .into(),
+                                    },
                                 )
                             })
                         })
-                        .flatten()
                         .fold(Column::new(), |column, widget| column.push(widget))
                 ]
                 .width(self.sidebar_width),
@@ -258,13 +254,12 @@ impl MessengingWindow {
             let main = match &self.main {
                 Main::Contacts { search_input } => {
                     let widget = Column::new();
-                    let widget = widget.push(
-                        TextInput::new("Search", search_input).on_input(Message::MessageInput),
-                    );
+                    let widget = widget
+                        .push(TextInput::new("Search", search_input).on_input(Message::MsgInput));
                     widget.push(
                         messengers
                             .data_iter()
-                            .map(|messanger| {
+                            .flat_map(|messanger| {
                                 messanger.contacts.iter().filter_map(|i| {
                                     if search_input.is_empty()
                                         || i.data
@@ -277,7 +272,6 @@ impl MessengingWindow {
                                     None
                                 })
                             })
-                            .flatten()
                             .fold(Column::new(), |column, widget| column.push(widget)),
                     )
                 }
@@ -306,11 +300,11 @@ impl MessengingWindow {
                     .height(Length::Fill);
 
                     let message_box = TextInput::new("New msg...", msg)
-                        .on_input(Message::MessageInput)
-                        .on_submit(Message::MessageSend)
+                        .on_input(Message::MsgInput)
+                        .on_submit(Message::MsgSend)
                         .line_height(LineHeight::Absolute(20.into()));
 
-                    column![channel_info, chat, message_box].into()
+                    column![channel_info, chat, message_box]
                 }
             };
             row![

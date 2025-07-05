@@ -1,13 +1,9 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use adaptors::{
+    Messanger,
     types::{Chan, Identifier, Msg, Server, Usr},
-    Messanger, Socket,
 };
-use futures::{future::join_all, Stream};
 // ==
 // TODO: MAKE READ ONLY USING GETTERS
 #[derive(Debug)]

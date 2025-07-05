@@ -1,13 +1,12 @@
 use std::{
-    collections::VecDeque,
     sync::{Arc, Weak},
     task::Poll,
 };
 
 use adaptors::{Messanger as Auth, Socket, SocketEvent};
 use futures::{
-    channel::mpsc::{self, Receiver, Sender},
     FutureExt, Stream, StreamExt,
+    channel::mpsc::{self, Receiver, Sender},
 };
 
 use crate::messanger_unifier::MessangerHandle;

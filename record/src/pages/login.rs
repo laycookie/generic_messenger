@@ -1,7 +1,7 @@
-use adaptors::{discord::Discord, Messanger};
+use adaptors::{Messanger, discord::Discord};
 use iced::{
-    widget::{column, combo_box::State, Button, Column, ComboBox, Container, TextInput},
     Alignment, Task,
+    widget::{Button, Column, ComboBox, Container, TextInput, column, combo_box::State},
 };
 use std::{fmt::Display, sync::Arc};
 use strum::EnumString;
@@ -140,15 +140,7 @@ impl Login {
             "Login",
             select_platform,
             auth_input,
-            Button::new("Submit")
-                .on_press_maybe(self.button_state.then_some(Message::SubmitToken))
-                .style(|theme, status| {
-                    iced::widget::button::Style::default().with_background(if self.button_state {
-                        iced::Background::Color(iced::Color::from_rgba(1.0, 1.0, 1.0, 1.0))
-                    } else {
-                        iced::Background::Color(iced::Color::from_rgba(1.0, 1.0, 1.0, 0.5))
-                    })
-                })
+            Button::new("Submit").on_press_maybe(self.button_state.then_some(Message::SubmitToken))
         ]
         .width(iced::Length::Fixed(width))
         .align_x(Alignment::Center)

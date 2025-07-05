@@ -3,7 +3,7 @@ pub mod login;
 
 use std::fmt::Debug;
 
-use crate::{messanger_unifier::MessangerHandle, SocketMesg};
+use crate::{SocketMesg, messanger_unifier::MessangerHandle};
 use adaptors::types::{Chan, Identifier, Msg, Server, Usr};
 use chat::Message as MessangerMessage;
 pub use login::Login;

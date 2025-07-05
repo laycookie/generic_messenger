@@ -1,19 +1,17 @@
-#![feature(let_chains)]
+// #![feature(let_chains)]
 
 use crate::pages::login::Message as LoginMessage;
 use adaptors::SocketEvent;
 use auth::MessangersGenerator;
-use futures::{channel::mpsc::Sender, future::join_all, try_join, Stream, StreamExt};
-use iced::{window, Element, Subscription, Task};
-use adaptors::types::{Identifier, Msg};
+use futures::{Stream, StreamExt, channel::mpsc::Sender, future::join_all, try_join};
+use iced::{Element, Subscription, Task, window};
 use messanger_unifier::Messangers;
-use pages::{chat::MessengingWindow, Login, MyAppMessage};
+use pages::{Login, MyAppMessage, chat::MessengingWindow};
 use socket::{ReciverEvent, SocketsInterface};
 
 use crate::messanger_unifier::MessangerHandle;
 
 mod auth;
-mod cache;
 mod messanger_unifier;
 mod pages;
 mod socket;
@@ -79,7 +77,7 @@ impl App {
     fn title() -> &'static str {
         "record"
     }
-    fn update(&mut self, message: MyAppMessage) -> impl Into<Task<MyAppMessage>> {
+    fn update(&mut self, message: MyAppMessage) -> Task<MyAppMessage> {
         match message {
             MyAppMessage::SaveMessengers => {
                 MessangersGenerator::messangers_to_file(&self.messangers, "./LoginInfo".into());
@@ -200,15 +198,12 @@ impl App {
                             let d = self.messangers.mut_data_from_handle(handle).unwrap();
                             println!("{:#?}", d.chats);
                             println!("{:#?}", channel);
-                            match d.chats.get_mut(&channel){
+                            match d.chats.get_mut(&channel) {
                                 Some(msgs) => msgs.push(msg),
                                 None => {
                                     d.chats.insert(channel, vec![msg]);
-                                    ()
-                                },
+                                }
                             };
-                            // println!("{:#?}", msgs);
-
                         }
                         SocketEvent::Disconected => println!("Disconected"),
                         SocketEvent::Skip => println!("Skiped"),

@@ -25,11 +25,6 @@ pub struct Msg {
     pub author: Identifier<Usr>,
     pub text: String,
 }
-struct NewMsg {
-    chan_id: Identifier<()>, // Needed to update the channel, so just ID is enough
-    author: Identifier<Usr>,
-    text: String,
-}
 
 #[derive(Debug, Clone)]
 #[repr(C)]
