@@ -99,6 +99,14 @@ impl MessengingWindow {
                 };
                 let interface = interface.to_owned();
 
+                if let Some(messanger) = messengers.data_from_handle(handle) && messanger.chats.get(chan.borrow()).is_some() {
+                    return Action::Run(Task::done(Message::ChangeMain(Main::Chat {
+                        interface,
+                        meta_data: chan,
+                        msg_box: String::new(),
+                    })));
+                }
+
                 Action::Run(
                     Task::future(async move {
                         let msgs = {

@@ -1,8 +1,11 @@
+#![feature(let_chains)]
+
 use crate::pages::login::Message as LoginMessage;
 use adaptors::SocketEvent;
 use auth::MessangersGenerator;
 use futures::{channel::mpsc::Sender, future::join_all, try_join, Stream, StreamExt};
 use iced::{window, Element, Subscription, Task};
+use adaptors::types::{Identifier, Msg};
 use messanger_unifier::Messangers;
 use pages::{chat::MessengingWindow, Login, MyAppMessage};
 use socket::{ReciverEvent, SocketsInterface};
@@ -197,9 +200,15 @@ impl App {
                             let d = self.messangers.mut_data_from_handle(handle).unwrap();
                             println!("{:#?}", d.chats);
                             println!("{:#?}", channel);
-                            let msgs = d.chats.get_mut(&channel).unwrap();
-                            println!("{:#?}", msgs);
-                            msgs.push(msg);
+                            match d.chats.get_mut(&channel){
+                                Some(msgs) => msgs.push(msg),
+                                None => {
+                                    d.chats.insert(channel, vec![msg]);
+                                    ()
+                                },
+                            };
+                            // println!("{:#?}", msgs);
+
                         }
                         SocketEvent::Disconected => println!("Disconected"),
                         SocketEvent::Skip => println!("Skiped"),
