@@ -39,7 +39,7 @@ impl MessangersGenerator {
         }
         Ok(messangers)
     }
-    pub fn messangers_to_file(messangers: Messangers, path: PathBuf) {
+    pub fn messangers_to_file(messangers: &Messangers, path: PathBuf) {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)

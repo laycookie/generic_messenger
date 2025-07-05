@@ -32,7 +32,9 @@ pub(crate) enum MyAppMessage {
         messanger_handle: MessangerHandle,
         new_data: MessangerData,
     },
+    RemoveMessanger(MessangerHandle),
     SocketEvent(SocketMesg),
+    SaveMessengers,
     StartUp,
     // === Pages ===
     Login(LoginMessage),

@@ -78,6 +78,14 @@ impl App {
     }
     fn update(&mut self, message: MyAppMessage) -> impl Into<Task<MyAppMessage>> {
         match message {
+            MyAppMessage::SaveMessengers => {
+                MessangersGenerator::messangers_to_file(&self.messangers, "./LoginInfo".into());
+                Task::none()
+            }
+            MyAppMessage::RemoveMessanger(handle) => {
+                self.messangers.remove_by_handle(handle);
+                Task::none()
+            }
             MyAppMessage::SetMessangerData {
                 messanger_handle,
                 new_data,
@@ -113,7 +121,7 @@ impl App {
             MyAppMessage::StartUp => {
                 Task::future(join_all(self.messangers.interface_iter().map(
                     |interface| {
-                        let (id, interface) = interface.clone();
+                        let (handle, interface) = interface.clone();
                         async move {
                             let Some(q) = interface.query() else {
                                 return Ok(None);
@@ -126,44 +134,46 @@ impl App {
                                 q.get_guilds()
                             ) {
                                 Ok(t) => t,
-                                Err(e) => return Err(e),
+                                Err(e) => return Err((handle, e)),
                             };
 
-                            Ok(Some((id, profile, contacts, conversations, servers)))
+                            Ok(Some((handle, profile, contacts, conversations, servers)))
                         }
                     },
                 )))
                 .then(|outputs| {
-                    let mut tasks_itr = outputs
-                        .into_iter()
-                        .filter_map(|m| {
-                            let Ok(m) = m else {
-                                eprintln!("Failed to fetch the data");
-                                return None;
-                            };
-                            let (handle, profile, contacts, conversations, servers) = m.unwrap();
-
-                            Some(Task::done(MyAppMessage::SetMessangerData {
-                                messanger_handle: handle,
-                                new_data: pages::MessangerData::Everything {
-                                    profile,
-                                    contacts,
-                                    conversations,
-                                    servers,
-                                },
-                            }))
-                        })
-                        .peekable();
-
-                    if tasks_itr.peek().is_none() {
+                    if !outputs.iter().any(|m| m.is_ok()) {
                         // In case we are running this from login screen. If
                         // we are not there this would be equivalent of Task::none()
                         return Task::done(MyAppMessage::Login(LoginMessage::ToggleButtonState));
-                    }
+                    };
 
-                    Task::batch(tasks_itr).chain(Task::done(MyAppMessage::OpenPage(Screen::Chat(
-                        MessengingWindow::new(),
-                    ))))
+                    let tasks_itr = outputs.into_iter().map(|m| {
+                        let m = match m {
+                            Ok(m) => m,
+                            Err((handle, e)) => {
+                                eprintln!("Failed to fetch the data: {e}");
+                                return Task::done(MyAppMessage::RemoveMessanger(handle));
+                            }
+                        };
+                        let (handle, profile, contacts, conversations, servers) = m.unwrap();
+
+                        Task::done(MyAppMessage::SetMessangerData {
+                            messanger_handle: handle,
+                            new_data: pages::MessangerData::Everything {
+                                profile,
+                                contacts,
+                                conversations,
+                                servers,
+                            },
+                        })
+                    });
+
+                    Task::batch(tasks_itr)
+                        .chain(Task::done(MyAppMessage::OpenPage(Screen::Chat(
+                            MessengingWindow::new(),
+                        ))))
+                        .chain(Task::done(MyAppMessage::SaveMessengers))
                 })
             }
             // Global Actions
