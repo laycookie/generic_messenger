@@ -1,6 +1,7 @@
+use crate::pages::login::Message as LoginMessage;
 use adaptors::SocketEvent;
 use auth::MessangersGenerator;
-use futures::{channel::mpsc::Sender, future::try_join_all, try_join, Stream, StreamExt};
+use futures::{channel::mpsc::Sender, future::join_all, try_join, Stream, StreamExt};
 use iced::{window, Element, Subscription, Task};
 use messanger_unifier::Messangers;
 use pages::{chat::MessengingWindow, Login, MyAppMessage};
@@ -110,43 +111,57 @@ impl App {
                 Task::none()
             }
             MyAppMessage::StartUp => {
-                let qs = self.messangers.interface_iter().map(|interface| {
-                    let (id, interface) = interface.clone();
-                    async move {
-                        let Some(q) = interface.query() else {
-                            return Ok(None);
-                        };
+                Task::future(join_all(self.messangers.interface_iter().map(
+                    |interface| {
+                        let (id, interface) = interface.clone();
+                        async move {
+                            let Some(q) = interface.query() else {
+                                return Ok(None);
+                            };
 
-                        let (profile, conversations, contacts, servers) = match try_join!(
-                            q.get_profile(),
-                            q.get_conversation(),
-                            q.get_contacts(),
-                            q.get_guilds()
-                        ) {
-                            Ok(t) => t,
-                            Err(e) => return Err(e),
-                        };
+                            let (profile, conversations, contacts, servers) = match try_join!(
+                                q.get_profile(),
+                                q.get_conversation(),
+                                q.get_contacts(),
+                                q.get_guilds()
+                            ) {
+                                Ok(t) => t,
+                                Err(e) => return Err(e),
+                            };
 
-                        Ok(Some((id, profile, contacts, conversations, servers)))
+                            Ok(Some((id, profile, contacts, conversations, servers)))
+                        }
+                    },
+                )))
+                .then(|outputs| {
+                    let mut tasks_itr = outputs
+                        .into_iter()
+                        .filter_map(|m| {
+                            let Ok(m) = m else {
+                                eprintln!("Failed to fetch the data");
+                                return None;
+                            };
+                            let (handle, profile, contacts, conversations, servers) = m.unwrap();
+
+                            Some(Task::done(MyAppMessage::SetMessangerData {
+                                messanger_handle: handle,
+                                new_data: pages::MessangerData::Everything {
+                                    profile,
+                                    contacts,
+                                    conversations,
+                                    servers,
+                                },
+                            }))
+                        })
+                        .peekable();
+
+                    if tasks_itr.peek().is_none() {
+                        // In case we are running this from login screen. If
+                        // we are not there this would be equivalent of Task::none()
+                        return Task::done(MyAppMessage::Login(LoginMessage::ToggleButtonState));
                     }
-                });
 
-                Task::future(try_join_all(qs)).then(|r| {
-                    let mut ta = Task::none();
-                    for m in r.unwrap() {
-                        let (handle, profile, contacts, conversations, servers) = m.unwrap();
-                        ta = ta.chain(Task::done(MyAppMessage::SetMessangerData {
-                            messanger_handle: handle,
-                            new_data: pages::MessangerData::Everything {
-                                profile,
-                                contacts,
-                                conversations,
-                                servers,
-                            },
-                        }));
-                    }
-
-                    ta.chain(Task::done(MyAppMessage::OpenPage(Screen::Chat(
+                    Task::batch(tasks_itr).chain(Task::done(MyAppMessage::OpenPage(Screen::Chat(
                         MessengingWindow::new(),
                     ))))
                 })
@@ -198,9 +213,7 @@ impl App {
                             .try_send(ReciverEvent::Connection(interface.to_owned()))
                             .unwrap();
 
-                        Task::done(MyAppMessage::StartUp).chain(Task::done(MyAppMessage::OpenPage(
-                            Screen::Chat(MessengingWindow::new()),
-                        )))
+                        Task::done(MyAppMessage::StartUp)
                     }
                 }
             }

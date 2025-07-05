@@ -71,6 +71,7 @@ impl Messangers {
             return Some(&self.interface[messanger_handle.index]);
         }
 
+        eprintln!("Cache hit occured");
         self.interface
             .iter()
             .find(|a| a.0.id == messanger_handle.id)
@@ -82,6 +83,7 @@ impl Messangers {
             return Some(&self.data[messanger_handle.index]);
         }
 
+        eprintln!("Cache hit occured");
         self.data
             .iter()
             .find(|a| a.messenger_id == messanger_handle.id)
@@ -96,11 +98,11 @@ impl Messangers {
             return Some(&mut self.data[messanger_handle.index]);
         }
 
+        eprintln!("Cache hit occured");
         self.data
             .iter_mut()
             .find(|a| a.messenger_id == messanger_handle.id)
     }
-
     pub fn add_messanger(&mut self, messanger: Arc<dyn Messanger>) -> MessangerHandle {
         let handle = MessangerHandle {
             id: self.id_counter,
@@ -113,5 +115,16 @@ impl Messangers {
         self.id_counter += 1;
 
         handle
+    }
+    pub fn remove_by_handle(&mut self, handle_to_remove: MessangerHandle) {
+        self.interface.remove(handle_to_remove.index);
+        // Updates all cached indexes that are now wrong.
+        for (i, (handle, _)) in self.interface[handle_to_remove.index..]
+            .iter_mut()
+            .enumerate()
+        {
+            handle.index = handle_to_remove.index + i;
+        }
+        self.data.remove(handle_to_remove.index);
     }
 }
