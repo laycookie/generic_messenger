@@ -1,12 +1,13 @@
 use adaptors::SocketEvent;
 use auth::MessangersGenerator;
-use futures::{channel::mpsc::Sender, future::try_join_all, try_join, Stream, StreamExt};
+use futures::{channel::mpsc::Sender, future::{try_join_all, join_all}, stream, try_join, Stream, StreamExt};
 use iced::{window, Element, Subscription, Task};
 use messanger_unifier::Messangers;
 use pages::{chat::MessengingWindow, Login, MyAppMessage};
 use socket::{ReciverEvent, SocketsInterface};
 
 use crate::messanger_unifier::MessangerHandle;
+use crate::pages::login::Message;
 
 mod auth;
 mod cache;
@@ -110,31 +111,45 @@ impl App {
                 Task::none()
             }
             MyAppMessage::StartUp => {
-                let qs = self.messangers.interface_iter().map(|interface| {
-                    let (id, interface) = interface.clone();
-                    async move {
-                        let Some(q) = interface.query() else {
-                            return Ok(None);
-                        };
+                let interfaces = self
+                    .messangers
+                    .interface_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut sender = self.socket_sender.clone().unwrap();
+                Task::future(async move {
+                    let qs = interfaces.into_iter().map(|interface| {
+                        let (id, messanger) = interface.clone();
+                        let mut sender = sender.clone();
+                        async move {
+                            let Some(q) = messanger.query() else {
+                                return None;
+                            };
 
-                        let (profile, conversations, contacts, servers) = match try_join!(
-                            q.get_profile(),
-                            q.get_conversation(),
-                            q.get_contacts(),
-                            q.get_guilds()
-                        ) {
-                            Ok(t) => t,
-                            Err(e) => return Err(e),
-                        };
-
-                        Ok(Some((id, profile, contacts, conversations, servers)))
+                            let (profile, conversations, contacts, servers) = match try_join!(
+                                q.get_profile(),
+                                q.get_conversation(),
+                                q.get_contacts(),
+                                q.get_guilds()
+                            ) {
+                                Ok(t) => t,
+                                Err(e) => return None,
+                            };
+                            sender
+                                .try_send(ReciverEvent::Connection(interface))
+                                .unwrap();
+                            Some((id, profile, contacts, conversations, servers))
+                        }
+                    });
+                    join_all(qs).await.into_iter().filter_map(|x| x).collect()
+                })
+                .then(|r: Vec<_>| {
+                    let mut ta = Task::done(MyAppMessage::MessangerStructSync(r.clone()));
+                    if r.len() == 0 {
+                        return Task::done(MyAppMessage::RedirectToLogin);
                     }
-                });
-
-                Task::future(try_join_all(qs)).then(|r| {
-                    let mut ta = Task::none();
-                    for m in r.unwrap() {
-                        let (handle, profile, contacts, conversations, servers) = m.unwrap();
+                    for m in r {
+                        let (handle, profile, contacts, conversations, servers) = m;
                         ta = ta.chain(Task::done(MyAppMessage::SetMessangerData {
                             messanger_handle: handle,
                             new_data: pages::MessangerData::Everything {
@@ -155,6 +170,12 @@ impl App {
             MyAppMessage::OpenPage(page) => {
                 self.page = page;
                 Task::none()
+            }
+            MyAppMessage::RedirectToLogin => {
+                if let Screen::Login(_) = &self.page {
+                    return Task::done(MyAppMessage::Login(Message::ToggleButtonState));
+                }
+                return Task::done(MyAppMessage::OpenPage(Screen::Login(Login::new())));
             }
             MyAppMessage::SocketEvent(event) => match event {
                 SocketMesg::Connect(mut socket_connection) => {
@@ -192,17 +213,16 @@ impl App {
                     pages::login::Action::Run(task) => task.map(MyAppMessage::Login),
                     pages::login::Action::Login(messenger) => {
                         let handle = self.messangers.add_messanger(messenger);
-                        let interface = self.messangers.interface_from_handle(handle).unwrap();
-                        let sender = self.socket_sender.as_mut().unwrap();
-                        sender
-                            .try_send(ReciverEvent::Connection(interface.to_owned()))
-                            .unwrap();
-
-                        Task::done(MyAppMessage::StartUp).chain(Task::done(MyAppMessage::OpenPage(
-                            Screen::Chat(MessengingWindow::new()),
-                        )))
+                        //redundant chain
+                        Task::done(MyAppMessage::StartUp)
                     }
                 }
+            }
+            MyAppMessage::MessangerStructSync(messangers) => {
+                for (messanger, _, _, _, _) in messangers {
+                    self.messangers.retain_by_handle(messanger);
+                }
+                Task::none()
             }
             MyAppMessage::Chat(message) => {
                 let Screen::Chat(chat) = &mut self.page else {
@@ -243,8 +263,8 @@ fn spawn_sockets_interface() -> impl Stream<Item = SocketMesg> {
     iced::stream::channel(128, |mut output| async move {
         let (mut interface, sender) = SocketsInterface::new();
         output.try_send(SocketMesg::Connect(sender)).unwrap();
-        loop {
-            let a = interface.next().await.unwrap();
+
+        while let Some(a) = interface.next().await {
             output.try_send(SocketMesg::Message(a)).unwrap();
         }
     })

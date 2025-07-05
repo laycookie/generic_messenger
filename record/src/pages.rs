@@ -37,4 +37,6 @@ pub(crate) enum MyAppMessage {
     // === Pages ===
     Login(LoginMessage),
     Chat(MessangerMessage),
+    RedirectToLogin,
+    MessangerStructSync(Vec<(MessangerHandle, Identifier<Usr>, Vec<Identifier<Usr>>, Vec<Identifier<Chan>>, Vec<Identifier<Server>>)>)
 }

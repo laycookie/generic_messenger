@@ -50,6 +50,10 @@ pub struct Messangers {
 }
 
 impl Messangers {
+    pub fn retain_by_handle(&mut self, handle: MessangerHandle) {
+        self.interface.retain(|(h, _)| h.id == handle.id);
+        self.data.retain(|d| d.messenger_id == handle.id);
+    }
     pub fn len(&self) -> usize {
         self.interface.len()
     }
