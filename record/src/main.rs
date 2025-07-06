@@ -180,15 +180,21 @@ impl App {
                 self.page = page;
                 Task::none()
             }
+            //Separate Event for future development (user wants to add a messanger during runtime)
+            MyAppMessage::SocketConnect((handle, messanger)) => {
+                let mut sender = self.socket_sender.clone().unwrap();
+                Task::future(async move {
+                    sender.try_send(ReciverEvent::Connection((handle, messanger.socket().await)));
+                })
+                .then(|_| Task::none())
+            }
             MyAppMessage::SocketEvent(event) => match event {
                 SocketMesg::Connect(mut socket_connection) => {
-                    let interfaces = self.messangers.interface_iter();
-                    interfaces.into_iter().for_each(|auth| {
-                        let _temp =
-                            socket_connection.try_send(ReciverEvent::Connection(auth.clone()));
-                    });
-                    self.socket_sender = Some(socket_connection);
-                    Task::none()
+                    let copy_sender = socket_connection.clone();
+                    self.socket_sender = Some(copy_sender);
+                    Task::batch(self.messangers.interface_iter().map(|interface| {
+                        Task::done(MyAppMessage::SocketConnect(interface.to_owned()))
+                    }))
                 }
                 SocketMesg::Message((handle, socket_event)) => {
                     match socket_event {
@@ -220,12 +226,8 @@ impl App {
                     pages::login::Action::Login(messenger) => {
                         let handle = self.messangers.add_messanger(messenger);
                         let interface = self.messangers.interface_from_handle(handle).unwrap();
-                        let sender = self.socket_sender.as_mut().unwrap();
-                        sender
-                            .try_send(ReciverEvent::Connection(interface.to_owned()))
-                            .unwrap();
-
-                        Task::done(MyAppMessage::StartUp)
+                        Task::done(MyAppMessage::SocketConnect(interface.to_owned()))
+                            .chain(Task::done(MyAppMessage::StartUp))
                     }
                 }
             }

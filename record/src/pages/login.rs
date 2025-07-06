@@ -50,7 +50,6 @@ pub enum Message {
     PlatformInput(Platform),
     TokenInput(String),
     SubmitToken,
-    LoginSuccess(Arc<dyn Messanger>),
 }
 
 pub enum Action {
@@ -101,12 +100,7 @@ impl Login {
                 let token = self.token.clone();
 
                 let messanger = platform.to_messanger(token);
-                return Action::Run(Task::future(
-                    async move { Message::LoginSuccess(messanger) },
-                ));
-            }
-            Message::LoginSuccess(messenger) => {
-                return Action::Login(messenger);
+                return Action::Login(messanger);
             }
         }
 
