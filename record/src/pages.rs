@@ -27,7 +27,6 @@ pub(crate) enum MessangerData {
 
 #[derive(Debug)]
 pub(crate) enum MyAppMessage {
-    SocketConnect((MessangerHandle, std::sync::Arc<dyn Messanger>)),
     OpenPage(Screen),
     SetMessangerData {
         messanger_handle: MessangerHandle,
