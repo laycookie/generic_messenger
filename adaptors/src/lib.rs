@@ -1,6 +1,6 @@
-use std::error::Error;
 use std::fmt::Debug;
 use std::sync::Weak;
+use std::{error::Error, sync::Arc};
 
 use async_trait::async_trait;
 use types::{Chan, Identifier, Msg, Server, Usr};
@@ -21,13 +21,13 @@ pub trait Messanger: Send + Sync + Debug {
     fn param_query(&self) -> Option<&dyn ParameterizedMessangerQuery> {
         None
     }
-    async fn socket(&self) -> Option<Weak<dyn Socket + Send + Sync>> {
+    async fn socket(self: Arc<Self>) -> Option<Weak<dyn Socket + Send + Sync>> {
         None
     }
 }
 impl PartialEq for dyn Messanger {
     fn eq(&self, other: &Self) -> bool {
-        format!("{}", self.id()) == format!("{}", other.id())
+        self.id() == other.id()
     }
 }
 
@@ -55,7 +55,7 @@ pub trait ParameterizedMessangerQuery {
 }
 
 // === Sockets
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum SocketEvent {
     MessageCreated {
         channel: Identifier<()>,
@@ -66,5 +66,6 @@ pub enum SocketEvent {
 }
 #[async_trait]
 pub trait Socket {
-    async fn next(&self) -> Option<SocketEvent>;
+    async fn next(self: Arc<Self>) -> Option<SocketEvent>;
+    async fn background_next(self: Arc<Self>) -> Option<()>;
 }

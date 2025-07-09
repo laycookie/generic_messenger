@@ -25,6 +25,8 @@
     		      rust-analyzer
     		      # rustfmt
 
+				  cargo-expand
+
 				  openssl
 				  pkg-config
     		    ];

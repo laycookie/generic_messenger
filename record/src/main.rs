@@ -1,5 +1,3 @@
-// #![feature(let_chains)]
-
 use crate::pages::login::Message as LoginMessage;
 use adaptors::SocketEvent;
 use auth::MessangersGenerator;
@@ -54,7 +52,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }),
             )
         })
-        .inspect_err(|err| println!("{}", err))?;
+        .inspect_err(|err| println!("{err}"))?;
 
     Ok(())
 }
@@ -197,7 +195,7 @@ impl App {
                         SocketEvent::MessageCreated { channel, msg } => {
                             let d = self.messangers.mut_data_from_handle(handle).unwrap();
                             println!("{:#?}", d.chats);
-                            println!("{:#?}", channel);
+                            println!("{channel:#?}");
                             match d.chats.get_mut(&channel) {
                                 Some(msgs) => msgs.push(msg),
                                 None => {

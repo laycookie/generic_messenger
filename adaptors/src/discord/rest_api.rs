@@ -43,7 +43,6 @@ impl MessangerQuery for Discord {
             self.get_auth_header(),
         )
         .await?;
-        println!("Friends: {:?}", friends);
         Ok(friends
             .iter()
             .map(|friend| Identifier {

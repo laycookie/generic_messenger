@@ -1,11 +1,13 @@
 use std::{
     fmt::Debug,
     sync::{Arc, RwLock, Weak},
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use async_tungstenite::async_std::connect_async;
 use futures::lock::Mutex;
+use futures_locks::RwLock as RwLockAwait;
 
 use crate::discord::websocket::DiscordSocket;
 use crate::{Messanger, MessangerQuery, ParameterizedMessangerQuery, Socket};
@@ -20,6 +22,7 @@ pub struct Discord {
     intents: u32,
     // Owned data
     socket: Mutex<Option<DiscordSocket>>,
+    heart_beat_interval: RwLockAwait<Option<Duration>>,
     // Cache
     dms: RwLock<Vec<json_structs::Channel>>,
     guilds: RwLock<Vec<json_structs::Guild>>,
@@ -27,13 +30,15 @@ pub struct Discord {
 
 impl Discord {
     pub fn new(token: &str) -> Arc<dyn Messanger> {
-        Arc::new(Arc::new(Discord {
+        Arc::new(Discord {
             token: token.into(),
             intents: 161789, // 32767,
-            socket: Mutex::new(None),
+            socket: None.into(),
+            heart_beat_interval: RwLockAwait::new(None),
+            // socket: Mutex::new(None),
             dms: RwLock::new(Vec::new()),
             guilds: RwLock::new(Vec::new()),
-        }))
+        })
     }
     fn id(&self) -> String {
         String::from(self.name().to_owned() + &self.token)
@@ -50,24 +55,24 @@ impl Debug for Discord {
 }
 
 #[async_trait]
-impl Messanger for Arc<Discord> {
+impl Messanger for Discord {
     fn id(&self) -> String {
-        (**self).id()
+        self.id()
     }
     // === Unify a bit ===
     fn name(&self) -> &'static str {
-        (**self).name()
+        self.name()
     }
     fn auth(&self) -> String {
         self.token.clone()
     }
     fn query(&self) -> Option<&dyn MessangerQuery> {
-        Some(&**self)
+        Some(self)
     }
     fn param_query(&self) -> Option<&dyn ParameterizedMessangerQuery> {
-        Some(&**self)
+        Some(self)
     }
-    async fn socket(&self) -> Option<Weak<dyn Socket + Send + Sync>> {
+    async fn socket(self: Arc<Self>) -> Option<Weak<dyn Socket + Send + Sync>> {
         let mut socket = self.socket.lock().await;
 
         if socket.is_none() {

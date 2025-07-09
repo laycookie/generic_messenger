@@ -3,9 +3,11 @@ use async_tungstenite::WebSocketStream;
 use async_tungstenite::async_std::ConnectStream;
 use async_tungstenite::tungstenite::Message;
 use futures::StreamExt;
+use futures_timer::Delay;
 use serde::Deserialize;
 use serde_json::json;
 use serde_repr::Deserialize_repr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
@@ -15,8 +17,8 @@ use crate::{
 
 use super::Discord;
 
-/// Implementation of:
-/// https://discord.com/developers/docs/events/gateway
+// Implementation of:
+// https://discord.com/developers/docs/events/gateway
 
 // https://discord.com/developers/docs/topics/opcodes-and-status-codes#gateway-gateway-opcodes
 #[repr(u8)]
@@ -26,17 +28,19 @@ enum Opcode {
     Heartbeat = 1,
     Identify = 2,
     Hello = 10,
+    HeartbeatAck = 11,
 }
 
 pub(super) struct DiscordSocket {
     pub websocket: WebSocketStream<ConnectStream>,
-    pub heart_beat_interval: Option<Duration>,
+    last_sequance_number: Option<usize>,
+    // pub heart_beat_interval: RwLock<Option<Duration>>,
 }
 impl DiscordSocket {
     pub fn new(websocket: WebSocketStream<ConnectStream>) -> Self {
         DiscordSocket {
             websocket,
-            heart_beat_interval: None,
+            last_sequance_number: None,
         }
     }
 }
@@ -47,45 +51,66 @@ struct GateawayPayload {
     // Event type
     t: Option<String>,
     // Sequence numbers
-    s: Option<u32>,
+    s: Option<usize>,
     // data
     d: serde_json::Value,
 }
 
 #[async_trait]
 impl Socket for Discord {
-    async fn next(&self) -> Option<SocketEvent> {
+    async fn background_next(self: Arc<Self>) -> Option<()> {
+        if let Some(heart_beat_interval) = *self.heart_beat_interval.read().await {
+            Delay::new(heart_beat_interval).await;
+
+            let mut socket = self.socket.lock().await;
+            let discord_stream = socket.as_mut()?;
+
+            let a = json!({
+                    "op": Opcode::Heartbeat as u8,
+                    "d": discord_stream.last_sequance_number,
+
+            });
+
+            discord_stream.websocket.send(a.to_string().into()).await;
+
+            println!("Beat");
+        }
+        // Notably results in a loop when heart_beat doesn't exsist
+        Some(())
+    }
+    async fn next(self: Arc<Self>) -> Option<SocketEvent> {
         let mut socket = self.socket.lock().await;
         let discord_stream = socket.as_mut()?;
 
         let json = match discord_stream.websocket.next().await? {
             Ok(Message::Text(text)) => serde_json::from_str::<GateawayPayload>(&text).unwrap(),
             Ok(Message::Close(frame)) => {
-                println!("Disconnected: {:?}", frame);
+                println!("Disconnected: {frame:?}");
                 *socket = None;
                 return None;
             }
             Ok(_) => todo!(),
             Err(e) => {
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {e}");
                 *socket = None;
                 return None;
             }
         };
-        // println!("Received: {:#?}", json);
         println!("Received: {:#?}", json.op);
 
         match json.op {
             Opcode::Hello => {
-                discord_stream.heart_beat_interval = json
+                let mut heart_beat_interval = self.heart_beat_interval.write().await;
+                *heart_beat_interval = json
                     .d
                     .get("heartbeat_interval")
                     .and_then(|v| v.as_u64())
                     .map(Duration::from_millis);
+                println!("{:?}", *heart_beat_interval);
 
                 // Send Identify payload
                 let identify_payload = json!({
-                    "op": 2,
+                    "op": Opcode::Identify as u8,
                     "d": {
                         "token": self.token,
                         "intents": self.intents,
@@ -105,13 +130,13 @@ impl Socket for Discord {
 
             Opcode::Dispatch => {
                 let event_name = json.t.unwrap();
-                println!("{:?}", event_name);
+                println!("{event_name:?}");
                 match event_name.as_str() {
                     "READY" => {
-                        println!("importing data")
+                        println!("importing data");
                     }
                     "SESSIONS_REPLACE" => {
-                        println!("something something")
+                        println!("something something");
                     }
                     "MESSAGE_CREATE" => {
                         let channel_id = json
@@ -164,12 +189,11 @@ impl Socket for Discord {
                             },
                         });
                     }
-                    _ => eprintln!("Unkown event_name recived: {:?}", event_name),
+                    _ => eprintln!("Unkown event_name recived: {event_name:?}",),
                 }
             }
             _ => {}
         };
-
         Some(SocketEvent::Skip)
     }
 }
