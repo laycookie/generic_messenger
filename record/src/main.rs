@@ -182,15 +182,14 @@ impl App {
             }
             MyAppMessage::SocketEvent(event) => match event {
                 SocketMesg::Connect(mut socket_connection) => {
-                    let copy_sender = socket_connection.clone();
-                    self.socket_sender = Some(copy_sender);
+                    self.socket_sender = Some(socket_connection.clone());
                     Task::batch(self.messangers.interface_iter().map(|interface| {
-                        let interface = interface.to_owned();
+                        let (handle, messanger) = interface.to_owned();
                         let mut socket_connection = socket_connection.clone();
                         Task::future(async move {
                             socket_connection.try_send(ReciverEvent::Connection((
-                                interface.0,
-                                interface.1.socket().await,
+                                handle,
+                                messanger.socket().await,
                             )));
                         })
                         .then(|_| Task::none())
@@ -225,7 +224,7 @@ impl App {
                     pages::login::Action::Run(task) => task.map(MyAppMessage::Login),
                     pages::login::Action::Login(messenger) => {
                         let handle = self.messangers.add_messanger(messenger);
-                        let interface = self
+                        let (handle, messanger )= self
                             .messangers
                             .interface_from_handle(handle)
                             .unwrap()
@@ -234,8 +233,8 @@ impl App {
                         Task::perform(
                             async move {
                                 sender.try_send(ReciverEvent::Connection((
-                                    interface.0,
-                                    interface.1.socket().await,
+                                    handle,
+                                    messanger.socket().await,
                                 )));
                             },
                             |_| MyAppMessage::StartUp,
