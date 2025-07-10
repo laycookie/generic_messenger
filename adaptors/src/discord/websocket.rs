@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use async_tungstenite::WebSocketStream;
 use async_tungstenite::async_std::ConnectStream;
 use async_tungstenite::tungstenite::Message;
-use futures::StreamExt;
+use futures::{FutureExt, Stream, StreamExt};
 use futures_timer::Delay;
 use serde::Deserialize;
 use serde_json::json;
@@ -34,7 +34,6 @@ enum Opcode {
 pub(super) struct DiscordSocket {
     pub websocket: WebSocketStream<ConnectStream>,
     last_sequance_number: Option<usize>,
-    // pub heart_beat_interval: RwLock<Option<Duration>>,
 }
 impl DiscordSocket {
     pub fn new(websocket: WebSocketStream<ConnectStream>) -> Self {
@@ -56,6 +55,18 @@ struct GateawayPayload {
     d: serde_json::Value,
 }
 
+// TODO: Think hard about this
+impl Stream for Discord {
+    type Item = SocketEvent;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.next().poll_unpin(cx)
+    }
+}
+
 #[async_trait]
 impl Socket for Discord {
     async fn background_next(self: Arc<Self>) -> Option<()> {
@@ -71,11 +82,12 @@ impl Socket for Discord {
 
             });
 
-            discord_stream.websocket.send(a.to_string().into()).await;
-
-            println!("Beat");
+            discord_stream
+                .websocket
+                .send(a.to_string().into())
+                .await
+                .unwrap();
         }
-        // Notably results in a loop when heart_beat doesn't exsist
         Some(())
     }
     async fn next(self: Arc<Self>) -> Option<SocketEvent> {

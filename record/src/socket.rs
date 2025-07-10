@@ -4,7 +4,7 @@ use std::{
     task::Poll,
 };
 
-use adaptors::{Messanger as Auth, Socket, SocketEvent};
+use adaptors::{Messanger, Socket, SocketEvent};
 use futures::{
     FutureExt, Stream, StreamExt,
     channel::mpsc::{self, Receiver, Sender},
@@ -13,20 +13,18 @@ use futures::{
 use crate::messanger_unifier::MessangerHandle;
 
 pub enum ReciverEvent {
-    Connection((MessangerHandle, Arc<dyn Auth>)),
+    Connection((MessangerHandle, Arc<dyn Messanger>)),
 }
 
 struct ActiveStream {
     handle: MessangerHandle,
     socket: Weak<dyn Socket + Send + Sync>,
-    future: Option<Pin<Box<dyn Future<Output = Option<SocketEvent>> + Send>>>,
     silent_future: Option<Pin<Box<dyn Future<Output = Option<()>> + Send>>>,
 }
 
 pub struct SocketsInterface {
     receiver: Receiver<ReciverEvent>,
     active_streams: Vec<ActiveStream>,
-    ready_events: Vec<(MessangerHandle, SocketEvent)>,
 }
 impl SocketsInterface {
     pub fn new() -> (Self, Sender<ReciverEvent>) {
@@ -35,7 +33,6 @@ impl SocketsInterface {
             SocketsInterface {
                 receiver,
                 active_streams: Vec::new(),
-                ready_events: Vec::new(),
             },
             sender,
         )
@@ -49,8 +46,9 @@ impl Stream for SocketsInterface {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        if let Poll::Ready(m) = self.receiver.select_next_some().poll_unpin(cx) {
-            match m {
+        // Check if we got anything new from the outside
+        if let Poll::Ready(event) = self.receiver.select_next_some().poll_unpin(cx) {
+            match event {
                 ReciverEvent::Connection((handle, auth)) => {
                     let mut stream_fut = auth.socket();
 
@@ -65,7 +63,6 @@ impl Stream for SocketsInterface {
                         self.active_streams.push(ActiveStream {
                             handle,
                             socket: stream,
-                            future: None,
                             silent_future: None,
                         });
                         println!("Pushed as active");
@@ -73,69 +70,46 @@ impl Stream for SocketsInterface {
                 }
             }
         };
-
-        if let Some(e) = self.ready_events.pop() {
-            return Poll::Ready(Some(e));
+        // Prep some stuff pre-pulling events
+        let mut open_streams = Vec::new();
+        {
+            let mut i = 0usize;
+            self.active_streams.retain(|stream| {
+                let mut retain = false;
+                if let Some(socket) = stream.socket.upgrade() {
+                    open_streams.push((i, socket));
+                    retain = true;
+                };
+                i += 1;
+                retain
+            });
         }
 
-        // Pull streams, and collect inactive ones
-        let mut new_events = Vec::with_capacity(self.active_streams.len());
-        let open_status = self
-            .active_streams
-            .iter_mut()
-            .map(|stream| {
-                let Some(socket) = stream.socket.upgrade() else {
-                    return false;
+        // Pull events
+        for (i, stream) in open_streams.iter() {
+            let polled_event = stream.clone().next().poll_unpin(cx);
+            match polled_event {
+                Poll::Ready(Some(event)) => {
+                    return Poll::Ready(Some((self.active_streams[*i].handle, event)));
+                }
+                Poll::Ready(None) => self.active_streams.remove(*i),
+                Poll::Pending => continue,
+            };
+        }
+
+        for (i, stream) in open_streams {
+            if self.active_streams[i].silent_future.is_none() {
+                self.active_streams[i].silent_future = Some(stream.clone().background_next());
+            }
+            if let Some(silent_future) = self.active_streams[i].silent_future.as_mut() {
+                match silent_future.poll_unpin(cx) {
+                    Poll::Ready(Some(_)) => {
+                        self.active_streams[i].silent_future = None;
+                    }
+                    Poll::Ready(None) => unreachable!(),
+                    Poll::Pending => {}
                 };
-
-                {
-                    if stream.future.is_none() {
-                        stream.future = Some(socket.clone().next());
-                    }
-                    match stream.future.as_mut().unwrap().poll_unpin(cx) {
-                        Poll::Ready(Some(update)) => {
-                            new_events.push((stream.handle.to_owned(), update));
-                            stream.future = None;
-                        }
-                        Poll::Ready(None) => return false, // The stream got closed
-                        Poll::Pending => {
-                            // TODO: Work around, when pending that's usually,
-                            // due to it waiting on new events from socket
-                            // causing a block preventing others from borrowing.
-                            // the socket.
-                            stream.future = None;
-                        }
-                    }
-                }
-                {
-                    if stream.silent_future.is_none() {
-                        stream.silent_future = Some(socket.clone().background_next());
-                    }
-                    match stream.silent_future.as_mut().unwrap().poll_unpin(cx) {
-                        Poll::Ready(Some(_)) => {
-                            stream.silent_future = None;
-                        }
-                        Poll::Ready(None) => return false, // The stream got closed
-                        Poll::Pending => {}
-                    }
-                }
-                true
-            })
-            .collect::<Vec<_>>();
-        let mut open_status_itr = open_status.iter();
-
-        // Drop closed streams
-        self.active_streams
-            .retain(|_| *open_status_itr.next().unwrap());
-
-        // In case any new events are pending
-        if !new_events.is_empty() {
-            self.ready_events.extend(
-                new_events
-                    .into_iter()
-                    .filter(|(_, e)| *e != SocketEvent::Skip),
-            );
-            cx.waker().wake_by_ref();
+            }
         }
 
         Poll::Pending
