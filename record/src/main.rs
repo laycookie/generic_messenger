@@ -182,13 +182,18 @@ impl App {
             }
             MyAppMessage::SocketEvent(event) => match event {
                 SocketMesg::Connect(mut socket_connection) => {
-                    let interfaces = self.messangers.interface_iter();
-                    interfaces.into_iter().for_each(|auth| {
-                        let _temp =
-                            socket_connection.try_send(ReciverEvent::Connection(auth.clone()));
-                    });
-                    self.socket_sender = Some(socket_connection);
-                    Task::none()
+                    self.socket_sender = Some(socket_connection.clone());
+                    Task::batch(self.messangers.interface_iter().map(|interface| {
+                        let (handle, messanger) = interface.to_owned();
+                        let mut socket_connection = socket_connection.clone();
+                        Task::future(async move {
+                            socket_connection.try_send(ReciverEvent::Connection((
+                                handle,
+                                messanger.socket().await,
+                            )));
+                        })
+                        .then(|_| Task::none())
+                    }))
                 }
                 SocketMesg::Message((handle, socket_event)) => {
                     match socket_event {
@@ -219,13 +224,21 @@ impl App {
                     pages::login::Action::Run(task) => task.map(MyAppMessage::Login),
                     pages::login::Action::Login(messenger) => {
                         let handle = self.messangers.add_messanger(messenger);
-                        let interface = self.messangers.interface_from_handle(handle).unwrap();
-                        let sender = self.socket_sender.as_mut().unwrap();
-                        sender
-                            .try_send(ReciverEvent::Connection(interface.to_owned()))
-                            .unwrap();
-
-                        Task::done(MyAppMessage::StartUp)
+                        let (handle, messanger )= self
+                            .messangers
+                            .interface_from_handle(handle)
+                            .unwrap()
+                            .to_owned();
+                        let mut sender = self.socket_sender.clone().unwrap();
+                        Task::perform(
+                            async move {
+                                sender.try_send(ReciverEvent::Connection((
+                                    handle,
+                                    messanger.socket().await,
+                                )));
+                            },
+                            |_| MyAppMessage::StartUp,
+                        )
                     }
                 }
             }
