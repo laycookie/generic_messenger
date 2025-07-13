@@ -1,10 +1,6 @@
-use std::{
-    pin::Pin,
-    sync::{Arc, Weak},
-    task::Poll,
-};
+use std::{sync::Weak, task::Poll};
 
-use adaptors::{Messanger, Socket, SocketEvent};
+use adaptors::{Socket, SocketEvent};
 use futures::{
     FutureExt, Stream, StreamExt,
     channel::mpsc::{self, Receiver, Sender},
@@ -19,7 +15,6 @@ pub enum ReciverEvent {
 struct ActiveStream {
     handle: MessangerHandle,
     socket: Weak<dyn Socket + Send + Sync>,
-    silent_future: Option<Pin<Box<dyn Future<Output = Option<()>> + Send>>>,
 }
 
 pub struct SocketsInterface {
@@ -51,11 +46,7 @@ impl Stream for SocketsInterface {
             match event {
                 ReciverEvent::Connection((handle, socket)) => {
                     if let Some(socket) = socket {
-                        self.active_streams.push(ActiveStream {
-                            handle,
-                            socket,
-                            silent_future: None,
-                        });
+                        self.active_streams.push(ActiveStream { handle, socket });
                         println!("Pushed as active");
                     }
                 }
@@ -81,26 +72,15 @@ impl Stream for SocketsInterface {
             let polled_event = stream.clone().next().poll_unpin(cx);
             match polled_event {
                 Poll::Ready(Some(event)) => {
-                    return Poll::Ready(Some((self.active_streams[*i].handle, event)));
+                    let SocketEvent::Skip = event else {
+                        return Poll::Ready(Some((self.active_streams[*i].handle, event)));
+                    };
+                    cx.waker().wake_by_ref();
+                    continue;
                 }
                 Poll::Ready(None) => self.active_streams.remove(*i),
                 Poll::Pending => continue,
             };
-        }
-
-        for (i, stream) in open_streams {
-            if self.active_streams[i].silent_future.is_none() {
-                self.active_streams[i].silent_future = Some(stream.clone().background_next());
-            }
-            if let Some(silent_future) = self.active_streams[i].silent_future.as_mut() {
-                match silent_future.poll_unpin(cx) {
-                    Poll::Ready(Some(_)) => {
-                        self.active_streams[i].silent_future = None;
-                    }
-                    Poll::Ready(None) => unreachable!(),
-                    Poll::Pending => {}
-                };
-            }
         }
 
         Poll::Pending

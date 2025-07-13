@@ -28,14 +28,14 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (App::new(messangers, Screen::Loading), true)
             } else {
                 (
-                    App::new(Messangers::default(), Screen::Login(Login::new())),
+                    App::new(Messangers::default(), Screen::Login(Login::default())),
                     false,
                 )
             }
         }
         Err(_) => (
             // TODO: This will probably not handle the error well.
-            App::new(Messangers::default(), Screen::Login(Login::new())),
+            App::new(Messangers::default(), Screen::Login(Login::default())),
             false,
         ),
     };
@@ -181,16 +181,18 @@ impl App {
                 Task::none()
             }
             MyAppMessage::SocketEvent(event) => match event {
-                SocketMesg::Connect(mut socket_connection) => {
+                SocketMesg::Connect(socket_connection) => {
                     self.socket_sender = Some(socket_connection.clone());
                     Task::batch(self.messangers.interface_iter().map(|interface| {
                         let (handle, messanger) = interface.to_owned();
                         let mut socket_connection = socket_connection.clone();
                         Task::future(async move {
-                            socket_connection.try_send(ReciverEvent::Connection((
-                                handle,
-                                messanger.socket().await,
-                            )));
+                            socket_connection
+                                .try_send(ReciverEvent::Connection((
+                                    handle,
+                                    messanger.socket().await,
+                                )))
+                                .unwrap();
                         })
                         .then(|_| Task::none())
                     }))
@@ -221,10 +223,9 @@ impl App {
                 };
                 match login.update(message) {
                     pages::login::Action::None => Task::none(),
-                    pages::login::Action::Run(task) => task.map(MyAppMessage::Login),
                     pages::login::Action::Login(messenger) => {
                         let handle = self.messangers.add_messanger(messenger);
-                        let (handle, messanger )= self
+                        let (handle, messanger) = self
                             .messangers
                             .interface_from_handle(handle)
                             .unwrap()
@@ -232,10 +233,12 @@ impl App {
                         let mut sender = self.socket_sender.clone().unwrap();
                         Task::perform(
                             async move {
-                                sender.try_send(ReciverEvent::Connection((
-                                    handle,
-                                    messanger.socket().await,
-                                )));
+                                sender
+                                    .try_send(ReciverEvent::Connection((
+                                        handle,
+                                        messanger.socket().await,
+                                    )))
+                                    .unwrap();
                             },
                             |_| MyAppMessage::StartUp,
                         )
@@ -267,7 +270,7 @@ impl App {
         }
     }
     fn subscription(&self) -> Subscription<MyAppMessage> {
-        Subscription::run(spawn_sockets_interface).map(|t| MyAppMessage::SocketEvent(t))
+        Subscription::run(spawn_sockets_interface).map(MyAppMessage::SocketEvent)
     }
 }
 

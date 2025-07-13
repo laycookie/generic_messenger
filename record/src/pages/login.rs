@@ -1,6 +1,6 @@
 use adaptors::{Messanger, discord::Discord};
 use iced::{
-    Alignment, Task,
+    Alignment,
     widget::{Button, Column, ComboBox, Container, TextInput, column, combo_box::State},
 };
 use std::{fmt::Display, sync::Arc};
@@ -22,13 +22,13 @@ impl Display for Platform {
 }
 impl Platform {
     pub fn to_messanger(&self, auth: String) -> Arc<dyn Messanger> {
-        match self {
+        Arc::new(match self {
             Self::Discord => Discord::new(&auth),
             Self::Test => {
                 println!("Testing");
                 todo!()
             }
-        }
+        })
     }
     fn get_login_methods(&self) -> Vec<LoginMethods> {
         match self {
@@ -54,7 +54,6 @@ pub enum Message {
 
 pub enum Action {
     None,
-    Run(Task<Message>),
     Login(Arc<dyn Messanger>),
 }
 
@@ -67,8 +66,8 @@ pub struct Login {
     _error: Option<String>,
     button_state: bool,
 }
-impl Login {
-    pub fn new() -> Self {
+impl Default for Login {
+    fn default() -> Self {
         // TODO: Automate addition of new enum variants in here
         let service = State::new(vec![Platform::Discord, Platform::Test]);
         Self {

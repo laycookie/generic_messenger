@@ -67,5 +67,4 @@ pub enum SocketEvent {
 #[async_trait]
 pub trait Socket {
     async fn next(self: Arc<Self>) -> Option<SocketEvent>;
-    async fn background_next(self: Arc<Self>) -> Option<()>;
 }

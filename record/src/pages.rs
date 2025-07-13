@@ -2,7 +2,6 @@ pub mod chat;
 pub mod login;
 
 use crate::{SocketMesg, messanger_unifier::MessangerHandle};
-use adaptors::Messanger;
 use adaptors::types::{Chan, Identifier, Msg, Server, Usr};
 use chat::Message as MessangerMessage;
 pub use login::Login;

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use async_tungstenite::WebSocketStream;
 use async_tungstenite::async_std::ConnectStream;
 use async_tungstenite::tungstenite::Message;
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt, poll};
 use futures_timer::Delay;
 use serde::Deserialize;
 use serde_json::json;
@@ -67,30 +67,46 @@ impl Stream for Discord {
     }
 }
 
-#[async_trait]
-impl Socket for Discord {
-    async fn background_next(self: Arc<Self>) -> Option<()> {
-        if let Some(heart_beat_interval) = *self.heart_beat_interval.read().await {
-            Delay::new(heart_beat_interval).await;
+impl Discord {
+    async fn heart_beat(self: Arc<Self>) -> Option<()> {
+        if let Some(interval) = *self.heart_beat_interval.read().await {
+            Delay::new(interval).await;
 
             let mut socket = self.socket.lock().await;
             let discord_stream = socket.as_mut()?;
 
-            let a = json!({
-                    "op": Opcode::Heartbeat as u8,
-                    "d": discord_stream.last_sequance_number,
-
-            });
-
             discord_stream
                 .websocket
-                .send(a.to_string().into())
+                .send(
+                    json!({
+                            "op": Opcode::Heartbeat as u8,
+                            "d": discord_stream.last_sequance_number,
+
+                    })
+                    .to_string()
+                    .into(),
+                )
                 .await
                 .unwrap();
         }
         Some(())
     }
+}
+
+#[async_trait]
+impl Socket for Discord {
     async fn next(self: Arc<Self>) -> Option<SocketEvent> {
+        let mut heart_beat_future = self.heart_beat_future.lock().await;
+        {
+            if heart_beat_future.is_none() {
+                *heart_beat_future = Some(Box::pin(self.clone().heart_beat()));
+            };
+            match poll!(heart_beat_future.as_mut().unwrap()) {
+                std::task::Poll::Ready(_) => *heart_beat_future = None,
+                std::task::Poll::Pending => {}
+            };
+        }
+
         let mut socket = self.socket.lock().await;
         let discord_stream = socket.as_mut()?;
 
@@ -107,6 +123,9 @@ impl Socket for Discord {
                 *socket = None;
                 return None;
             }
+        };
+        if let Some(sequance_number) = json.s {
+            discord_stream.last_sequance_number = Some(sequance_number);
         };
         println!("Received: {:#?}", json.op);
 

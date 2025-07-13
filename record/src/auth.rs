@@ -30,10 +30,10 @@ impl MessangersGenerator {
             };
 
             // In theory should never return false
-            let auth: Arc<dyn Auth> = match Platform::from_str(platform).unwrap() {
+            let auth: Arc<dyn Auth> = Arc::new(match Platform::from_str(platform).unwrap() {
                 Platform::Discord => Discord::new(token),
                 Platform::Test => todo!(),
-            };
+            });
 
             messangers.add_messanger(auth);
         }
@@ -44,6 +44,7 @@ impl MessangersGenerator {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .unwrap();
 

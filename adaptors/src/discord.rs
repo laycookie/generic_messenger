@@ -1,5 +1,6 @@
 use std::{
     fmt::Debug,
+    pin::Pin,
     sync::{Arc, RwLock, Weak},
     time::Duration,
 };
@@ -16,12 +17,14 @@ pub mod json_structs;
 pub mod rest_api;
 pub mod websocket;
 
+type HeartBeatFuture = Pin<Box<dyn Future<Output = Option<()>> + Send>>;
 pub struct Discord {
     // Metadata
     token: String, // TODO: Make it secure
     intents: u32,
     // Owned data
     socket: Mutex<Option<DiscordSocket>>,
+    heart_beat_future: Arc<Mutex<Option<HeartBeatFuture>>>,
     heart_beat_interval: RwLockAwait<Option<Duration>>,
     // Cache
     dms: RwLock<Vec<json_structs::Channel>>,
@@ -29,22 +32,23 @@ pub struct Discord {
 }
 
 impl Discord {
-    pub fn new(token: &str) -> Arc<dyn Messanger> {
-        Arc::new(Discord {
+    pub fn new(token: &str) -> Self {
+        Discord {
             token: token.into(),
             intents: 161789, // 32767,
             socket: None.into(),
             heart_beat_interval: RwLockAwait::new(None),
+            heart_beat_future: Mutex::new(None).into(),
             // socket: Mutex::new(None),
             dms: RwLock::new(Vec::new()),
             guilds: RwLock::new(Vec::new()),
-        })
+        }
     }
     fn id(&self) -> String {
-        String::from(self.name().to_owned() + &self.token)
+        self.name().to_owned() + &self.token
     }
     fn name(&self) -> &'static str {
-        "Discord".into()
+        "Discord"
     }
 }
 

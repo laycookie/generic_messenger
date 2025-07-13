@@ -242,7 +242,7 @@ impl ParameterizedMessangerQuery for Discord {
             mobile_network_type: None,
         };
 
-        let req = http_request::<Vec<Message>>(
+        let reqs = http_request::<Vec<Message>>(
             surf::post(format!(
                 "https://discord.com/api/v9/channels/{}/messages",
                 location.id,
