@@ -54,16 +54,13 @@ impl Stream for SocketsInterface {
         };
         // Prep some stuff pre-pulling events
         let mut open_streams = Vec::new();
-        {
-            self.active_streams.retain(|stream| {
-                let mut retain = false;
-                if let Some(socket) = stream.socket.upgrade() {
-                    open_streams.push(socket);
-                    retain = true;
-                };
-                retain
-            });
-        }
+        self.active_streams.retain(|stream| {
+            if let Some(socket) = stream.socket.upgrade() {
+                open_streams.push(socket);
+                return true;
+            };
+            false
+        });
 
         // Pull events
         for (i, stream) in open_streams.iter().enumerate() {
