@@ -55,30 +55,28 @@ impl Stream for SocketsInterface {
         // Prep some stuff pre-pulling events
         let mut open_streams = Vec::new();
         {
-            let mut i = 0usize;
             self.active_streams.retain(|stream| {
                 let mut retain = false;
                 if let Some(socket) = stream.socket.upgrade() {
-                    open_streams.push((i, socket));
+                    open_streams.push(socket);
                     retain = true;
                 };
-                i += 1;
                 retain
             });
         }
 
         // Pull events
-        for (i, stream) in open_streams.iter() {
+        for (i, stream) in open_streams.iter().enumerate() {
             let polled_event = stream.clone().next().poll_unpin(cx);
             match polled_event {
                 Poll::Ready(Some(event)) => {
                     let SocketEvent::Skip = event else {
-                        return Poll::Ready(Some((self.active_streams[*i].handle, event)));
+                        return Poll::Ready(Some((self.active_streams[i].handle, event)));
                     };
                     cx.waker().wake_by_ref();
                     continue;
                 }
-                Poll::Ready(None) => self.active_streams.remove(*i),
+                Poll::Ready(None) => self.active_streams.remove(i),
                 Poll::Pending => continue,
             };
         }
