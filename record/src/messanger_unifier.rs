@@ -34,7 +34,7 @@ impl MessangerData {
 
 #[derive(Debug, Clone, Copy)]
 pub struct MessangerHandle {
-    id: usize,
+    pub(crate) id: usize,
     index: usize,
 }
 

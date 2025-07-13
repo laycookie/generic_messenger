@@ -9,6 +9,7 @@ use login::Message as LoginMessage;
 use std::fmt::Debug;
 
 use crate::Screen;
+use crate::socket::ActiveStream;
 
 #[derive(Debug)]
 pub(crate) enum MessangerData {
@@ -26,6 +27,7 @@ pub(crate) enum MessangerData {
 
 #[derive(Debug)]
 pub(crate) enum MyAppMessage {
+    Test(Vec<ActiveStream>),
     OpenPage(Screen),
     SetMessangerData {
         messanger_handle: MessangerHandle,

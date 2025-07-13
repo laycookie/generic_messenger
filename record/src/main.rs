@@ -8,6 +8,7 @@ use pages::{Login, MyAppMessage, chat::MessengingWindow};
 use socket::{ReciverEvent, SocketsInterface};
 
 use crate::messanger_unifier::MessangerHandle;
+use crate::socket::ActiveStream;
 
 mod auth;
 mod messanger_unifier;
@@ -61,6 +62,7 @@ struct App {
     page: Screen,
     messangers: Messangers,
     socket_sender: Option<Sender<ReciverEvent>>,
+    active_streams: Vec<ActiveStream>,
 }
 
 impl App {
@@ -69,6 +71,7 @@ impl App {
             page,
             messangers,
             socket_sender: None,
+            active_streams: Vec::new(),
         }
     }
 
@@ -169,6 +172,7 @@ impl App {
                     });
 
                     Task::batch(tasks_itr)
+                        .chain(Task::done(MyAppMessage::SocketEvent(SocketMesg::Connect)))
                         .chain(Task::done(MyAppMessage::OpenPage(Screen::Chat(
                             MessengingWindow::new(),
                         ))))
@@ -180,22 +184,43 @@ impl App {
                 self.page = page;
                 Task::none()
             }
+            MyAppMessage::Test(active_streams) => {
+                self.active_streams = active_streams;
+                Task::none()
+            }
             MyAppMessage::SocketEvent(event) => match event {
-                SocketMesg::Connect(socket_connection) => {
-                    self.socket_sender = Some(socket_connection.clone());
-                    Task::batch(self.messangers.interface_iter().map(|interface| {
-                        let (handle, messanger) = interface.to_owned();
-                        let mut socket_connection = socket_connection.clone();
-                        Task::future(async move {
-                            socket_connection
-                                .try_send(ReciverEvent::Connection((
-                                    handle,
-                                    messanger.socket().await,
-                                )))
-                                .unwrap();
-                        })
-                        .then(|_| Task::none())
-                    }))
+                SocketMesg::Connect => {
+                    Task::perform(
+                        join_all(self.messangers.interface_iter().map(|interface| {
+                            let (handle, messanger) = interface.to_owned();
+                            async move {
+                                let Some(socket) = messanger.socket().await else {
+                                    return None;
+                                };
+                                Some(ActiveStream { handle, socket })
+                            }
+                        })),
+                        |active_streams| {
+                            let active_streams =
+                                active_streams.into_iter().filter_map(|x| x).collect();
+                            MyAppMessage::Test(active_streams)
+                        },
+                    )
+
+                    // self.socket_sender = Some(socket_connection.clone());
+                    // Task::batch(self.messangers.interface_iter().map(|interface| {
+                    //     let (handle, messanger) = interface.to_owned();
+                    //     let mut socket_connection = socket_connection.clone();
+                    //     Task::future(async move {
+                    //         socket_connection
+                    //             .try_send(ReciverEvent::Connection((
+                    //                 handle,
+                    //                 messanger.socket().await,
+                    //             )))
+                    //             .unwrap();
+                    //     })
+                    //     .then(|_| Task::none())
+                    // }))
                 }
                 SocketMesg::Message((handle, socket_event)) => {
                     match socket_event {
@@ -225,23 +250,7 @@ impl App {
                     pages::login::Action::None => Task::none(),
                     pages::login::Action::Login(messenger) => {
                         let handle = self.messangers.add_messanger(messenger);
-                        let (handle, messanger) = self
-                            .messangers
-                            .interface_from_handle(handle)
-                            .unwrap()
-                            .to_owned();
-                        let mut sender = self.socket_sender.clone().unwrap();
-                        Task::perform(
-                            async move {
-                                sender
-                                    .try_send(ReciverEvent::Connection((
-                                        handle,
-                                        messanger.socket().await,
-                                    )))
-                                    .unwrap();
-                            },
-                            |_| MyAppMessage::StartUp,
-                        )
+                        Task::done(MyAppMessage::StartUp)
                     }
                 }
             }
@@ -270,23 +279,21 @@ impl App {
         }
     }
     fn subscription(&self) -> Subscription<MyAppMessage> {
-        Subscription::run(spawn_sockets_interface).map(MyAppMessage::SocketEvent)
+        if self.active_streams.is_empty() {
+            return Subscription::none();
+        }
+        Subscription::batch(
+            self.active_streams
+                .clone()
+                .into_iter()
+                .map(|x| Subscription::run_with_id(x.handle.id, x)),
+        )
+        .map(|msg| MyAppMessage::SocketEvent(SocketMesg::Message(msg)))
     }
 }
 
 #[derive(Debug)]
 enum SocketMesg {
-    Connect(Sender<ReciverEvent>),
+    Connect,
     Message((MessangerHandle, SocketEvent)),
-}
-
-fn spawn_sockets_interface() -> impl Stream<Item = SocketMesg> {
-    iced::stream::channel(128, |mut output| async move {
-        let (mut interface, sender) = SocketsInterface::new();
-        output.try_send(SocketMesg::Connect(sender)).unwrap();
-        loop {
-            let a = interface.next().await.unwrap();
-            output.try_send(SocketMesg::Message(a)).unwrap();
-        }
-    })
 }
