@@ -2,12 +2,15 @@ use async_trait::async_trait;
 use async_tungstenite::WebSocketStream;
 use async_tungstenite::async_std::ConnectStream;
 use async_tungstenite::tungstenite::Message;
-use futures::{FutureExt, Stream, StreamExt, poll};
+use futures::{FutureExt, Stream, StreamExt, poll, select, select_biased};
 use futures_timer::Delay;
 use serde::Deserialize;
 use serde_json::json;
 use serde_repr::Deserialize_repr;
+use std::future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use crate::{
@@ -15,7 +18,7 @@ use crate::{
     types::{Identifier, Msg, Usr},
 };
 
-use super::Discord;
+use super::{Discord, HeartBeatFuture};
 
 // Implementation of:
 // https://discord.com/developers/docs/events/gateway
@@ -69,7 +72,8 @@ impl Stream for Discord {
 
 impl Discord {
     async fn heart_beat(self: Arc<Self>) -> Option<()> {
-        if let Some(interval) = *self.heart_beat_interval.read().await {
+        //This should always return some
+        while let Some(interval) = *self.heart_beat_interval.read().await {
             Delay::new(interval).await;
 
             let mut socket = self.socket.lock().await;
@@ -89,6 +93,7 @@ impl Discord {
                 .await
                 .unwrap();
         }
+        println!("Disconnected");
         Some(())
     }
 }
@@ -97,19 +102,14 @@ impl Discord {
 impl Socket for Discord {
     async fn next(self: Arc<Self>) -> Option<SocketEvent> {
         let mut heart_beat_future = self.heart_beat_future.lock().await;
+        //OPTION 1 on how to refactor
+        if let Some(heart_beat_future) = heart_beat_future.as_mut()
+            && let std::task::Poll::Ready(_) = poll!(heart_beat_future)
         {
-            if heart_beat_future.is_none() {
-                *heart_beat_future = Some(Box::pin(self.clone().heart_beat()));
-            };
-            match poll!(heart_beat_future.as_mut().unwrap()) {
-                std::task::Poll::Ready(_) => *heart_beat_future = None,
-                std::task::Poll::Pending => {}
-            };
+            return Some(SocketEvent::Disconected);
         }
-
         let mut socket = self.socket.lock().await;
         let discord_stream = socket.as_mut()?;
-
         let json = match discord_stream.websocket.next().await? {
             Ok(Message::Text(text)) => serde_json::from_str::<GateawayPayload>(&text).unwrap(),
             Ok(Message::Close(frame)) => {
@@ -138,7 +138,7 @@ impl Socket for Discord {
                     .and_then(|v| v.as_u64())
                     .map(Duration::from_millis);
                 println!("{:?}", *heart_beat_interval);
-
+                *heart_beat_future = Some(Box::pin(self.clone().heart_beat()));
                 // Send Identify payload
                 let identify_payload = json!({
                     "op": Opcode::Identify as u8,
@@ -220,11 +220,142 @@ impl Socket for Discord {
                             },
                         });
                     }
-                    _ => eprintln!("Unkown event_name recived: {event_name:?}",),
+                    _ => eprintln!("Unkown event_name recived: {event_name:?}", ),
                 }
             }
             _ => {}
         };
         Some(SocketEvent::Skip)
+        //Option 2 on how to refactor
+
+
+        // let mut pending_fut: Pin<Box<dyn Future<Output = Option<()>> + Send>> = Box::pin(future::pending());
+        // let fut_a = heart_beat_future.as_mut().unwrap_or(&mut pending_fut);
+        // select! {
+        //     heart_beat = fut_a.fuse() => {
+        //       return Some(SocketEvent::Disconected);
+        //     },
+        //     mut socket = self.socket.lock() => {
+        //       let discord_stream = socket.as_mut()?;
+        // let json = match discord_stream.websocket.next().await.unwrap() {
+        //     Ok(Message::Text(text)) => serde_json::from_str::<GateawayPayload>(&text).unwrap(),
+        //     Ok(Message::Close(frame)) => {
+        //         println!("Disconnected: {frame:?}");
+        //         *socket = None;
+        //         return None;
+        //     }
+        //     Ok(_) => todo!(),
+        //     Err(e) => {
+        //         eprintln!("Error: {e}");
+        //         *socket = None;
+        //         return None;
+        //     }
+        // };
+        // if let Some(sequance_number) = json.s {
+        //     discord_stream.last_sequance_number = Some(sequance_number);
+        // };
+        //
+        // println!("Received: {:#?}", json.op);
+        //
+        // match json.op {
+        //     Opcode::Hello => {
+        //         let mut heart_beat_interval = self.heart_beat_interval.write().await;
+        //         *heart_beat_interval = json
+        //             .d
+        //             .get("heartbeat_interval")
+        //             .and_then(|v| v.as_u64())
+        //             .map(Duration::from_millis);
+        //         println!("{:?}", *heart_beat_interval);
+        //         *heart_beat_future = Some(Box::pin(self.clone().heart_beat()));
+        //         // Send Identify payload
+        //         let identify_payload = json!({
+        //             "op": Opcode::Identify as u8,
+        //             "d": {
+        //                 "token": self.token,
+        //                 "intents": self.intents,
+        //                 "properties": {
+        //                     "$os": "Linux",
+        //                     "$browser": "Firefox",
+        //                     "$device": ""
+        //                 }
+        //             }
+        //         });
+        //         discord_stream
+        //             .websocket
+        //             .send(Message::Text(identify_payload.to_string().into()))
+        //             .await
+        //             .expect("Failed to send identify payload");
+        //     }
+        //
+        //     Opcode::Dispatch => {
+        //         let event_name = json.t.unwrap();
+        //         println!("{event_name:?}");
+        //         match event_name.as_str() {
+        //             "READY" => {
+        //                 println!("importing data");
+        //             }
+        //             "SESSIONS_REPLACE" => {
+        //                 println!("something something");
+        //             }
+        //             "MESSAGE_CREATE" => {
+        //                 let channel_id = json
+        //                     .d
+        //                     .get("channel_id")
+        //                     .and_then(|id| id.as_str().map(|s| s.to_string()))
+        //                     .unwrap();
+        //                 let msg_id = json
+        //                     .d
+        //                     .get("id")
+        //                     .and_then(|id| id.as_str().map(|s| s.to_string()))
+        //                     .unwrap();
+        //
+        //                 let text = json
+        //                     .d
+        //                     .get("content")
+        //                     .and_then(|id| id.as_str().map(|s| s.to_string()))
+        //                     .unwrap();
+        //
+        //                 let author = json.d.get("author").unwrap();
+        //                 let author_id = author
+        //                     .get("id")
+        //                     .and_then(|id| id.as_str().map(|s| s.to_string()))
+        //                     .unwrap();
+        //                 let author_name = author
+        //                     .get("username")
+        //                     .and_then(|username| username.as_str().map(|s| s.to_string()))
+        //                     .unwrap();
+        //
+        //                 return Some(SocketEvent::MessageCreated {
+        //                     channel: Identifier {
+        //                         id: channel_id.to_owned(),
+        //                         hash: None,
+        //                         data: (),
+        //                     },
+        //                     msg: Identifier {
+        //                         id: msg_id,
+        //                         hash: None,
+        //                         data: Msg {
+        //                             author: Identifier {
+        //                                 id: author_id,
+        //                                 hash: None,
+        //                                 data: Usr {
+        //                                     name: author_name,
+        //                                     icon: None, // TODO:
+        //                                 },
+        //                             },
+        //                             text,
+        //                         },
+        //                     },
+        //                 });
+        //             }
+        //             _ => eprintln!("Unkown event_name recived: {event_name:?}",),
+        //         }
+        //     }
+        //     _ => {}
+        // };
+        // return Some(SocketEvent::Skip);
+        //
+        //     }
+        // }
     }
 }
