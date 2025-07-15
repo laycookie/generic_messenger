@@ -5,7 +5,7 @@ use futures::{Stream, StreamExt, channel::mpsc::Sender, future::join_all, try_jo
 use iced::{Element, Subscription, Task, window};
 use messanger_unifier::Messangers;
 use pages::{Login, MyAppMessage, chat::MessengingWindow};
-use socket::{ReciverEvent, SocketsInterface};
+use socket::ReciverEvent;
 
 use crate::messanger_unifier::MessangerHandle;
 use crate::socket::ActiveStream;
@@ -189,39 +189,21 @@ impl App {
                 Task::none()
             }
             MyAppMessage::SocketEvent(event) => match event {
-                SocketMesg::Connect => {
-                    Task::perform(
-                        join_all(self.messangers.interface_iter().map(|interface| {
-                            let (handle, messanger) = interface.to_owned();
-                            async move {
-                                let Some(socket) = messanger.socket().await else {
-                                    return None;
-                                };
-                                Some(ActiveStream { handle, socket })
-                            }
-                        })),
-                        |active_streams| {
-                            let active_streams =
-                                active_streams.into_iter().filter_map(|x| x).collect();
-                            MyAppMessage::Test(active_streams)
-                        },
-                    )
-
-                    // self.socket_sender = Some(socket_connection.clone());
-                    // Task::batch(self.messangers.interface_iter().map(|interface| {
-                    //     let (handle, messanger) = interface.to_owned();
-                    //     let mut socket_connection = socket_connection.clone();
-                    //     Task::future(async move {
-                    //         socket_connection
-                    //             .try_send(ReciverEvent::Connection((
-                    //                 handle,
-                    //                 messanger.socket().await,
-                    //             )))
-                    //             .unwrap();
-                    //     })
-                    //     .then(|_| Task::none())
-                    // }))
-                }
+                SocketMesg::Connect => Task::perform(
+                    join_all(self.messangers.interface_iter().map(|interface| {
+                        let (handle, messanger) = interface.to_owned();
+                        async move {
+                            let Some(socket) = messanger.socket().await else {
+                                return None;
+                            };
+                            Some(ActiveStream { handle, socket })
+                        }
+                    })),
+                    |active_streams| {
+                        let active_streams = active_streams.into_iter().filter_map(|x| x).collect();
+                        MyAppMessage::Test(active_streams)
+                    },
+                ),
                 SocketMesg::Message((handle, socket_event)) => {
                     match socket_event {
                         SocketEvent::MessageCreated { channel, msg } => {
@@ -286,7 +268,7 @@ impl App {
             self.active_streams
                 .clone()
                 .into_iter()
-                .map(|x| Subscription::run_with_id(x.handle.id, x)),
+                .map(|x| Subscription::run_with_id(x.handle.id(), x)),
         )
         .map(|msg| MyAppMessage::SocketEvent(SocketMesg::Message(msg)))
     }

@@ -2,8 +2,7 @@ use std::{sync::Weak, task::Poll};
 
 use adaptors::{Socket, SocketEvent};
 use futures::{
-    FutureExt, Stream, StreamExt,
-    channel::mpsc::{self, Receiver, Sender},
+    FutureExt, Stream
 };
 
 use crate::messanger_unifier::MessangerHandle;
@@ -16,11 +15,6 @@ pub enum ReciverEvent {
 pub struct ActiveStream {
     pub(crate) handle: MessangerHandle,
     pub(crate) socket: Weak<dyn Socket + Send + Sync>,
-}
-
-pub struct SocketsInterface {
-    receiver: Receiver<ReciverEvent>,
-    active_streams: Vec<ActiveStream>,
 }
 
 impl Stream for ActiveStream {
