@@ -7,16 +7,19 @@ use futures::{
 
 use crate::messanger_unifier::MessangerHandle;
 
-pub enum ReciverEvent {
-    Connection((MessangerHandle, Option<Weak<dyn Socket + Send + Sync>>)),
-}
 
-#[derive(Debug, Clone)]
 pub struct ActiveStream {
-    pub(crate) handle: MessangerHandle,
-    pub(crate) socket: Weak<dyn Socket + Send + Sync>,
+    handle: MessangerHandle,
+    socket: Weak<dyn Socket + Send + Sync>,
 }
-
+impl ActiveStream {
+    pub fn new(handle: MessangerHandle, socket: Weak<dyn Socket + Send + Sync>) -> Self {
+        ActiveStream {
+            handle,
+            socket
+        }
+    }
+}
 impl Stream for ActiveStream {
     type Item = (MessangerHandle, SocketEvent);
 
@@ -29,7 +32,13 @@ impl Stream for ActiveStream {
         };
 
         match stream.next().poll_unpin(cx) {
-            Poll::Ready(Some(socket_event)) => Poll::Ready(Some((self.handle, socket_event))),
+            Poll::Ready(Some(socket_event)) => {
+                if let SocketEvent::Skip = socket_event {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(Some((self.handle, socket_event)))
+            },
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }

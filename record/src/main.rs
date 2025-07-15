@@ -1,11 +1,11 @@
 use crate::pages::login::Message as LoginMessage;
-use adaptors::SocketEvent;
+use adaptors::{Socket, SocketEvent};
 use auth::MessangersGenerator;
 use futures::{Stream, StreamExt, channel::mpsc::Sender, future::join_all, try_join};
 use iced::{Element, Subscription, Task, window};
 use messanger_unifier::Messangers;
 use pages::{Login, MyAppMessage, chat::MessengingWindow};
-use socket::ReciverEvent;
+use std::sync::Weak;
 
 use crate::messanger_unifier::MessangerHandle;
 use crate::socket::ActiveStream;
@@ -43,6 +43,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     iced::daemon(App::title(), App::update, App::view)
         .subscription(App::subscription)
+        .antialiasing(true)
         .run_with(move || {
             let (_window_id, window_task) = window::open(window::Settings::default());
             (
@@ -61,8 +62,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct App {
     page: Screen,
     messangers: Messangers,
-    socket_sender: Option<Sender<ReciverEvent>>,
-    active_streams: Vec<ActiveStream>,
+    active_streams: Vec<(MessangerHandle, Weak<dyn Socket + Send + Sync>)>,
 }
 
 impl App {
@@ -70,7 +70,6 @@ impl App {
         Self {
             page,
             messangers,
-            socket_sender: None,
             active_streams: Vec::new(),
         }
     }
@@ -184,7 +183,7 @@ impl App {
                 self.page = page;
                 Task::none()
             }
-            MyAppMessage::Test(active_streams) => {
+            MyAppMessage::SaveStreams(active_streams) => {
                 self.active_streams = active_streams;
                 Task::none()
             }
@@ -196,12 +195,12 @@ impl App {
                             let Some(socket) = messanger.socket().await else {
                                 return None;
                             };
-                            Some(ActiveStream { handle, socket })
+                            Some((handle, socket))
                         }
                     })),
                     |active_streams| {
                         let active_streams = active_streams.into_iter().filter_map(|x| x).collect();
-                        MyAppMessage::Test(active_streams)
+                        MyAppMessage::SaveStreams(active_streams)
                     },
                 ),
                 SocketMesg::Message((handle, socket_event)) => {
@@ -268,7 +267,9 @@ impl App {
             self.active_streams
                 .clone()
                 .into_iter()
-                .map(|x| Subscription::run_with_id(x.handle.id(), x)),
+                .map(|(handle, socket)| {
+                    Subscription::run_with_id(handle.id(), ActiveStream::new(handle, socket))
+                }),
         )
         .map(|msg| MyAppMessage::SocketEvent(SocketMesg::Message(msg)))
     }

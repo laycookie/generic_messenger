@@ -7,9 +7,10 @@ use chat::Message as MessangerMessage;
 pub use login::Login;
 use login::Message as LoginMessage;
 use std::fmt::Debug;
-
+use std::sync::Weak;
+use adaptors::Socket;
 use crate::Screen;
-use crate::socket::ActiveStream;
+
 
 #[derive(Debug)]
 pub(crate) enum MessangerData {
@@ -27,7 +28,7 @@ pub(crate) enum MessangerData {
 
 #[derive(Debug)]
 pub(crate) enum MyAppMessage {
-    Test(Vec<ActiveStream>),
+    SaveStreams(Vec<(MessangerHandle, Weak<dyn Socket + Send + Sync>)>),
     OpenPage(Screen),
     SetMessangerData {
         messanger_handle: MessangerHandle,
