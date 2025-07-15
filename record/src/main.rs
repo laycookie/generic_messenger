@@ -43,7 +43,6 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     iced::daemon(App::title(), App::update, App::view)
         .subscription(App::subscription)
-        .antialiasing(true)
         .run_with(move || {
             let (_window_id, window_task) = window::open(window::Settings::default());
             (
