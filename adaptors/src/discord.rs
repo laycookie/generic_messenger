@@ -10,8 +10,8 @@ use async_tungstenite::async_std::connect_async;
 use futures::lock::Mutex;
 use futures_locks::RwLock as RwLockAwait;
 
-use crate::discord::websocket::DiscordSocket;
 use crate::{Messanger, MessangerQuery, ParameterizedMessangerQuery, Socket};
+use crate::{VC, discord::websocket::DiscordSocket};
 
 pub mod json_structs;
 pub mod rest_api;
@@ -27,6 +27,7 @@ pub struct Discord {
     heart_beat_future: Arc<Mutex<Option<HeartBeatFuture>>>,
     heart_beat_interval: RwLockAwait<Option<Duration>>,
     // Cache
+    profile: RwLockAwait<Option<json_structs::Profile>>,
     dms: RwLock<Vec<json_structs::Channel>>,
     guilds: RwLock<Vec<json_structs::Guild>>,
 }
@@ -39,7 +40,7 @@ impl Discord {
             socket: None.into(),
             heart_beat_interval: RwLockAwait::new(None),
             heart_beat_future: Mutex::new(None).into(),
-            // socket: Mutex::new(None),
+            profile: RwLockAwait::new(None),
             dms: RwLock::new(Vec::new()),
             guilds: RwLock::new(Vec::new()),
         }
@@ -90,5 +91,8 @@ impl Messanger for Discord {
             *socket = Some(DiscordSocket::new(stream));
         };
         Some(Arc::<Discord>::downgrade(&self) as Weak<dyn Socket + Send + Sync>)
+    }
+    async fn vc(&self) -> Option<&dyn VC> {
+        Some(self)
     }
 }

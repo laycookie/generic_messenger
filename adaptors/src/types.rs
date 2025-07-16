@@ -34,6 +34,9 @@ pub struct Identifier<D> {
     pub data: D,
 }
 impl<D> Identifier<D> {
+    pub fn get_id(&self) -> &str {
+        &self.id
+    }
     pub fn remove_data(self) -> Identifier<()> {
         Identifier {
             id: self.id.clone(),

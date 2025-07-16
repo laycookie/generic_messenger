@@ -1,4 +1,4 @@
-use std::{sync::Weak, task::Poll};
+use std::{fmt::Debug, pin::Pin, sync::Weak, task::Poll};
 
 use adaptors::{Socket, SocketEvent};
 use futures::{
@@ -15,6 +15,25 @@ pub enum ReciverEvent {
 struct ActiveStream {
     handle: MessangerHandle,
     socket: Weak<dyn Socket + Send + Sync>,
+    fut: Option<Pin<Box<dyn Future<Output = Option<SocketEvent>> + Send>>>,
+}
+impl Debug for ActiveStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveStream")
+            .field("handle", &self.handle)
+            .field("socket", &self.socket)
+            .field("fut", &self.fut.is_some())
+            .finish()
+    }
+}
+impl ActiveStream {
+    fn new(handle: MessangerHandle, socket: Weak<dyn Socket + Send + Sync>) -> Self {
+        Self {
+            handle,
+            socket,
+            fut: None,
+        }
+    }
 }
 
 pub struct SocketsInterface {
@@ -46,7 +65,7 @@ impl Stream for SocketsInterface {
             match event {
                 ReciverEvent::Connection((handle, socket)) => {
                     if let Some(socket) = socket {
-                        self.active_streams.push(ActiveStream { handle, socket });
+                        self.active_streams.push(ActiveStream::new(handle, socket));
                         println!("Pushed as active");
                     }
                 }
@@ -64,9 +83,12 @@ impl Stream for SocketsInterface {
 
         // Pull events
         for (i, stream) in open_streams.iter().enumerate() {
-            let polled_event = stream.clone().next().poll_unpin(cx);
-            match polled_event {
+            if self.active_streams[i].fut.is_none() {
+                self.active_streams[i].fut = Some(stream.clone().next());
+            }
+            match self.active_streams[i].fut.as_mut().unwrap().poll_unpin(cx) {
                 Poll::Ready(Some(event)) => {
+                    self.active_streams[i].fut = None;
                     let SocketEvent::Skip = event else {
                         return Poll::Ready(Some((self.active_streams[i].handle, event)));
                     };

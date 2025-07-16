@@ -22,6 +22,7 @@ pub(crate) enum Message {
     DividerChange(f32),
     MsgInput(String),
     MsgSend,
+    Call,
     // ===
     UpdateChat {
         handle: MessangerHandle,
@@ -40,7 +41,7 @@ pub(crate) enum Main {
     },
     Chat {
         interface: (MessangerHandle, Arc<dyn Auth>),
-        meta_data: Identifier<Chan>,
+        channel_meta_data: Identifier<Chan>,
         msg_box: String,
     },
 }
@@ -103,7 +104,7 @@ impl MessengingWindow {
                 {
                     return Action::Run(Task::done(Message::ChangeMain(Main::Chat {
                         interface,
-                        meta_data: chan,
+                        channel_meta_data: chan,
                         msg_box: String::new(),
                     })));
                 }
@@ -126,7 +127,7 @@ impl MessengingWindow {
                         .chain(Task::done(Message::ChangeMain(
                             Main::Chat {
                                 interface,
-                                meta_data: chan,
+                                channel_meta_data: chan,
                                 msg_box: String::new(),
                             },
                         )))
@@ -147,10 +148,8 @@ impl MessengingWindow {
             Message::MsgSend => {
                 let Main::Chat {
                     interface,
-                    // auth,
-                    meta_data,
+                    channel_meta_data: meta_data,
                     msg_box: msg,
-                    ..
                 } = &mut self.main
                 else {
                     return Action::None;
@@ -163,9 +162,32 @@ impl MessengingWindow {
                 Action::Run(
                     Task::future(async move {
                         let param = auth.param_query().unwrap();
-                        param.send_message(&meta_data, contents).await.unwrap();
+                        if let Err(e) = param.send_message(&meta_data, contents).await {
+                            eprintln!("{e:#?}");
+                        };
                     })
                     .then(|_| Task::done(Message::MsgInput(String::new()))),
+                )
+            }
+            Message::Call => {
+                let Main::Chat {
+                    interface,
+                    channel_meta_data,
+                    ..
+                } = &mut self.main
+                else {
+                    return Action::None;
+                };
+
+                let auth = interface.1.clone();
+                let meta_data = channel_meta_data.clone();
+
+                Action::Run(
+                    Task::future(async move {
+                        let vc = auth.vc().await;
+                        vc.unwrap().connect(&meta_data).await;
+                    })
+                    .then(|_| Task::none()),
                 )
             }
         }
@@ -277,10 +299,13 @@ impl MessengingWindow {
                 }
                 Main::Chat {
                     interface,
-                    meta_data,
+                    channel_meta_data: meta_data,
                     msg_box: msg,
                 } => {
-                    let channel_info = row![Text::new(meta_data.data.name.clone())];
+                    let channel_info = row![
+                        Text::new(meta_data.data.name.clone()),
+                        Button::new("CALL").on_press(Message::Call)
+                    ];
 
                     let messages = messengers
                         .data_from_handle(interface.0)
