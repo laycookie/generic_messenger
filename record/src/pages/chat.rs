@@ -1,6 +1,6 @@
-use std::{borrow::Borrow, fmt::Debug, sync::Arc};
-
 use crate::messanger_unifier::{MessangerHandle, Messangers};
+use std::path::PathBuf;
+use std::{borrow::Borrow, fmt::Debug, sync::Arc};
 
 use adaptors::{
     Messanger as Auth,
@@ -316,8 +316,25 @@ impl MessengingWindow {
                     let chat = Scrollable::new(match messages {
                         Some(messages) => messages
                             .iter()
-                            .map(|msg| Text::from(msg.data.text.as_str()))
-                            .fold(Column::new(), |column, widget| column.push(widget)),
+                            .map(|msg| {
+                                let icon = msg.data.author.data.icon.clone();
+                                let icon =
+                                    icon.unwrap_or_else(|| "./public/imgs/placeholder.jpg".into());
+                                let image_height = Length::Fixed(36.0);
+                                row![
+                                    image(icon).height(image_height),
+                                    column![
+                                        container(Text::from(msg.data.author.data.name.as_str()))
+                                            .center_y(image_height)
+                                            .padding(Padding::new(0.0).left(5.0)),
+                                        container(Text::from(msg.data.text.as_str()))
+                                            .padding(Padding::new(0.0).left(5.0))
+                                    ]
+                                ]
+                            })
+                            .fold(Column::new().spacing(15.0), |column, widget| {
+                                column.push(widget)
+                            }),
                         None => Column::new(),
                     })
                     .anchor_bottom()
