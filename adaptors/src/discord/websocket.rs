@@ -198,12 +198,6 @@ impl Socket for Discord {
                             .and_then(|session_id| session_id.as_str().map(|s| s.to_string()))
                             .unwrap();
                         discord_stream.vc_session_id = Some(session_id);
-                        if discord_stream.vc_websocket.is_none() {
-                            let profile = self.profile.read().await;
-                            let profile = profile.as_ref();
-                            let user_id = profile.unwrap().id.as_str();
-                            connect_vc(user_id, discord_stream).await;
-                        }
                     }
                     "VOICE_SERVER_UPDATE" => {
                         let token = json
@@ -294,8 +288,8 @@ impl VC for Discord {
         let connection_payload = json!({
             "op": Opcode::VoiceStateUpdate as u8,
             "d": {
-                "guild_id": location.id,
-                "channel_id": location.id,
+                "guild_id": "1264672506963300513",
+                "channel_id": "1264672507353628775",
                 "self_mute": false,
                 "self_deaf": false
               }

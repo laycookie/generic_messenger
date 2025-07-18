@@ -37,7 +37,11 @@ pub struct MessangerHandle {
     id: usize,
     index: usize,
 }
-
+impl MessangerHandle {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
 #[derive(Default)]
 pub struct Messangers {
     id_counter: usize,
