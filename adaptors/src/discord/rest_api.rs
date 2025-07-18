@@ -27,14 +27,15 @@ impl MessangerQuery for Discord {
             self.get_auth_header(),
         )
         .await?;
+        let (id, name) = (profile.id.clone(), profile.username.clone());
+
+        let mut profile_cache = self.profile.write().await;
+        *profile_cache = Some(profile);
 
         Ok(Identifier {
-            id: profile.id.clone(),
+            id,
             hash: None,
-            data: Usr {
-                name: profile.username.clone(),
-                icon: None,
-            },
+            data: Usr { name, icon: None },
         })
     }
     async fn get_contacts(&self) -> Result<Vec<Identifier<Usr>>, Box<dyn Error + Sync + Send>> {
@@ -242,7 +243,7 @@ impl ParameterizedMessangerQuery for Discord {
             mobile_network_type: None,
         };
 
-        let reqs = http_request::<Vec<Message>>(
+        let msgs = http_request::<Vec<Message>>(
             surf::post(format!(
                 "https://discord.com/api/v9/channels/{}/messages",
                 location.id,
@@ -251,7 +252,7 @@ impl ParameterizedMessangerQuery for Discord {
             .unwrap(),
             self.get_auth_header(),
         )
-        .await;
+        .await?;
 
         Ok(())
     }

@@ -24,6 +24,9 @@ pub trait Messanger: Send + Sync + Debug {
     async fn socket(self: Arc<Self>) -> Option<Weak<dyn Socket + Send + Sync>> {
         None
     }
+    async fn vc(&self) -> Option<&dyn VC> {
+        None
+    }
 }
 impl PartialEq for dyn Messanger {
     fn eq(&self, other: &Self) -> bool {
@@ -67,4 +70,9 @@ pub enum SocketEvent {
 #[async_trait]
 pub trait Socket {
     async fn next(self: Arc<Self>) -> Option<SocketEvent>;
+}
+
+#[async_trait]
+pub trait VC {
+    async fn connect(&self, location: &Identifier<Chan>);
 }

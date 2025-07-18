@@ -206,8 +206,8 @@ impl App {
                     match socket_event {
                         SocketEvent::MessageCreated { channel, msg } => {
                             let d = self.messangers.mut_data_from_handle(handle).unwrap();
-                            println!("{:#?}", d.chats);
-                            println!("{channel:#?}");
+                            // println!("{:#?}", d.chats);
+                            // println!("{channel:#?}");
                             match d.chats.get_mut(&channel) {
                                 Some(msgs) => msgs.push(msg),
                                 None => {

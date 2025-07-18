@@ -1,17 +1,19 @@
 use async_trait::async_trait;
-use async_tungstenite::WebSocketStream;
 use async_tungstenite::async_std::ConnectStream;
 use async_tungstenite::tungstenite::Message;
-use futures::{FutureExt, Stream, StreamExt, poll};
+use async_tungstenite::{WebSocketStream, async_std::connect_async};
+use futures::{FutureExt, Stream, StreamExt, pending, poll};
 use futures_timer::Delay;
 use serde::Deserialize;
 use serde_json::json;
 use serde_repr::Deserialize_repr;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
+use crate::types::Chan;
 use crate::{
-    Socket, SocketEvent,
+    Socket, SocketEvent, VC,
     types::{Identifier, Msg, Usr},
 };
 
@@ -27,6 +29,8 @@ enum Opcode {
     Dispatch = 0,
     Heartbeat = 1,
     Identify = 2,
+    PresenceUpdate = 3,
+    VoiceStateUpdate = 4,
     Hello = 10,
     HeartbeatAck = 11,
 }
@@ -34,12 +38,19 @@ enum Opcode {
 pub(super) struct DiscordSocket {
     pub websocket: WebSocketStream<ConnectStream>,
     last_sequance_number: Option<usize>,
+    // VC
+    vc_websocket: Option<WebSocketStream<ConnectStream>>,
+    vc_location: Option<(String, String)>, // (token, endpoint)
+    vc_session_id: Option<String>,
 }
 impl DiscordSocket {
     pub fn new(websocket: WebSocketStream<ConnectStream>) -> Self {
         DiscordSocket {
             websocket,
             last_sequance_number: None,
+            vc_websocket: None,
+            vc_location: None,
+            vc_session_id: None,
         }
     }
 }
@@ -96,21 +107,33 @@ impl Discord {
 #[async_trait]
 impl Socket for Discord {
     async fn next(self: Arc<Self>) -> Option<SocketEvent> {
-        let mut heart_beat_future = self.heart_beat_future.lock().await;
-        {
-            if heart_beat_future.is_none() {
-                *heart_beat_future = Some(Box::pin(self.clone().heart_beat()));
-            };
-            match poll!(heart_beat_future.as_mut().unwrap()) {
-                std::task::Poll::Ready(_) => *heart_beat_future = None,
-                std::task::Poll::Pending => {}
-            };
-        }
+        let event = loop {
+            // Checks heartbeats
+            {
+                let mut heart_beat_future = self.heart_beat_future.lock().await;
+                if heart_beat_future.is_none() {
+                    *heart_beat_future = Some(Box::pin(self.clone().heart_beat()));
+                };
+                if poll!(heart_beat_future.as_mut().unwrap()).is_ready() {
+                    *heart_beat_future = None
+                }
+            }
 
+            // Pull next event
+            {
+                let mut socket = self.socket.lock().await;
+
+                let next_event = poll!(socket.as_mut()?.websocket.next());
+                if let Poll::Ready(event) = next_event {
+                    break event;
+                }
+            }
+            pending!()
+        };
         let mut socket = self.socket.lock().await;
         let discord_stream = socket.as_mut()?;
 
-        let json = match discord_stream.websocket.next().await? {
+        let json = match event? {
             Ok(Message::Text(text)) => serde_json::from_str::<GateawayPayload>(&text).unwrap(),
             Ok(Message::Close(frame)) => {
                 println!("Disconnected: {frame:?}");
@@ -158,9 +181,8 @@ impl Socket for Discord {
                     .await
                     .expect("Failed to send identify payload");
             }
-
             Opcode::Dispatch => {
-                let event_name = json.t.unwrap();
+                let event_name = json.t.as_ref().unwrap();
                 println!("{event_name:?}");
                 match event_name.as_str() {
                     "READY" => {
@@ -168,6 +190,33 @@ impl Socket for Discord {
                     }
                     "SESSIONS_REPLACE" => {
                         println!("something something");
+                    }
+                    "VOICE_STATE_UPDATE" => {
+                        let session_id = json
+                            .d
+                            .get("session_id")
+                            .and_then(|session_id| session_id.as_str().map(|s| s.to_string()))
+                            .unwrap();
+                        discord_stream.vc_session_id = Some(session_id);
+                    }
+                    "VOICE_SERVER_UPDATE" => {
+                        let token = json
+                            .d
+                            .get("token")
+                            .and_then(|token| token.as_str().map(|s| s.to_string()))
+                            .unwrap();
+                        let endpoint = json
+                            .d
+                            .get("endpoint")
+                            .and_then(|endpoint| endpoint.as_str().map(|s| s.to_string()))
+                            .unwrap();
+                        discord_stream.vc_location = Some((token, endpoint));
+                        if discord_stream.vc_websocket.is_none() {
+                            let profile = self.profile.read().await;
+                            let profile = profile.as_ref();
+                            let user_id = profile.unwrap().id.as_str();
+                            connect_vc(user_id, discord_stream).await;
+                        }
                     }
                     "MESSAGE_CREATE" => {
                         let channel_id = json
@@ -226,5 +275,58 @@ impl Socket for Discord {
             _ => {}
         };
         Some(SocketEvent::Skip)
+    }
+}
+
+#[async_trait]
+impl VC for Discord {
+    async fn connect(&self, location: &Identifier<Chan>) {
+        let mut socket = self.socket.lock().await;
+        let socket = socket.as_mut().unwrap();
+        let websocket = &mut socket.websocket;
+
+        let connection_payload = json!({
+            "op": Opcode::VoiceStateUpdate as u8,
+            "d": {
+                "guild_id": "1264672506963300513",
+                "channel_id": "1264672507353628775",
+                "self_mute": false,
+                "self_deaf": false
+              }
+        });
+        websocket
+            .send(connection_payload.to_string().into())
+            .await
+            .unwrap();
+        println!("Calling: {:?}", location.id);
+    }
+}
+
+async fn connect_vc(user_id: &str, socket: &mut DiscordSocket) {
+    if let Some((token, endpoint)) = socket.vc_location.as_ref()
+        && let Some(session_id) = socket.vc_session_id.as_ref()
+    {
+        println!("{endpoint:?}");
+        let (mut stream, response) = connect_async("wss://".to_string() + endpoint)
+            .await
+            .unwrap();
+        println!("Response HTTP code: {}", response.status());
+
+        let handshake_payload = json!({
+          "op": 0,
+          "d": {
+            "server_id": "743307525524422666",
+            "user_id": user_id,
+            "session_id": session_id,
+            "token": token,
+          }
+        });
+
+        stream
+            .send(handshake_payload.to_string().into())
+            .await
+            .unwrap();
+
+        socket.vc_websocket = Some(stream);
     }
 }
