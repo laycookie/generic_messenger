@@ -325,11 +325,9 @@ impl MessengingWindow {
                                     image(icon).height(image_height),
                                     column![
                                         container(Text::from(msg.data.author.data.name.as_str()))
-                                            .center_y(image_height)
-                                            .padding(Padding::new(0.0).left(5.0)),
+                                            .center_y(image_height),
                                         container(Text::from(msg.data.text.as_str()))
-                                            .padding(Padding::new(0.0).left(5.0))
-                                    ]
+                                    ].padding(Padding::new(0.0).left(5.0))
                                 ]
                             })
                             .fold(Column::new().spacing(15.0), |column, widget| {
