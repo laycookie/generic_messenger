@@ -1,12 +1,12 @@
-use async_trait::async_trait;
-use futures::future::join_all;
-use std::error::Error;
-
 use crate::{
     MessangerQuery, ParameterizedMessangerQuery,
     network::{cache_download, http_request},
     types::{Chan, Identifier, Msg, Server, Usr},
 };
+use async_trait::async_trait;
+use futures::future::join_all;
+use std::error::Error;
+use std::path::PathBuf;
 
 use super::{
     Discord,
@@ -44,17 +44,35 @@ impl MessangerQuery for Discord {
             self.get_auth_header(),
         )
         .await?;
-        Ok(friends
+
+        let contacts = friends
             .iter()
-            .map(|friend| Identifier {
-                id: friend.id.clone(),
-                hash: None,
-                data: Usr {
-                    name: friend.user.username.clone(),
-                    icon: None,
-                },
+            .map(async move |friend| {
+                let hash = match &friend.user.avatar {
+                    Some(hash) => {
+                        let url = format!(
+                            "https://cdn.discordapp.com/avatars/{}/{}.webp?size=80&quality=lossless",
+                            friend.id, hash
+                        );
+                        let dir = format!("./cache/imgs/users/discord/{}", friend.id);
+                        let filename = format!("{hash}.webp");
+
+                        cache_download(url, dir.into(), filename).await.ok()
+                    }
+                    None => None
+                };
+                Identifier {
+                    id: friend.id.clone(),
+                    hash: None,
+                    data: Usr {
+                        name: friend.user.username.clone(),
+                        icon: hash,
+                    },
+                }
             })
-            .collect())
+            .collect::<Vec<_>>();
+        let contacts = join_all(contacts).await;
+        Ok(contacts)
     }
     async fn get_conversation(
         &self,
@@ -114,7 +132,7 @@ impl MessangerQuery for Discord {
                             "https://cdn.discordapp.com/avatars/{}/{}.webp?size=80&quality=lossless",
                             first_recipients.id, hash
                         ),
-                        format!("./cache/imgs/users/discord/{}", channel.id).into(),
+                        format!("./cache/imgs/channels/discord/{}", channel.id).into(),
                         format!("{}.webp", hash),
                     )
                     .await;
@@ -219,7 +237,17 @@ impl ParameterizedMessangerQuery for Discord {
                         hash: None,
                         data: Usr {
                             name: message.author.username.clone(),
-                            icon: None, // TODO
+                            //NOTE: I have no idea if this will ever be desynchronized
+                            //For the time being, I dont want to turn this into asyncrhonous map and use cache_download()
+                            icon: {
+                                message.author.avatar.clone().and_then(|hash| {
+                                    let path = PathBuf::from(format!(
+                                        "./cache/imgs/users/discord/{}/{}.webp",
+                                        message.author.id, hash
+                                    ));
+                                    path.exists().then_some(path)
+                                })
+                            }, // TODO
                         },
                     },
                     text: message.content.clone(),
