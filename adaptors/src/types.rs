@@ -1,6 +1,7 @@
 use std::{
     borrow::Borrow,
     hash::{Hash, Hasher},
+    ops::Deref,
     path::PathBuf,
 };
 
@@ -43,6 +44,13 @@ impl<D> Identifier<D> {
             hash: self.hash.clone(),
             data: (),
         }
+    }
+}
+impl<D> Deref for Identifier<D> {
+    type Target = D;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
     }
 }
 

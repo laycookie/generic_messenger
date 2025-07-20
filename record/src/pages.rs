@@ -1,11 +1,11 @@
-pub mod chat;
 pub mod login;
+pub mod messenger;
 
 use crate::{SocketMesg, messanger_unifier::MessangerHandle};
 use adaptors::types::{Chan, Identifier, Msg, Server, Usr};
-use chat::Message as MessangerMessage;
 pub use login::Login;
 use login::Message as LoginMessage;
+use messenger::Message as MessangerMessage;
 use std::fmt::Debug;
 
 use crate::Screen;

@@ -4,7 +4,7 @@ use auth::MessangersGenerator;
 use futures::{Stream, StreamExt, channel::mpsc::Sender, future::join_all, try_join};
 use iced::{Element, Subscription, Task, window};
 use messanger_unifier::Messangers;
-use pages::{Login, MyAppMessage, chat::MessengingWindow};
+use pages::{Login, MyAppMessage, messenger::Messenger};
 use socket::{ReciverEvent, SocketsInterface};
 
 use crate::messanger_unifier::MessangerHandle;
@@ -18,7 +18,7 @@ mod socket;
 pub enum Screen {
     Loading,
     Login(Login),
-    Chat(MessengingWindow),
+    Chat(Messenger),
 }
 
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -170,7 +170,7 @@ impl App {
 
                     Task::batch(tasks_itr)
                         .chain(Task::done(MyAppMessage::OpenPage(Screen::Chat(
-                            MessengingWindow::new(),
+                            Messenger::new(),
                         ))))
                         .chain(Task::done(MyAppMessage::SaveMessengers))
                 })
@@ -250,14 +250,14 @@ impl App {
                     return Task::none();
                 };
                 match chat.update(message, &self.messangers) {
-                    pages::chat::Action::None => Task::none(),
-                    pages::chat::Action::UpdateChat { handle, kv } => {
+                    pages::messenger::Action::None => Task::none(),
+                    pages::messenger::Action::UpdateChat { handle, kv } => {
                         Task::done(MyAppMessage::SetMessangerData {
                             messanger_handle: handle,
                             new_data: pages::MessangerData::Chat(kv),
                         })
                     }
-                    pages::chat::Action::Run(task) => task.map(MyAppMessage::Chat),
+                    pages::messenger::Action::Run(task) => task.map(MyAppMessage::Chat),
                 }
             }
         }
