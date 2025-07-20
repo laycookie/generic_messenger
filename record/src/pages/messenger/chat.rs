@@ -6,8 +6,11 @@ use adaptors::{
     types::{Chan, Identifier},
 };
 use iced::{
-    Element, Length, Task,
-    widget::{Button, Column, Scrollable, Text, TextInput, column, row, text::LineHeight},
+    Element, Length, Padding, Task, advanced,
+    widget::{
+        Button, Column, Scrollable, Text, TextInput, column, container, image, row,
+        text::LineHeight,
+    },
 };
 
 use crate::messanger_unifier::{MessangerHandle, Messangers};
@@ -44,11 +47,17 @@ impl Chat {
     ) -> Element<'a, Message, Theme, Renderer>
     where
         Message: Clone,
-        Renderer: iced::advanced::Renderer + iced::advanced::text::Renderer + 'a,
+        Renderer: iced::advanced::Renderer
+            + iced::advanced::text::Renderer
+            + iced::advanced::image::Renderer
+            + 'a,
+        <Renderer as advanced::image::Renderer>::Handle:
+            for<'c> From<&'c std::path::PathBuf> + From<&'static str>,
         Theme: iced::widget::text::Catalog
             + iced::widget::button::Catalog
             + iced::widget::scrollable::Catalog
             + iced::widget::text_input::Catalog
+            + iced::widget::container::Catalog
             + 'a,
     {
         let channel_info = row![
@@ -65,8 +74,23 @@ impl Chat {
         let chat = Scrollable::new(match messages {
             Some(messages) => messages
                 .iter()
-                .map(|msg| Text::from(msg.text.as_str()))
-                .fold(Column::new(), |column, widget| column.push(widget)),
+                .map(|msg| {
+                    let icon = msg.data.author.data.icon.clone();
+                    let icon = icon.unwrap_or_else(|| "./public/imgs/placeholder.jpg".into());
+                    let image_height = Length::Fixed(36.0);
+                    row![
+                        image(&icon).height(image_height),
+                        column![
+                            container(Text::from(msg.data.author.data.name.as_str()))
+                                .center_y(image_height),
+                            container(Text::from(msg.data.text.as_str()))
+                        ]
+                        .padding(Padding::new(0.0).left(5.0))
+                    ]
+                })
+                .fold(Column::new().spacing(15.0), |column, widget| {
+                    column.push(widget)
+                }),
             None => Column::new(),
         })
         .anchor_bottom()
