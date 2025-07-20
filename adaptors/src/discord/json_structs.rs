@@ -81,16 +81,16 @@ pub enum ChannelTypes {
     GuildMedia,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct Channel {
     pub(crate) id: String,
-    // #[serde(rename = "type")]
-    // channel_type: ChannelTypes,
+    #[serde(rename = "type")]
+    channel_type: ChannelTypes,
     // flags: i32,
     pub(crate) icon: Option<String>,
     pub last_message_id: Option<String>,
     pub(crate) name: Option<String>,
-    pub(crate) recipients: Vec<Recipient>,
+    pub(crate) recipients: Option<Vec<Recipient>>,
 }
 
 #[derive(Deserialize, Debug)]

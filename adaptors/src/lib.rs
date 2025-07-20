@@ -40,11 +40,12 @@ pub trait MessangerQuery {
     async fn get_contacts(&self) -> Result<Vec<Identifier<Usr>>, Box<dyn Error + Sync + Send>>; // Users from friend list etc
     async fn get_conversation(&self)
     -> Result<Vec<Identifier<Chan>>, Box<dyn Error + Sync + Send>>; // List of DMs
-    async fn get_guilds(&self) -> Result<Vec<Identifier<Server>>, Box<dyn Error + Sync + Send>>; // Large groups that can have over a 100 people in them.
+    async fn get_guilds(&self) -> Result<Vec<Identifier<Server>>, Box<dyn Error + Sync + Send>>; // Multi-channel groups.
 }
 
 #[async_trait]
 pub trait ParameterizedMessangerQuery {
+    async fn get_guild_channels(&self, location: &Identifier<Server>) -> Vec<Identifier<Chan>>;
     async fn get_messanges(
         &self,
         msgs_location: &Identifier<Chan>,

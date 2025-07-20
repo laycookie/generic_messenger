@@ -93,7 +93,7 @@ impl MessangerQuery for Discord {
                         name: channel
                               .clone()
                               .name
-                              .unwrap_or(match channel.recipients.get(0) {
+                              .unwrap_or(match channel.recipients.as_ref().unwrap_or(&Vec::new()).first() {
                                     Some(test) => test.username.clone(),
                                     None => "Fix later".to_string(),
                         }),
@@ -110,7 +110,7 @@ impl MessangerQuery for Discord {
                             channel.id, hash
                         ),
                         format!("./cache/imgs/channels/discord/{}", channel.id).into(),
-                        format!("{}.webp", hash),
+                        format!("{hash}.webp"),
                     )
                     .await;
                     match icon {
@@ -125,29 +125,32 @@ impl MessangerQuery for Discord {
                 }
 
                 // If first recipient has a profile picture, insert that, and return
-                let first_recipients = &channel.recipients[0];
-                if let Some(hash) = &first_recipients.avatar {
-                    let icon = cache_download(
-                        format!(
-                            "https://cdn.discordapp.com/avatars/{}/{}.webp?size=80&quality=lossless",
-                            first_recipients.id, hash
-                        ),
-                        format!("./cache/imgs/channels/discord/{}", channel.id).into(),
-                        format!("{}.webp", hash),
-                    )
-                    .await;
-                    match icon {
-                        Ok(path) => {
-                            id.data.icon = Some(path);
-                            return id;
+                match channel.recipients.as_ref().unwrap_or(&Vec::new()).first() {
+                    Some(first_recipients) => {
+                        if let Some(hash) = &first_recipients.avatar {
+                            let icon = cache_download(
+                                format!(
+                                    "https://cdn.discordapp.com/avatars/{}/{}.webp?size=80&quality=lossless",
+                                    first_recipients.id, hash
+                                ),
+                                format!("./cache/imgs/channels/discord/{}", channel.id).into(),
+                                format!("{hash}.webp"),
+                            )
+                            .await;
+                            match icon {
+                                Ok(path) => {
+                                    id.data.icon = Some(path);
+                                    return id;
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to download icon for channel: {}\n{}", id.data.name, e);
+                                }
+                            };
                         }
-                        Err(e) => {
-                            eprintln!("Failed to download icon for channel: {}\n{}", id.data.name, e);
-                        }
-                    };
-                };
-
-                id
+                        id
+                    },
+                    None => id,
+                }
             })
             .collect::<Vec<_>>();
         let b = join_all(conversations).await;
@@ -171,7 +174,7 @@ impl MessangerQuery for Discord {
                         g.id, hash
                     ),
                     format!("./cache/imgs/guilds/discord/{}", g.id).into(),
-                    format!("{}.webp", hash),
+                    format!("{hash}.webp"),
                 )
                 .await;
                 match icon {
@@ -204,6 +207,32 @@ impl MessangerQuery for Discord {
 
 #[async_trait]
 impl ParameterizedMessangerQuery for Discord {
+    // Docs: https://discord.com/developers/docs/resources/guild#get-guild
+    async fn get_guild_channels(&self, location: &Identifier<Server>) -> Vec<Identifier<Chan>> {
+        let channels = http_request::<Vec<Channel>>(
+            surf::get(format!(
+                "https://discord.com/api/v10/guilds/{}/channels",
+                location.id
+            )),
+            self.get_auth_header(),
+        )
+        .await
+        .unwrap();
+        println!("{channels:#?}");
+
+        channels
+            .into_iter()
+            .map(|channel| Identifier {
+                id: channel.id,
+                hash: None,
+                data: Chan {
+                    name: channel.name.unwrap(),
+                    icon: None,
+                    particepents: Vec::new(),
+                },
+            })
+            .collect()
+    }
     // Docs: https://discord.com/developers/docs/resources/channel#get-channel
     // https://discord.com/developers/docs/resources/message#get-channel-message
     async fn get_messanges(
@@ -226,32 +255,34 @@ impl ParameterizedMessangerQuery for Discord {
         .await?;
 
         Ok(messages
-            .iter()
+            .into_iter()
             .rev()
-            .map(|message| Identifier {
-                id: message.id.clone(),
-                hash: None,
-                data: Msg {
-                    author: Identifier {
-                        id: message.author.id.clone(),
-                        hash: None,
-                        data: Usr {
-                            name: message.author.username.clone(),
-                            //NOTE: I have no idea if this will ever be desynchronized
-                            //For the time being, I dont want to turn this into asyncrhonous map and use cache_download()
-                            icon: {
-                                message.author.avatar.clone().and_then(|hash| {
-                                    let path = PathBuf::from(format!(
-                                        "./cache/imgs/users/discord/{}/{}.webp",
-                                        message.author.id, hash
-                                    ));
-                                    path.exists().then_some(path)
-                                })
-                            }, // TODO
+            .map(|message| {
+                //NOTE: I have no idea if this will ever be desynchronized
+                //For the time being, I dont want to turn this into asyncrhonous map and use cache_download()
+                let icon = message.author.avatar.and_then(|hash| {
+                    let path = PathBuf::from(format!(
+                        "./cache/imgs/users/discord/{}/{}.webp",
+                        message.author.id, hash
+                    ));
+                    path.exists().then_some(path)
+                });
+
+                Identifier {
+                    id: message.id,
+                    hash: None,
+                    data: Msg {
+                        author: Identifier {
+                            id: message.author.id,
+                            hash: None,
+                            data: Usr {
+                                name: message.author.username,
+                                icon,
+                            },
                         },
+                        text: message.content,
                     },
-                    text: message.content.clone(),
-                },
+                }
             })
             .collect())
     }

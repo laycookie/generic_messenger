@@ -33,11 +33,14 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
             }
         }
-        Err(_) => (
+        Err(e) => {
+            eprintln!("{e}");
             // TODO: This will probably not handle the error well.
-            App::new(Messangers::default(), Screen::Login(Login::default())),
-            false,
-        ),
+            (
+                App::new(Messangers::default(), Screen::Login(Login::default())),
+                false,
+            )
+        }
     };
 
     iced::daemon(App::title(), App::update, App::view)
@@ -133,7 +136,9 @@ impl App {
                                 q.get_guilds()
                             ) {
                                 Ok(t) => t,
-                                Err(e) => return Err((handle, e)),
+                                Err(e) => {
+                                    return Err((handle, e));
+                                }
                             };
 
                             Ok(Some((handle, profile, contacts, conversations, servers)))
@@ -144,6 +149,9 @@ impl App {
                     if !outputs.iter().any(|m| m.is_ok()) {
                         // In case we are running this from login screen. If
                         // we are not there this would be equivalent of Task::none()
+
+                        // TODO: Make it also clear all messengers
+                        // TODO: This might potentially get us stuck on loading screen
                         return Task::done(MyAppMessage::Login(LoginMessage::ToggleButtonState));
                     };
 

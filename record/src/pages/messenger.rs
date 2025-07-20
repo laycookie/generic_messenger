@@ -5,8 +5,9 @@ use crate::{
     pages::messenger::{
         chat::{Chat, Message as ChatMessage},
         contacts::{Contacts, Message as ContactsMessage},
-        conversation_sidebar::Sidebar,
-        navbar::Navbar,
+        conversation_sidebar::{Action as SidebarAction, Sidebar},
+        navbar::{Action as NavbarAction, Navbar},
+        server::{Message as ServerMessage, Server},
     },
 };
 
@@ -21,6 +22,7 @@ mod chat;
 mod contacts;
 mod conversation_sidebar;
 mod navbar;
+mod server;
 
 pub(super) const PLACEHOLDER_PFP: &str = "./public/imgs/placeholder.jpg";
 
@@ -28,17 +30,15 @@ pub(super) const PLACEHOLDER_PFP: &str = "./public/imgs/placeholder.jpg";
 pub(crate) enum Message {
     Chat(ChatMessage),
     Contacts(ContactsMessage),
+    Server(ServerMessage),
+    Navbar(NavbarAction),
+    Sidebar(SidebarAction),
     // ===
     ChangeMain(Main),
     DividerChange(f32),
-    // ===
     UpdateChat {
         handle: MessangerHandle,
         kv: (Identifier<()>, Vec<Identifier<Msg>>),
-    },
-    LoadConversation {
-        handle: MessangerHandle,
-        conversation: Identifier<Chan>,
     },
 }
 
@@ -46,6 +46,7 @@ pub(crate) enum Message {
 pub(crate) enum Main {
     Contacts(Contacts),
     Chat(Chat),
+    Server(Server),
 }
 
 #[derive(Debug)]
@@ -86,6 +87,7 @@ impl Messenger {
                 self.sidebar.width += val;
                 Action::None
             }
+            Message::UpdateChat { handle, kv } => Action::UpdateChat { handle, kv },
             Message::Chat(msg) => {
                 if let Main::Chat(chat) = &mut self.main {
                     return Action::Run(chat.update(msg).map(Message::Chat));
@@ -98,46 +100,93 @@ impl Messenger {
                 };
                 Action::None
             }
-            Message::UpdateChat { handle, kv } => Action::UpdateChat { handle, kv },
-            Message::LoadConversation {
-                handle,
-                conversation,
-            } => {
-                let Some(interface) = messengers.interface_from_handle(handle) else {
-                    return Action::None;
+            Message::Server(msg) => {
+                if let Main::Server(server) = &mut self.main {
+                    return Action::Run(server.update(msg).map(Message::Server));
                 };
-                let interface = interface.to_owned();
-
-                if let Some(messanger) = messengers.data_from_handle(handle)
-                    && messanger.chats.contains_key(conversation.borrow())
-                {
-                    return Action::Run(Task::done(Message::ChangeMain(Main::Chat(Chat::new(
-                        interface,
-                        conversation,
-                    )))));
-                }
-
-                Action::Run(
-                    Task::future(async move {
-                        let msgs = {
-                            let pq = interface.1.param_query().unwrap();
-                            pq.get_messanges(&conversation, None).await.unwrap()
-                        };
-
-                        (interface, conversation, msgs)
-                    })
-                    .then(|(interface, conversation, msgs)| {
-                        let channel_id: &Identifier<()> = conversation.borrow();
-                        Task::done(Message::UpdateChat {
-                            handle: interface.0,
-                            kv: (channel_id.to_owned(), msgs),
-                        })
-                        .chain(Task::done(Message::ChangeMain(
-                            Main::Chat(Chat::new(interface, conversation)),
-                        )))
-                    }),
-                )
+                Action::None
             }
+            Message::Navbar(action) => match action {
+                NavbarAction::GetGuild { handle, server } => {
+                    let Some(interface) = messengers.interface_from_handle(handle) else {
+                        return Action::None;
+                    };
+                    let interface = interface.to_owned();
+
+                    // TODO: Check cache
+
+                    // Otherwise fetch
+                    Action::Run(
+                        Task::future(async move {
+                            let channels = {
+                                let pq = interface.1.param_query().unwrap();
+                                pq.get_guild_channels(&server).await
+                            };
+
+                            (interface, server, channels)
+                        })
+                        .then(|(interface, server, channels)| {
+                            // TODO
+                            println!("loading");
+
+                            Task::done(Message::ChangeMain(Main::Server(Server::new(channels))))
+                            // Task::done(Message::UpdateChat {
+                            //     handle: interface.0,
+                            //     kv: (channel_id.to_owned(), channels),
+                            // })
+                            // .chain(Task::done(Message::ChangeMain(
+                            //     Main::Chat(Chat::new(interface, server)),
+                            // )))
+                        }),
+                    )
+                }
+            },
+            Message::Sidebar(action) => match action {
+                SidebarAction::OpenContacts => {
+                    self.main = Main::Contacts(Contacts::default());
+                    Action::None
+                }
+                SidebarAction::OpenChat {
+                    handle,
+                    conversation,
+                } => {
+                    let Some(interface) = messengers.interface_from_handle(handle) else {
+                        return Action::None;
+                    };
+                    let interface = interface.to_owned();
+
+                    // Check cache
+                    if let Some(messanger) = messengers.data_from_handle(handle)
+                        && messanger.chats.contains_key(conversation.borrow())
+                    {
+                        return Action::Run(Task::done(Message::ChangeMain(Main::Chat(
+                            Chat::new(interface, conversation),
+                        ))));
+                    }
+
+                    // Otherwise fetch
+                    Action::Run(
+                        Task::future(async move {
+                            let msgs = {
+                                let pq = interface.1.param_query().unwrap();
+                                pq.get_messanges(&conversation, None).await.unwrap()
+                            };
+
+                            (interface, conversation, msgs)
+                        })
+                        .then(|(interface, conversation, msgs)| {
+                            let channel_id: &Identifier<()> = conversation.borrow();
+                            Task::done(Message::UpdateChat {
+                                handle: interface.0,
+                                kv: (channel_id.to_owned(), msgs),
+                            })
+                            .chain(Task::done(Message::ChangeMain(
+                                Main::Chat(Chat::new(interface, conversation)),
+                            )))
+                        }),
+                    )
+                }
+            },
         }
     }
 
@@ -152,14 +201,15 @@ impl Messenger {
             None => "No messangers connected",
         })];
 
-        let navbar = Navbar::get_element(messengers.data_iter().flat_map(|data| &data.guilds));
+        let navbar = Navbar::get_element(messengers).map(Message::Navbar);
 
         let window = Responsive::new(move |size| {
-            let sidebar = self.sidebar.get_element(messengers);
+            let sidebar = self.sidebar.get_element(messengers).map(Message::Sidebar);
 
             let main = match &self.main {
                 Main::Chat(chat) => chat.get_element(messengers).map(Message::Chat),
                 Main::Contacts(contacts) => contacts.get_element(messengers).map(Message::Contacts),
+                Main::Server(server) => server.get_element(messengers).map(Message::Server),
             };
             row![
                 sidebar,

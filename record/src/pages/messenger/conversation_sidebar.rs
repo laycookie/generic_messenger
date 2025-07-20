@@ -1,5 +1,8 @@
+use std::borrow::Borrow;
+
+use adaptors::types::{Chan, Identifier};
 use iced::{
-    Alignment, Element, Length, Padding,
+    Alignment, Element, Length, Padding, Task,
     advanced::{self, renderer},
     widget::{
         Button, Column, Scrollable, button, column, container, image, row,
@@ -10,12 +13,28 @@ use iced::{
 
 use crate::{
     messanger_unifier::Messangers,
-    pages::messenger::{Main, Message, PLACEHOLDER_PFP, contacts::Contacts},
+    pages::messenger::{Main, PLACEHOLDER_PFP, chat::Chat, contacts::Contacts},
 };
 
 #[derive(Debug)]
 pub struct Sidebar {
     pub width: f32,
+}
+
+// enum Message {
+//     LoadConversation {
+//         handle: crate::messanger_unifier::MessangerHandle,
+//         conversation: Identifier<Chan>,
+//     },
+// }
+
+#[derive(Debug, Clone)]
+pub enum Action {
+    OpenContacts,
+    OpenChat {
+        handle: crate::messanger_unifier::MessangerHandle,
+        conversation: Identifier<Chan>,
+    },
 }
 
 impl Sidebar {
@@ -26,7 +45,7 @@ impl Sidebar {
     pub fn get_element<'a, Theme, Renderer>(
         &self,
         messengers: &'a Messangers,
-    ) -> Element<'a, Message, Theme, Renderer>
+    ) -> Element<'a, Action, Theme, Renderer>
     where
         Renderer: 'a + renderer::Renderer + advanced::image::Renderer + advanced::text::Renderer,
         <Renderer as advanced::image::Renderer>::Handle:
@@ -40,9 +59,8 @@ impl Sidebar {
                         .width(Length::Fill)
                         .align_x(Alignment::Center)
                 )
-                .on_press(Message::ChangeMain(Main::Contacts(Contacts::default())))
+                .on_press(Action::OpenContacts)
                 .width(Length::Fill),
-                // TODO: Make it read from all of them
                 messengers
                     .data_iter()
                     .zip(messengers.interface_iter())
@@ -60,7 +78,7 @@ impl Sidebar {
                                 ]
                             })
                             .width(Length::Fill)
-                            .on_press(Message::LoadConversation {
+                            .on_press(Action::OpenChat {
                                 handle: *m_handle,
                                 conversation: conversation.to_owned(),
                             })
