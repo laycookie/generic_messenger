@@ -11,7 +11,7 @@ use crate::{
     },
 };
 
-use adaptors::types::{Chan, Identifier, Msg};
+use adaptors::types::{Identifier, Msg};
 use iced::{
     Task,
     widget::{Responsive, Text, column, row},
@@ -112,8 +112,7 @@ impl Messenger {
                         return Action::None;
                     };
                     let interface = interface.to_owned();
-
-                    // TODO: Check cache
+                    self.sidebar.is_server = true;
 
                     // Otherwise fetch
                     Action::Run(
@@ -129,14 +128,10 @@ impl Messenger {
                             // TODO
                             println!("loading");
 
-                            Task::done(Message::ChangeMain(Main::Server(Server::new(channels))))
-                            // Task::done(Message::UpdateChat {
-                            //     handle: interface.0,
-                            //     kv: (channel_id.to_owned(), channels),
-                            // })
-                            // .chain(Task::done(Message::ChangeMain(
-                            //     Main::Chat(Chat::new(interface, server)),
-                            // )))
+                            Task::done(Message::ChangeMain(Main::Server(Server::new(
+                                interface.0,
+                                channels,
+                            ))))
                         }),
                     )
                 }
@@ -204,11 +199,19 @@ impl Messenger {
         let navbar = Navbar::get_element(messengers).map(Message::Navbar);
 
         let window = Responsive::new(move |size| {
-            let sidebar = self.sidebar.get_element(messengers).map(Message::Sidebar);
+            let sidebar;
+            if let Main::Server(server) = &self.main {
+                sidebar = self
+                    .sidebar
+                    .get_server_bar(messengers, server)
+                    .map(Message::Sidebar);
+            } else {
+                sidebar = self.sidebar.get_dm_bar(messengers).map(Message::Sidebar);
+            }
 
             let main = match &self.main {
-                Main::Chat(chat) => chat.get_element(messengers).map(Message::Chat),
                 Main::Contacts(contacts) => contacts.get_element(messengers).map(Message::Contacts),
+                Main::Chat(chat) => chat.get_element(messengers).map(Message::Chat),
                 Main::Server(server) => server.get_element(messengers).map(Message::Server),
             };
             row![

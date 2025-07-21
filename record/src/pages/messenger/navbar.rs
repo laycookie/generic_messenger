@@ -59,10 +59,4 @@ impl Navbar {
             ))
             .into()
     }
-    // pub fn update(msg: Message) -> Task<Message> {
-    //     match msg {
-    //         Message::GetGuild { handle, server } => Task::future(async {}).then(|_| Task::none()),
-    //     }
-    // }
 }
-
