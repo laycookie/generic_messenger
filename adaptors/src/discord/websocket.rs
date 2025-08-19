@@ -11,11 +11,9 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use crate::types::Chan;
-use crate::{
-    Socket, SocketEvent, VC,
-    types::{Identifier, Msg, Usr},
-};
+use crate::VCLocation;
+use crate::types::{Identifier, Msg, Usr};
+use crate::{Socket, SocketEvent, VC};
 
 use super::Discord;
 
@@ -119,10 +117,18 @@ impl Socket for Discord {
                 }
             }
 
+            let mut socket = self.socket.lock().await;
+            // Pull vc event
+            {
+                if let Some(a) = socket.as_mut()?.vc_websocket.as_mut() {
+                    if let Poll::Ready(event) = poll!(a.next()) {
+                        println!("VC event: {event:#?}")
+                    };
+                };
+            }
+
             // Pull next event
             {
-                let mut socket = self.socket.lock().await;
-
                 let next_event = poll!(socket.as_mut()?.websocket.next());
                 if let Poll::Ready(event) = next_event {
                     break event;
@@ -252,19 +258,20 @@ impl Socket for Discord {
                             .and_then(|username| username.as_str().map(|s| s.to_string()))
                             .unwrap();
 
+                        let channel_id_hash = Discord::discord_id_to_u32_id(channel_id.as_str());
+                        let msg_id_hash = Discord::discord_id_to_u32_id(channel_id.as_str());
+                        let author_id_hash = Discord::discord_id_to_u32_id(author_id.as_str());
+
                         return Some(SocketEvent::MessageCreated {
                             channel: Identifier {
-                                id: channel_id.to_owned(),
-                                hash: None,
+                                neo_id: channel_id_hash,
                                 data: (),
                             },
                             msg: Identifier {
-                                id: msg_id,
-                                hash: None,
+                                neo_id: msg_id_hash,
                                 data: Msg {
                                     author: Identifier {
-                                        id: author_id,
-                                        hash: None,
+                                        neo_id: author_id_hash,
                                         data: Usr {
                                             name: author_name,
                                             icon: None, // TODO:
@@ -286,16 +293,28 @@ impl Socket for Discord {
 
 #[async_trait]
 impl VC for Discord {
-    async fn connect(&self, location: &Identifier<Chan>) {
+    async fn connect<'a>(&'a self, location: VCLocation<'a>) {
         let mut socket = self.socket.lock().await;
         let socket = socket.as_mut().unwrap();
         let websocket = &mut socket.websocket;
 
+        // let t = self.guild_data.read().await;
+        let t1 = self.channel_data.read().await;
+        let (guild_id, channel_id) = {
+            match location {
+                VCLocation::Direct(identifier) => {
+                    let a = t1.get(identifier.get_id()).unwrap();
+                    (&a.id, &a.id)
+                }
+                VCLocation::Server => todo!(),
+            }
+        };
+
         let connection_payload = json!({
             "op": Opcode::VoiceStateUpdate as u8,
             "d": {
-                "guild_id": location.id,
-                "channel_id": location.id,
+                "guild_id": guild_id,
+                "channel_id": channel_id,
                 "self_mute": false,
                 "self_deaf": false
               }
@@ -304,7 +323,6 @@ impl VC for Discord {
             .send(connection_payload.to_string().into())
             .await
             .unwrap();
-        println!("Calling: {:?}", location.id);
     }
 }
 

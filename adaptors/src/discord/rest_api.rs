@@ -1,7 +1,8 @@
 use crate::{
     MessangerQuery, ParameterizedMessangerQuery,
+    discord::json_structs,
     network::{cache_download, http_request},
-    types::{Chan, Identifier, Msg, Server, Usr},
+    types::{Chan, ChanType, Identifier, Msg, Server, Usr},
 };
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -27,16 +28,14 @@ impl MessangerQuery for Discord {
             self.get_auth_header(),
         )
         .await?;
-        let (id, name) = (profile.id.clone(), profile.username.clone());
+        let name = profile.username.clone();
+
+        let prof = Discord::identifier_generator(profile.id.as_str(), Usr { name, icon: None });
 
         let mut profile_cache = self.profile.write().await;
         *profile_cache = Some(profile);
 
-        Ok(Identifier {
-            id,
-            hash: None,
-            data: Usr { name, icon: None },
-        })
+        Ok(prof)
     }
     async fn get_contacts(&self) -> Result<Vec<Identifier<Usr>>, Box<dyn Error + Sync + Send>> {
         let friends = http_request::<Vec<Friend>>(
@@ -61,14 +60,10 @@ impl MessangerQuery for Discord {
                     }
                     None => None
                 };
-                Identifier {
-                    id: friend.id.clone(),
-                    hash: None,
-                    data: Usr {
+                Discord::identifier_generator(friend.id.as_str(), Usr {
                         name: friend.user.username.clone(),
                         icon: hash,
-                    },
-                }
+                    })
             })
             .collect::<Vec<_>>();
         let contacts = join_all(contacts).await;
@@ -86,10 +81,7 @@ impl MessangerQuery for Discord {
         let conversations = channels
             .iter()
             .map(async move |channel| {
-                let mut id = Identifier {
-                    id: channel.id.clone(),
-                    hash: None,
-                    data: Chan {
+                let mut id = Discord::identifier_generator(channel.id.as_str() ,Chan {
                         name: channel
                               .clone()
                               .name
@@ -99,8 +91,8 @@ impl MessangerQuery for Discord {
                         }),
                         icon: None,
                         particepents: Vec::new(),
-                    }
-                };
+                        chan_type: ChanType::TextAndVoice,
+                    });
 
                 // If channel has icon, insert that, and return it
                 if let Some(hash) = &channel.icon {
@@ -155,7 +147,10 @@ impl MessangerQuery for Discord {
             .collect::<Vec<_>>();
         let b = join_all(conversations).await;
 
-        *self.dms.write().unwrap() = channels;
+        let mut channel_data = self.channel_data.write().await;
+        for (identifier, channel) in b.iter().zip(channels) {
+            channel_data.insert(identifier.neo_id, channel);
+        }
 
         Ok(b)
     }
@@ -186,20 +181,23 @@ impl MessangerQuery for Discord {
                 }
             });
 
-            Identifier {
-                id: g.id.clone(),
-                hash: None,
-                data: Server {
+            Discord::identifier_generator(
+                g.id.as_str(),
+                Server {
                     name: g.name.clone(),
                     icon: match icon {
                         Some(icon) => icon.await,
                         None => None,
                     },
                 },
-            }
+            )
         });
         let b = join_all(g).await;
-        *self.guilds.write().unwrap() = guilds;
+
+        let mut channel_data = self.guild_data.write().await;
+        for (identifier, guild) in b.iter().zip(guilds) {
+            channel_data.insert(identifier.neo_id, guild);
+        }
 
         Ok(b)
     }
@@ -208,30 +206,57 @@ impl MessangerQuery for Discord {
 #[async_trait]
 impl ParameterizedMessangerQuery for Discord {
     // Docs: https://discord.com/developers/docs/resources/guild#get-guild
-    async fn get_guild_channels(&self, location: &Identifier<Server>) -> Vec<Identifier<Chan>> {
+    async fn get_server_conversations(
+        &self,
+        location: &Identifier<Server>,
+    ) -> Vec<Identifier<Chan>> {
+        let t = self.guild_data.read().await;
+        let guild = t.get(&location.neo_id).unwrap();
+
         let channels = http_request::<Vec<Channel>>(
             surf::get(format!(
                 "https://discord.com/api/v10/guilds/{}/channels",
-                location.id
+                guild.id
             )),
             self.get_auth_header(),
         )
         .await
         .unwrap();
-        println!("{channels:#?}");
 
+        let mut channel_data = self.channel_data.write().await;
         channels
             .into_iter()
-            .map(|channel| Identifier {
-                id: channel.id,
-                hash: None,
-                data: Chan {
-                    name: channel.name.unwrap(),
-                    icon: None,
-                    particepents: Vec::new(),
-                },
+            .filter_map(|channel| {
+                if channel
+                    .permission_overwrites
+                    .as_ref()?
+                    .iter()
+                    // TODO: Rewrite
+                    .any(|a| a.deny.parse::<u32>().unwrap() & (1 << 10) == (1 << 10))
+                {
+                    return None;
+                };
+
+                let identifier = Discord::identifier_generator(
+                    channel.id.as_str(),
+                    Chan {
+                        name: channel.name.clone().unwrap(),
+                        icon: None,
+                        particepents: Vec::new(),
+                        chan_type: match channel.channel_type {
+                            json_structs::ChannelTypes::GuildCategory => ChanType::Spacer,
+                            json_structs::ChannelTypes::GuildText => ChanType::Text,
+                            json_structs::ChannelTypes::GuildAnnouncement => ChanType::Text,
+                            json_structs::ChannelTypes::GuildVoice => ChanType::Voice,
+                            json_structs::ChannelTypes::GuildStageVoice => ChanType::Voice,
+                            _ => ChanType::Spacer,
+                        },
+                    },
+                );
+                channel_data.insert(identifier.neo_id, channel);
+                Some(identifier)
             })
-            .collect()
+            .collect::<Vec<_>>()
     }
     // Docs: https://discord.com/developers/docs/resources/channel#get-channel
     // https://discord.com/developers/docs/resources/message#get-channel-message
@@ -240,15 +265,22 @@ impl ParameterizedMessangerQuery for Discord {
         msgs_location: &Identifier<Chan>,
         load_from_msg: Option<Identifier<Msg>>,
     ) -> Result<Vec<Identifier<Msg>>, Box<dyn Error + Sync + Send>> {
+        let t = self.channel_data.read().await;
+        let channel = t.get(&msgs_location.neo_id).unwrap();
+
         let before = match load_from_msg {
-            Some(msg) => format!("?{}", msg.id),
+            Some(msg) => {
+                let t2 = self.msg_data.read().await;
+                let msg = t2.get(&msg.neo_id).unwrap();
+                format!("?{}", msg.id)
+            }
             None => "".to_string(),
         };
 
         let messages = http_request::<Vec<Message>>(
             surf::get(format!(
                 "https://discord.com/api/v10/channels/{}/messages{}",
-                msgs_location.id, before,
+                channel.id, before,
             )),
             self.get_auth_header(),
         )
@@ -268,21 +300,19 @@ impl ParameterizedMessangerQuery for Discord {
                     path.exists().then_some(path)
                 });
 
-                Identifier {
-                    id: message.id,
-                    hash: None,
-                    data: Msg {
-                        author: Identifier {
-                            id: message.author.id,
-                            hash: None,
-                            data: Usr {
+                Discord::identifier_generator(
+                    message.id.as_str(),
+                    Msg {
+                        author: Discord::identifier_generator(
+                            message.author.id.as_str(),
+                            Usr {
                                 name: message.author.username,
                                 icon,
                             },
-                        },
+                        ),
                         text: message.content,
                     },
-                }
+                )
             })
             .collect())
     }
@@ -293,19 +323,21 @@ impl ParameterizedMessangerQuery for Discord {
         location: &Identifier<Chan>,
         contents: String,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
+        let t = self.channel_data.read().await;
+        let channel = t.get(&location.neo_id).unwrap();
+
         let message = CreateMessage {
             content: Some(contents),
             nonce: None,
             enforce_nonce: None,
             tts: Some(false),
             flags: Some(0),
-            mobile_network_type: None,
         };
 
         let msgs = http_request::<Vec<Message>>(
             surf::post(format!(
                 "https://discord.com/api/v9/channels/{}/messages",
-                location.id,
+                channel.id,
             ))
             .body_json(&message)
             .unwrap(),

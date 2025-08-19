@@ -63,6 +63,13 @@ pub struct Recipient {
 
 // === Chennels ===
 
+#[derive(Deserialize, Debug, Clone)]
+pub(crate) struct OverwriteObject {
+    pub(crate) id: String,
+    pub(crate) allow: String,
+    pub(crate) deny: String,
+}
+
 #[derive(Deserialize_repr, Debug, Clone)]
 #[repr(u8)]
 pub enum ChannelTypes {
@@ -84,13 +91,15 @@ pub enum ChannelTypes {
 #[derive(Deserialize, Debug, Clone)]
 pub struct Channel {
     pub(crate) id: String,
+    pub(crate) guild_id: Option<String>,
     #[serde(rename = "type")]
-    channel_type: ChannelTypes,
+    pub(crate) channel_type: ChannelTypes,
     // flags: i32,
     pub(crate) icon: Option<String>,
-    pub last_message_id: Option<String>,
+    pub(crate) last_message_id: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) recipients: Option<Vec<Recipient>>,
+    pub(crate) permission_overwrites: Option<Vec<OverwriteObject>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -138,18 +147,9 @@ pub struct Message {
     // type: u32,
 }
 
-#[derive(Debug, Serialize)]
-pub enum MobileNetworkType {
-    Unkown,
-    _2G,
-    _3G,
-    _4G,
-    _5G,
-}
 // https://discord.com/developers/docs/resources/message#create-message-jsonform-params
 #[derive(Debug, Serialize)]
 pub struct CreateMessage {
-    pub mobile_network_type: Option<MobileNetworkType>, // Not in the official docs. but is a thing
     pub nonce: Option<String>, // Can be used to verify a message was sent (up to 25 characters). Value will appear in the Message Create event.
     pub enforce_nonce: Option<bool>, // If true, checks nonce uniqueness
     pub tts: Option<bool>,     // True if this is a TTS message

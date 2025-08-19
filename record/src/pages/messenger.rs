@@ -30,11 +30,11 @@ pub(super) const PLACEHOLDER_PFP: &str = "./public/imgs/placeholder.jpg";
 pub(crate) enum Message {
     Chat(ChatMessage),
     Contacts(ContactsMessage),
-    Server(ServerMessage),
     Navbar(NavbarAction),
     Sidebar(SidebarAction),
     // ===
     ChangeMain(Main),
+    SetSidebarServer(Option<Server>),
     DividerChange(f32),
     UpdateChat {
         handle: MessangerHandle,
@@ -46,7 +46,6 @@ pub(crate) enum Message {
 pub(crate) enum Main {
     Contacts(Contacts),
     Chat(Chat),
-    Server(Server),
 }
 
 #[derive(Debug)]
@@ -76,6 +75,10 @@ pub enum Action {
 impl Messenger {
     pub(crate) fn update(&mut self, message: Message, messengers: &Messangers) -> Action {
         match message {
+            Message::SetSidebarServer(server) => {
+                self.sidebar.server = server;
+                Action::None
+            }
             Message::ChangeMain(screen) => {
                 self.main = screen;
                 Action::None
@@ -100,26 +103,20 @@ impl Messenger {
                 };
                 Action::None
             }
-            Message::Server(msg) => {
-                if let Main::Server(server) = &mut self.main {
-                    return Action::Run(server.update(msg).map(Message::Server));
-                };
-                Action::None
-            }
+
             Message::Navbar(action) => match action {
                 NavbarAction::GetGuild { handle, server } => {
                     let Some(interface) = messengers.interface_from_handle(handle) else {
                         return Action::None;
                     };
                     let interface = interface.to_owned();
-                    self.sidebar.is_server = true;
 
                     // Otherwise fetch
                     Action::Run(
                         Task::future(async move {
                             let channels = {
                                 let pq = interface.1.param_query().unwrap();
-                                pq.get_guild_channels(&server).await
+                                pq.get_server_conversations(&server).await
                             };
 
                             (interface, server, channels)
@@ -128,7 +125,7 @@ impl Messenger {
                             // TODO
                             println!("loading");
 
-                            Task::done(Message::ChangeMain(Main::Server(Server::new(
+                            Task::done(Message::SetSidebarServer(Some(Server::new(
                                 interface.0,
                                 channels,
                             ))))
@@ -199,20 +196,11 @@ impl Messenger {
         let navbar = Navbar::get_element(messengers).map(Message::Navbar);
 
         let window = Responsive::new(move |size| {
-            let sidebar;
-            if let Main::Server(server) = &self.main {
-                sidebar = self
-                    .sidebar
-                    .get_server_bar(messengers, server)
-                    .map(Message::Sidebar);
-            } else {
-                sidebar = self.sidebar.get_dm_bar(messengers).map(Message::Sidebar);
-            }
+            let sidebar = self.sidebar.get_bar(messengers).map(Message::Sidebar);
 
             let main = match &self.main {
                 Main::Contacts(contacts) => contacts.get_element(messengers).map(Message::Contacts),
                 Main::Chat(chat) => chat.get_element(messengers).map(Message::Chat),
-                Main::Server(server) => server.get_element(messengers).map(Message::Server),
             };
             row![
                 sidebar,

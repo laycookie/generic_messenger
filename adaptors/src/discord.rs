@@ -1,7 +1,9 @@
 use std::{
+    collections::HashMap,
     fmt::Debug,
+    hash::{DefaultHasher, Hash, Hasher},
     pin::Pin,
-    sync::{Arc, RwLock, Weak},
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -10,7 +12,11 @@ use async_tungstenite::async_std::connect_async;
 use futures::lock::Mutex;
 use futures_locks::RwLock as RwLockAwait;
 
-use crate::{Messanger, MessangerQuery, ParameterizedMessangerQuery, Socket};
+use crate::{
+    Messanger, MessangerQuery, ParameterizedMessangerQuery, Socket,
+    discord::json_structs::{Channel, Guild, Message},
+    types::{ID, Identifier},
+};
 use crate::{VC, discord::websocket::DiscordSocket};
 
 pub mod json_structs;
@@ -28,8 +34,9 @@ pub struct Discord {
     heart_beat_interval: RwLockAwait<Option<Duration>>,
     // Cache
     profile: RwLockAwait<Option<json_structs::Profile>>,
-    dms: RwLock<Vec<json_structs::Channel>>,
-    guilds: RwLock<Vec<json_structs::Guild>>,
+    guild_data: RwLockAwait<HashMap<ID, Guild>>,
+    channel_data: RwLockAwait<HashMap<ID, Channel>>,
+    msg_data: RwLockAwait<HashMap<ID, Message>>,
 }
 
 impl Discord {
@@ -41,8 +48,9 @@ impl Discord {
             heart_beat_interval: RwLockAwait::new(None),
             heart_beat_future: Mutex::new(None).into(),
             profile: RwLockAwait::new(None),
-            dms: RwLock::new(Vec::new()),
-            guilds: RwLock::new(Vec::new()),
+            guild_data: RwLockAwait::new(HashMap::new()),
+            channel_data: RwLockAwait::new(HashMap::new()),
+            msg_data: RwLockAwait::new(HashMap::new()),
         }
     }
     fn id(&self) -> String {
@@ -50,6 +58,17 @@ impl Discord {
     }
     fn name(&self) -> &'static str {
         "Discord"
+    }
+    fn discord_id_to_u32_id(id: &str) -> u32 {
+        let mut hasher = DefaultHasher::new();
+        id.hash(&mut hasher);
+        hasher.finish() as u32
+    }
+    fn identifier_generator<D>(id: &str, data: D) -> Identifier<D> {
+        Identifier {
+            neo_id: Discord::discord_id_to_u32_id(id),
+            data,
+        }
     }
 }
 

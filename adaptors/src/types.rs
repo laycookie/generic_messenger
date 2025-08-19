@@ -6,21 +6,11 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
-pub struct Server {
-    pub name: String,
-    pub icon: Option<PathBuf>,
-}
-#[derive(Debug, Clone)]
-pub struct Chan {
-    pub name: String,
-    pub icon: Option<PathBuf>,
-    pub particepents: Vec<Identifier<Usr>>,
-}
-#[derive(Debug, Clone)]
 pub struct Usr {
     pub name: String,
     pub icon: Option<PathBuf>,
 }
+
 #[derive(Debug, Clone)]
 pub struct Msg {
     pub author: Identifier<Usr>,
@@ -28,20 +18,40 @@ pub struct Msg {
 }
 
 #[derive(Debug, Clone)]
+pub enum ChanType {
+    Spacer,
+    Text,
+    Voice,
+    TextAndVoice,
+}
+#[derive(Debug, Clone)]
+pub struct Chan {
+    pub chan_type: ChanType,
+    pub name: String,
+    pub icon: Option<PathBuf>,
+    pub particepents: Vec<Identifier<Usr>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Server {
+    pub name: String,
+    pub icon: Option<PathBuf>,
+}
+
+pub(crate) type ID = u32;
+#[derive(Debug, Clone)]
 #[repr(C)]
 pub struct Identifier<D> {
-    pub(crate) id: String,           // ID of a location inside the parent obj
-    pub(crate) hash: Option<String>, // Used in cases where ID can change
+    pub(crate) neo_id: ID,
     pub data: D,
 }
 impl<D> Identifier<D> {
-    pub fn get_id(&self) -> &str {
-        &self.id
+    pub fn get_id(&self) -> &ID {
+        &self.neo_id
     }
     pub fn remove_data(self) -> Identifier<()> {
         Identifier {
-            id: self.id.clone(),
-            hash: self.hash.clone(),
+            neo_id: self.neo_id,
             data: (),
         }
     }
@@ -56,7 +66,7 @@ impl<D> Deref for Identifier<D> {
 
 impl<D, E> PartialEq<Identifier<E>> for Identifier<D> {
     fn eq(&self, other: &Identifier<E>) -> bool {
-        self.id == other.id && self.hash == other.hash
+        self.get_id() == other.get_id()
     }
 }
 impl<D> Eq for Identifier<D> {}
@@ -64,8 +74,7 @@ impl<D> Eq for Identifier<D> {}
 // TODO: Review this later
 impl<D> Hash for Identifier<D> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-        self.hash.hash(state);
+        self.get_id().hash(state);
     }
 }
 
