@@ -147,7 +147,7 @@ impl MessangerQuery for Discord {
             .collect::<Vec<_>>();
         let b = join_all(conversations).await;
 
-        let mut channel_data = self.channel_data.write().await;
+        let mut channel_data = self.channels_map.write().await;
         for (identifier, channel) in b.iter().zip(channels) {
             channel_data.insert(identifier.neo_id, channel);
         }
@@ -223,7 +223,7 @@ impl ParameterizedMessangerQuery for Discord {
         .await
         .unwrap();
 
-        let mut channel_data = self.channel_data.write().await;
+        let mut channel_data = self.channels_map.write().await;
         channels
             .into_iter()
             .filter_map(|channel| {
@@ -265,7 +265,7 @@ impl ParameterizedMessangerQuery for Discord {
         msgs_location: &Identifier<Chan>,
         load_from_msg: Option<Identifier<Msg>>,
     ) -> Result<Vec<Identifier<Msg>>, Box<dyn Error + Sync + Send>> {
-        let t = self.channel_data.read().await;
+        let t = self.channels_map.read().await;
         let channel = t.get(&msgs_location.neo_id).unwrap();
 
         let before = match load_from_msg {
@@ -323,7 +323,7 @@ impl ParameterizedMessangerQuery for Discord {
         location: &Identifier<Chan>,
         contents: String,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let t = self.channel_data.read().await;
+        let t = self.channels_map.read().await;
         let channel = t.get(&location.neo_id).unwrap();
 
         let message = CreateMessage {
@@ -334,7 +334,7 @@ impl ParameterizedMessangerQuery for Discord {
             flags: Some(0),
         };
 
-        let msgs = http_request::<Vec<Message>>(
+        let _msgs = http_request::<Vec<Message>>(
             surf::post(format!(
                 "https://discord.com/api/v9/channels/{}/messages",
                 channel.id,

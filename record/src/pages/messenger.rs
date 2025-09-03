@@ -7,7 +7,7 @@ use crate::{
         contacts::{Contacts, Message as ContactsMessage},
         conversation_sidebar::{Action as SidebarAction, Sidebar},
         navbar::{Action as NavbarAction, Navbar},
-        server::{Message as ServerMessage, Server},
+        server::Server,
     },
 };
 
@@ -114,26 +114,41 @@ impl Messenger {
                     // Otherwise fetch
                     Action::Run(
                         Task::future(async move {
-                            let channels = {
+                            let server_channels = {
                                 let pq = interface.1.param_query().unwrap();
                                 pq.get_server_conversations(&server).await
                             };
 
-                            (interface, server, channels)
+                            (interface, server_channels)
                         })
-                        .then(|(interface, server, channels)| {
+                        .then(|(interface, server_channels)| {
                             // TODO
                             println!("loading");
 
                             Task::done(Message::SetSidebarServer(Some(Server::new(
                                 interface.0,
-                                channels,
+                                server_channels,
                             ))))
                         }),
                     )
                 }
             },
             Message::Sidebar(action) => match action {
+                SidebarAction::Call(channel) => {
+                    let server = self.sidebar.server.as_ref().unwrap();
+                    let Some(interface) = messengers.interface_from_handle(server.handle) else {
+                        return Action::None;
+                    };
+                    let auth = interface.to_owned().1;
+
+                    Action::Run(
+                        Task::future(async move {
+                            let vc = auth.vc().await;
+                            vc.unwrap().connect(&channel).await;
+                        })
+                        .then(|_| Task::none()),
+                    )
+                }
                 SidebarAction::OpenContacts => {
                     self.main = Main::Contacts(Contacts::default());
                     Action::None

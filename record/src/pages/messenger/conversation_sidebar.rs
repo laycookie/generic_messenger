@@ -1,12 +1,7 @@
 use adaptors::types::{Chan, ChanType, Identifier};
 use iced::{
-    Alignment, Color, Element, Length, Padding,
-    advanced::{self, renderer},
-    widget::{
-        Button, Column, Scrollable, Text, button, column, container, image, row,
-        scrollable::{self, Direction, Scrollbar},
-        text,
-    },
+    Color, Element, Length, Padding,
+    widget::{Button, Column, Scrollable, Text, button, column, container, image, row},
 };
 
 use super::PLACEHOLDER_PFP;
@@ -20,6 +15,7 @@ pub struct Sidebar {
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    Call(Identifier<Chan>),
     OpenContacts,
     OpenChat {
         handle: crate::messanger_unifier::MessangerHandle,
@@ -41,9 +37,8 @@ impl Sidebar {
                 match chan.chan_type {
                     ChanType::Spacer => Text::new(chan.name.as_str()).into(),
                     ChanType::Voice => Button::new(chan.name.as_str())
-                        // .on_press(Action::)
+                        .on_press(Action::Call(chan.clone()))
                         .style(|_, _| button::Style {
-                            // TODO: TEMP
                             background: Some(iced::Background::Color(Color::from_rgb(
                                 0.0, 1.0, 0.2,
                             ))),
@@ -88,6 +83,11 @@ impl Sidebar {
             ),
         };
 
-        Scrollable::new(elements).width(self.width).into()
+        Scrollable::new(column![
+            Button::new("Contacts").on_press(Action::OpenContacts),
+            elements
+        ])
+        .width(self.width)
+        .into()
     }
 }

@@ -17,10 +17,7 @@ pub(crate) enum MessangerData {
         contacts: Vec<Identifier<Usr>>,
         conversations: Vec<Identifier<Chan>>,
         servers: Vec<Identifier<Server>>,
-        // chat: (Identifier<()>, Vec<Identifier<Msg>>),
     },
-    Profile(Identifier<Usr>),
-    Servers(Vec<Identifier<Server>>),
     Chat((Identifier<()>, Vec<Identifier<Msg>>)),
 }
 

@@ -113,9 +113,7 @@ impl Chat {
 
                 Task::future(async move {
                     let vc = auth.vc().await;
-                    vc.unwrap()
-                        .connect(adaptors::VCLocation::Direct(&meta_data))
-                        .await;
+                    vc.unwrap().connect(&meta_data).await;
                 })
                 .then(|_| Task::none())
             }

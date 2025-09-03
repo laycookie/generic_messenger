@@ -108,12 +108,6 @@ impl App {
                         d.conversations = conversations;
                         d.guilds = servers;
                     }
-                    pages::MessangerData::Profile(p) => {
-                        d.profile = Some(p);
-                    }
-                    pages::MessangerData::Servers(s) => {
-                        d.guilds = s;
-                    }
                     pages::MessangerData::Chat((k, v)) => {
                         d.chats.insert(k.clone(), v);
                     }

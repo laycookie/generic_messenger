@@ -86,5 +86,5 @@ pub enum VCLocation<'a> {
 
 #[async_trait]
 pub trait VC {
-    async fn connect<'a>(&'a self, location: VCLocation<'a>);
+    async fn connect<'a>(&'a self, location: &Identifier<Chan>);
 }

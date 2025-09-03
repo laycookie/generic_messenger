@@ -2,7 +2,7 @@ use adaptors::types::{Identifier, Server};
 use iced::advanced::{self, renderer};
 use iced::widget::scrollable::{self, Direction, Scrollbar};
 use iced::widget::{Button, Column, Scrollable, button, image};
-use iced::{ContentFit, Element, Length, Task};
+use iced::{ContentFit, Element, Length};
 
 use crate::messanger_unifier::{MessangerHandle, Messangers};
 use crate::pages::messenger::PLACEHOLDER_PFP;

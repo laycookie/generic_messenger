@@ -65,8 +65,8 @@ pub struct Recipient {
 
 #[derive(Deserialize, Debug, Clone)]
 pub(crate) struct OverwriteObject {
-    pub(crate) id: String,
-    pub(crate) allow: String,
+    // pub(crate) id: String,
+    // pub(crate) allow: String,
     pub(crate) deny: String,
 }
 
@@ -96,7 +96,7 @@ pub struct Channel {
     pub(crate) channel_type: ChannelTypes,
     // flags: i32,
     pub(crate) icon: Option<String>,
-    pub(crate) last_message_id: Option<String>,
+    // pub(crate) last_message_id: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) recipients: Option<Vec<Recipient>>,
     pub(crate) permission_overwrites: Option<Vec<OverwriteObject>>,

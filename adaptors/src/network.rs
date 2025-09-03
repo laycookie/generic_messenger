@@ -29,27 +29,6 @@ pub async fn http_request<T: DeserializeOwned>(
     let json = res.body_json::<T>().await?;
     Ok(json)
 }
-pub async fn http_request_debug<T: DeserializeOwned>(
-    mut req: RequestBuilder,
-    headers: Vec<(&str, String)>,
-) -> Result<(), Box<dyn Error + Sync + Send>> {
-    for (key, value) in headers {
-        req = req.header(key, value);
-    }
-
-    let mut res = req.send().await?;
-
-    if StatusCode::Ok != res.status() {
-        return Err(surf::Error::from_str(
-            StatusCode::Unauthorized,
-            "TODO: Is ussualy caused by an outdated token",
-        )
-        .into());
-    }
-
-    println!("{:#?}", res.body_string().await?);
-    Ok(())
-}
 
 pub async fn cache_download(
     url: impl Into<String>,

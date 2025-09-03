@@ -2,9 +2,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     hash::{DefaultHasher, Hash, Hasher},
-    pin::Pin,
     sync::{Arc, Weak},
-    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -17,25 +15,24 @@ use crate::{
     discord::json_structs::{Channel, Guild, Message},
     types::{ID, Identifier},
 };
-use crate::{VC, discord::websocket::DiscordSocket};
+use crate::{VC, discord::websocket::DiscordSockets};
 
 pub mod json_structs;
+pub mod main_socket;
 pub mod rest_api;
+pub mod vc_socket;
 pub mod websocket;
 
-type HeartBeatFuture = Pin<Box<dyn Future<Output = Option<()>> + Send>>;
 pub struct Discord {
     // Metadata
     token: String, // TODO: Make it secure
     intents: u32,
     // Owned data
-    socket: Mutex<Option<DiscordSocket>>,
-    heart_beat_future: Arc<Mutex<Option<HeartBeatFuture>>>,
-    heart_beat_interval: RwLockAwait<Option<Duration>>,
+    socket: Mutex<Option<DiscordSockets>>,
     // Cache
     profile: RwLockAwait<Option<json_structs::Profile>>,
     guild_data: RwLockAwait<HashMap<ID, Guild>>,
-    channel_data: RwLockAwait<HashMap<ID, Channel>>,
+    channels_map: RwLockAwait<HashMap<ID, Channel>>,
     msg_data: RwLockAwait<HashMap<ID, Message>>,
 }
 
@@ -45,11 +42,9 @@ impl Discord {
             token: token.into(),
             intents: 161789, // 32767,
             socket: None.into(),
-            heart_beat_interval: RwLockAwait::new(None),
-            heart_beat_future: Mutex::new(None).into(),
             profile: RwLockAwait::new(None),
             guild_data: RwLockAwait::new(HashMap::new()),
-            channel_data: RwLockAwait::new(HashMap::new()),
+            channels_map: RwLockAwait::new(HashMap::new()),
             msg_data: RwLockAwait::new(HashMap::new()),
         }
     }
@@ -107,7 +102,7 @@ impl Messanger for Discord {
 
             println!("Response HTTP code: {}", response.status());
 
-            *socket = Some(DiscordSocket::new(stream));
+            *socket = Some(DiscordSockets::new(stream));
         };
         Some(Arc::<Discord>::downgrade(&self) as Weak<dyn Socket + Send + Sync>)
     }
