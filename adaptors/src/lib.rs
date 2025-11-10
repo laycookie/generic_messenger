@@ -53,7 +53,7 @@ pub trait ParameterizedMessangerQuery {
         &self,
         location: &Identifier<Server>,
     ) -> Vec<Identifier<Chan>>;
-    async fn get_messanges(
+    async fn get_messages(
         &self,
         msgs_location: &Identifier<Chan>,
         load_from_msg: Option<Identifier<Msg>>,
@@ -72,7 +72,7 @@ pub enum SocketEvent {
         channel: Identifier<()>,
         msg: Identifier<Msg>,
     },
-    Disconected,
+    Disconnected,
     Skip,
 }
 #[async_trait]
@@ -88,5 +88,5 @@ pub enum VCLocation<'a> {
 #[async_trait]
 pub trait VC {
     async fn connect<'a>(&'a self, location: &Identifier<Chan>);
-    async fn disconect<'a>(&'a self, location: &Identifier<Chan>);
+    async fn disconnect<'a>(&'a self, location: &Identifier<Chan>);
 }

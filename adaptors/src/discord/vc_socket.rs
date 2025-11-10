@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use crate::discord::{Discord, GateawayPayload, websocket::HeartBeatingData};
+use crate::discord::{Discord, GatewayPayload, websocket::HeartBeatingData};
 
 /// <https://discord.com/developers/docs/topics/opcodes-and-status-codes#voice>
 /// <https://docs.discord.food/topics/opcodes-and-status-codes#voice-opcodes>
@@ -29,13 +29,13 @@ pub(super) enum VCOpcode {
     ClientFlags = 18,
     ClientPlatform = 20,
 }
-impl GateawayPayload<VCOpcode> {
+impl GatewayPayload<VCOpcode> {
     pub(super) async fn exec(self, discord: &Discord) -> Result<(), ()> {
         let mut discord_socket = discord.socket.lock().await;
 
         if let Some(s) = self.s {
             println!("Updating VC seq: {s:?}");
-            discord_socket.vc_last_sequance_number = Some(s);
+            discord_socket.vc_last_sequence_number = Some(s);
         };
 
         println!("VCOpcode: {:?}", &self.op);
@@ -55,7 +55,7 @@ impl GateawayPayload<VCOpcode> {
 
                 // TODO: Not hard code it maybe?
                 if !modes.contains(&"aead_xchacha20_poly1305_rtpsize") {
-                    eprintln!("Encyption not supported");
+                    eprintln!("Encryption not supported");
                     return Err(());
                 };
 
@@ -108,7 +108,7 @@ impl GateawayPayload<VCOpcode> {
                             "address": std::str::from_utf8(&ip_discovery.address_ascii).unwrap(),
                             "port": ip_discovery.port.to_be(), // Converts it to little endian,
                                                                // because I'm too lazy to not use
-                                                               // transumate above
+                                                               // transmute above
                             // TODO: We are hard coding it just for rn
                             "mode": "aead_xchacha20_poly1305_rtpsize",
                         },

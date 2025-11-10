@@ -29,7 +29,7 @@ pub struct Chan {
     pub chan_type: ChanType,
     pub name: String,
     pub icon: Option<PathBuf>,
-    pub particepents: Vec<Identifier<Usr>>,
+    pub participants: Vec<Identifier<Usr>>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +42,7 @@ pub struct Server {
 pub enum CallStatus {
     Connected,
     Connecting,
-    Disconected,
+    Disconnected,
 }
 
 pub(crate) type ID = u32;

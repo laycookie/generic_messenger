@@ -74,7 +74,7 @@ pub enum Action {
         interface: MessangerInterface,
         channel: Identifier<Chan>,
     },
-    DisconectFromCall(Call),
+    DisconnectFromCall(Call),
 }
 
 impl Messenger {
@@ -156,10 +156,10 @@ impl Messenger {
                 }
             },
             Message::Sidebar(action) => match action {
-                SidebarAction::Disconect(call) => {
+                SidebarAction::Disconnect(call) => {
                     println!("{call:#?}");
 
-                    Action::DisconectFromCall(call)
+                    Action::DisconnectFromCall(call)
                 }
                 // TODO: Only calls server check if can be simplified
                 SidebarAction::Call(channel) => {
@@ -200,7 +200,7 @@ impl Messenger {
                         Task::future(async move {
                             let msgs = {
                                 let pq = interface.param_query().unwrap();
-                                pq.get_messanges(&conversation, None).await.unwrap()
+                                pq.get_messages(&conversation, None).await.unwrap()
                             };
 
                             (interface, conversation, msgs)

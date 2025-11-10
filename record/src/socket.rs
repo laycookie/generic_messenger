@@ -8,7 +8,7 @@ use futures::{
 
 use crate::messanger_unifier::MessangerHandle;
 
-pub enum ReciverEvent {
+pub enum ReceiverEvent {
     Connection((MessangerHandle, Option<Weak<dyn Socket + Send + Sync>>)),
 }
 
@@ -37,12 +37,12 @@ impl ActiveStream {
 }
 
 pub struct SocketsInterface {
-    receiver: Receiver<ReciverEvent>,
+    receiver: Receiver<ReceiverEvent>,
     active_streams: Vec<ActiveStream>,
 }
 impl SocketsInterface {
-    pub fn new() -> (Self, Sender<ReciverEvent>) {
-        let (sender, receiver) = mpsc::channel::<ReciverEvent>(128);
+    pub fn new() -> (Self, Sender<ReceiverEvent>) {
+        let (sender, receiver) = mpsc::channel::<ReceiverEvent>(128);
         (
             SocketsInterface {
                 receiver,
@@ -63,7 +63,7 @@ impl Stream for SocketsInterface {
         // Check if we got anything new from the outside
         if let Poll::Ready(event) = self.receiver.select_next_some().poll_unpin(cx) {
             match event {
-                ReciverEvent::Connection((handle, socket)) => {
+                ReceiverEvent::Connection((handle, socket)) => {
                     if let Some(socket) = socket {
                         self.active_streams.push(ActiveStream::new(handle, socket));
                         println!("Pushed as active");

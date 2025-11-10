@@ -90,7 +90,7 @@ impl MessangerQuery for Discord {
                                     None => "Fix later".to_string(),
                         }),
                         icon: None,
-                        particepents: Vec::new(),
+                        participants: Vec::new(),
                         chan_type: ChanType::TextAndVoice,
                     });
 
@@ -248,7 +248,7 @@ impl ParameterizedMessangerQuery for Discord {
                     Chan {
                         name: channel.name.clone().unwrap(),
                         icon: None,
-                        particepents: Vec::new(),
+                        participants: Vec::new(),
                         chan_type: match channel.channel_type {
                             json_structs::ChannelTypes::GuildCategory => ChanType::Spacer,
                             json_structs::ChannelTypes::GuildText => ChanType::Text,
@@ -272,7 +272,7 @@ impl ParameterizedMessangerQuery for Discord {
     }
     // Docs: https://discord.com/developers/docs/resources/channel#get-channel
     // https://discord.com/developers/docs/resources/message#get-channel-message
-    async fn get_messanges(
+    async fn get_messages(
         &self,
         msgs_location: &Identifier<Chan>,
         load_from_msg: Option<Identifier<Msg>>,

@@ -11,7 +11,7 @@ use serde_repr::Deserialize_repr;
 use crate::{
     SocketEvent,
     discord::{
-        Discord, DiscordSockets, GateawayPayload,
+        Discord, DiscordSockets, GatewayPayload,
         vc_socket::VCOpcode,
         websocket::{AllData, HeartBeatingData, VCLoc, VCLocation},
     },
@@ -30,7 +30,7 @@ pub(crate) enum Opcode {
     Hello = 10,
     HeartbeatAck = 11,
 }
-impl GateawayPayload<Opcode> {
+impl GatewayPayload<Opcode> {
     pub(super) async fn exec(
         self,
         discord: &Discord,
@@ -39,7 +39,7 @@ impl GateawayPayload<Opcode> {
 
         if let Some(s) = self.s {
             println!("Updating seq: {s}");
-            socket.last_sequance_number = Some(s);
+            socket.last_sequence_number = Some(s);
         }
 
         match self.op {
@@ -54,7 +54,7 @@ impl GateawayPayload<Opcode> {
                 ));
 
                 socket
-                    .gateaway_websocket
+                    .gateway_websocket
                     .as_mut()
                     .unwrap()
                     .send(Message::Text(
@@ -78,7 +78,7 @@ impl GateawayPayload<Opcode> {
             }
             Opcode::Dispatch => {
                 let event_name = self.t.as_ref().unwrap();
-                println!("Disatch event: {event_name:?}");
+                println!("Dispatch event: {event_name:?}");
                 // https://discord.com/developers/docs/events/gateway-events#receive-events
                 match event_name.as_str() {
                     "READY" => {
@@ -110,7 +110,7 @@ impl GateawayPayload<Opcode> {
                             let profile = discord.profile.read().await;
                             let profile = profile.as_ref();
                             let user_id = profile.unwrap().id.as_str();
-                            Discord::connect_vc_gateaway(user_id, vc_websocket, vc_location).await;
+                            Discord::connect_vc_gateway(user_id, vc_websocket, vc_location).await;
                         }
                     }
                     "VOICE_SERVER_UPDATE" => {
@@ -137,7 +137,7 @@ impl GateawayPayload<Opcode> {
                             let profile = profile.as_ref();
                             let user_id = profile.unwrap().id.as_str();
 
-                            Discord::connect_vc_gateaway(user_id, vc_websocket, vc_location).await;
+                            Discord::connect_vc_gateway(user_id, vc_websocket, vc_location).await;
                         }
                     }
                     "MESSAGE_CREATE" => {
@@ -194,7 +194,7 @@ impl GateawayPayload<Opcode> {
                     "CALL_UPDATE" => {
                         println!("{:#?}", self);
                     }
-                    _ => eprintln!("Unkown event_name recived: {event_name:?}",),
+                    _ => eprintln!("Unknown event_name received: {event_name:?}",),
                 }
             }
             Opcode::HeartbeatAck => {
@@ -210,9 +210,9 @@ impl GateawayPayload<Opcode> {
 }
 
 impl Discord {
-    async fn connect_vc_gateaway(
+    async fn connect_vc_gateway(
         user_id: &str,
-        vc_gateaway: &mut Option<WebSocketStream<ConnectStream>>,
+        vc_gateway: &mut Option<WebSocketStream<ConnectStream>>,
         vc_location: &VCLocation<AllData>,
     ) {
         let (mut stream, _) = connect_async("wss://".to_string() + vc_location.get_endpoint())
@@ -237,6 +237,6 @@ impl Discord {
             .await
             .unwrap();
 
-        *vc_gateaway = Some(stream);
+        *vc_gateway = Some(stream);
     }
 }
