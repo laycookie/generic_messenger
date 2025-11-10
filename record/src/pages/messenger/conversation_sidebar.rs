@@ -1,21 +1,25 @@
 use adaptors::types::{Chan, ChanType, Identifier};
 use iced::{
     Color, Element, Length, Padding,
-    widget::{Button, Column, Scrollable, Text, button, column, container, image, row},
+    widget::{Button, Column, Row, Scrollable, Text, button, column, container, image, row},
 };
 
 use super::PLACEHOLDER_PFP;
-use crate::{messanger_unifier::Messangers, pages::messenger::server::Server};
+use crate::{
+    messanger_unifier::{Call, Messangers},
+    pages::messenger::{self, server::Server},
+};
 
 #[derive(Debug)]
 pub struct Sidebar {
-    pub server: Option<Server>,
+    pub server_selected: Option<Server>,
     pub width: f32,
 }
 
 #[derive(Debug, Clone)]
 pub enum Action {
     Call(Identifier<Chan>),
+    Disconect(Call),
     OpenContacts,
     OpenChat {
         handle: crate::messanger_unifier::MessangerHandle,
@@ -26,13 +30,13 @@ pub enum Action {
 impl Sidebar {
     pub fn new(width: f32) -> Self {
         Self {
-            server: None,
+            server_selected: None,
             width,
         }
     }
 
-    pub fn get_bar<'a>(&'a self, messengers: &'a Messangers) -> Element<'a, Action> {
-        let elements = match &self.server {
+    pub fn view<'a>(&'a self, messengers: &'a Messangers) -> Element<'a, Action> {
+        let elements = match &self.server_selected {
             Some(server) => Column::from_iter(server.channels.iter().map(|chan| {
                 match chan.chan_type {
                     ChanType::Spacer => Text::new(chan.name.as_str()).into(),
@@ -59,7 +63,7 @@ impl Sidebar {
                 messengers
                     .data_iter()
                     .zip(messengers.interface_iter())
-                    .flat_map(|(data, (m_handle, _))| {
+                    .flat_map(|(data, interface)| {
                         data.conversations.iter().map(|conversation| {
                             Button::new({
                                 let image = match &conversation.icon {
@@ -74,7 +78,7 @@ impl Sidebar {
                             })
                             .width(Length::Fill)
                             .on_press(Action::OpenChat {
-                                handle: *m_handle,
+                                handle: interface.handle,
                                 conversation: conversation.to_owned(),
                             })
                             .into()
@@ -83,10 +87,32 @@ impl Sidebar {
             ),
         };
 
-        Scrollable::new(column![
-            Button::new("Contacts").on_press(Action::OpenContacts),
-            elements
-        ])
+        let mut active_calls = messengers.data_iter().flat_map(|m| &m.calls).peekable();
+
+        let panel = if active_calls.peek().is_some() {
+            let active_calls = Column::from_iter(active_calls.map(|call| {
+                Element::from(row![
+                    Text::from(call.status_str()),
+                    Button::new("D").on_press(Action::Disconect(call.clone()))
+                ])
+            }));
+            Some(column![
+                active_calls,
+                Button::new("Mute"),
+                Button::new("Deafen"),
+            ])
+        } else {
+            None
+        };
+
+        column![
+            Scrollable::new(column![
+                Button::new("Contacts").on_press(Action::OpenContacts),
+                elements,
+            ])
+            .height(Length::Fill),
+        ]
+        .push_maybe(panel)
         .width(self.width)
         .into()
     }

@@ -1,39 +1,40 @@
 use std::borrow::Borrow;
-use std::sync::Arc;
 
-use adaptors::{
-    Messanger as Auth,
-    types::{Chan, Identifier},
-};
+use adaptors::types::{Chan, Identifier};
 use iced::{
-    Element, Length, Padding, Task, advanced,
+    Element, Length, Padding, Task,
     widget::{
         Button, Column, Scrollable, Text, TextInput, column, container, image, row,
         text::LineHeight,
     },
 };
 
-use crate::messanger_unifier::{MessangerHandle, Messangers};
+use crate::messanger_unifier::{MessangerInterface, Messangers};
 
 #[derive(Debug, Clone)]
 pub struct Chat {
-    interface: (MessangerHandle, Arc<dyn Auth>),
+    interface: MessangerInterface,
     channel_data: Identifier<Chan>,
     msg_box: String,
 }
 
 #[derive(Debug, Clone)]
+pub enum Action {
+    Call {
+        interface: MessangerInterface,
+        channel: Identifier<Chan>,
+    },
+    Message(Message),
+}
+
+#[derive(Debug, Clone)]
 pub enum Message {
-    Call,
     MsgInput(String),
     MsgSend,
 }
 
 impl Chat {
-    pub fn new(
-        interface: (MessangerHandle, Arc<dyn Auth>),
-        channel_data: Identifier<Chan>,
-    ) -> Self {
+    pub fn new(interface: MessangerInterface, channel_data: Identifier<Chan>) -> Self {
         Self {
             interface,
             channel_data,
@@ -41,32 +42,17 @@ impl Chat {
         }
     }
 
-    pub fn get_element<'a, Theme, Renderer>(
-        &self,
-        messengers: &'a Messangers,
-    ) -> Element<'a, Message, Theme, Renderer>
-    where
-        Message: Clone,
-        Renderer: iced::advanced::Renderer
-            + iced::advanced::text::Renderer
-            + iced::advanced::image::Renderer
-            + 'a,
-        <Renderer as advanced::image::Renderer>::Handle:
-            for<'c> From<&'c std::path::PathBuf> + From<&'static str>,
-        Theme: iced::widget::text::Catalog
-            + iced::widget::button::Catalog
-            + iced::widget::scrollable::Catalog
-            + iced::widget::text_input::Catalog
-            + iced::widget::container::Catalog
-            + 'a,
-    {
+    pub fn get_element<'a>(&self, messengers: &'a Messangers) -> Element<'a, Action> {
         let channel_info = row![
             Text::new(self.channel_data.name.clone()),
-            Button::new("CALL").on_press(Message::Call)
+            Button::new("CALL").on_press(Action::Call {
+                interface: self.interface.clone(),
+                channel: self.channel_data.clone()
+            })
         ];
 
         let messages = messengers
-            .data_from_handle(self.interface.0)
+            .data_from_handle(self.interface.handle)
             .unwrap()
             .chats
             .get(self.channel_data.borrow());
@@ -98,8 +84,8 @@ impl Chat {
         .height(Length::Fill);
 
         let message_box = TextInput::new("New msg...", &self.msg_box)
-            .on_input(Message::MsgInput)
-            .on_submit(Message::MsgSend)
+            .on_input(|s| Action::Message(Message::MsgInput(s)))
+            .on_submit(Action::Message(Message::MsgSend))
             .line_height(LineHeight::Absolute(20.into()));
 
         column![channel_info, chat, message_box].into()
@@ -107,22 +93,12 @@ impl Chat {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Call => {
-                let auth = self.interface.1.clone();
-                let meta_data = self.channel_data.clone();
-
-                Task::future(async move {
-                    let vc = auth.vc().await;
-                    vc.unwrap().connect(&meta_data).await;
-                })
-                .then(|_| Task::none())
-            }
             Message::MsgInput(change) => {
                 self.msg_box = change;
                 Task::none()
             }
             Message::MsgSend => {
-                let auth = self.interface.1.clone();
+                let auth = self.interface.api.to_owned();
                 let meta_data = self.channel_data.clone();
                 let contents = self.msg_box.clone();
 

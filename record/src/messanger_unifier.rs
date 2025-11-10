@@ -1,47 +1,97 @@
-use std::{collections::HashMap, sync::Arc};
+//! Contains all data needed to interface with the messenger
+
+use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use adaptors::{
     Messanger,
-    types::{Chan, Identifier, Msg, Server, Usr},
+    types::{CallStatus, Chan, Identifier, Msg, Server, Usr},
 };
-// ==
-// TODO: MAKE READ ONLY USING GETTERS
+
+#[derive(Debug, Clone)]
+pub(crate) struct Call {
+    messanger_handle: MessangerHandle,
+    source: Identifier<Chan>,
+    status: CallStatus,
+}
+impl Call {
+    pub(crate) fn new(messanger_handle: MessangerHandle, source: Identifier<Chan>) -> Self {
+        Self {
+            messanger_handle,
+            source,
+            status: CallStatus::Connecting,
+        }
+    }
+    pub(crate) fn handle(&self) -> MessangerHandle {
+        self.messanger_handle
+    }
+    pub(crate) fn source(&self) -> &Identifier<Chan> {
+        &self.source
+    }
+    pub(crate) fn status_str(&self) -> &str {
+        match self.status {
+            CallStatus::Connected => "Connected",
+            CallStatus::Connecting => "Connecting",
+            CallStatus::Disconected => "Disconnected",
+        }
+    }
+}
 #[derive(Debug)]
 pub struct MessangerData {
-    messenger_id: usize,
+    handle: MessangerHandle,
 
     pub(crate) profile: Option<Identifier<Usr>>,
     pub(crate) contacts: Vec<Identifier<Usr>>,
     pub(crate) conversations: Vec<Identifier<Chan>>,
     pub(crate) guilds: Vec<Identifier<Server>>,
-
     pub(crate) chats: HashMap<Identifier<()>, Vec<Identifier<Msg>>>,
+    pub(crate) calls: Vec<Call>,
 }
 
 impl MessangerData {
-    pub fn new(id: usize) -> Self {
+    pub fn new(handle: MessangerHandle) -> Self {
         Self {
-            messenger_id: id,
+            handle,
             profile: None,
             contacts: Vec::new(),
             conversations: Vec::new(),
             guilds: Vec::new(),
             chats: HashMap::new(),
+            calls: Vec::new(),
         }
+    }
+    pub(crate) fn handle(&self) -> MessangerHandle {
+        self.handle
     }
 }
 // ===
-
 #[derive(Debug, Clone, Copy)]
 pub struct MessangerHandle {
     id: usize,
     index: usize,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MessangerInterface {
+    pub(crate) handle: MessangerHandle,
+    pub(crate) api: Arc<dyn Messanger>,
+}
+impl MessangerInterface {
+    fn handle(&self) -> MessangerHandle {
+        self.handle
+    }
+}
+impl Deref for MessangerInterface {
+    type Target = Arc<dyn Messanger>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.api
+    }
+}
+
 #[derive(Default)]
 pub struct Messangers {
     id_counter: usize,
-    interface: Vec<(MessangerHandle, Arc<dyn Messanger>)>,
+    interface: Vec<MessangerInterface>,
     data: Vec<MessangerData>,
 }
 
@@ -49,9 +99,7 @@ impl Messangers {
     pub fn len(&self) -> usize {
         self.interface.len()
     }
-    pub fn interface_iter(
-        &self,
-    ) -> std::slice::Iter<'_, (MessangerHandle, Arc<dyn Messanger + 'static>)> {
+    pub fn interface_iter(&self) -> std::slice::Iter<'_, MessangerInterface> {
         self.interface.iter()
     }
     pub fn data_iter(&self) -> std::slice::Iter<'_, MessangerData> {
@@ -60,9 +108,9 @@ impl Messangers {
     pub fn interface_from_handle(
         &self,
         messanger_handle: MessangerHandle,
-    ) -> Option<&(MessangerHandle, Arc<dyn Messanger>)> {
+    ) -> Option<&MessangerInterface> {
         if self.interface.len() > messanger_handle.index
-            && messanger_handle.id == self.interface[messanger_handle.index].0.id
+            && messanger_handle.id == self.interface[messanger_handle.index].handle.id
         {
             return Some(&self.interface[messanger_handle.index]);
         }
@@ -70,11 +118,11 @@ impl Messangers {
         eprintln!("Cache hit occured");
         self.interface
             .iter()
-            .find(|a| a.0.id == messanger_handle.id)
+            .find(|a| a.handle.id == messanger_handle.id)
     }
     pub fn data_from_handle(&self, messanger_handle: MessangerHandle) -> Option<&MessangerData> {
         if self.data.len() > messanger_handle.index
-            && messanger_handle.id == self.data[messanger_handle.index].messenger_id
+            && messanger_handle.id == self.data[messanger_handle.index].handle.id
         {
             return Some(&self.data[messanger_handle.index]);
         }
@@ -82,14 +130,14 @@ impl Messangers {
         eprintln!("Cache hit occured");
         self.data
             .iter()
-            .find(|a| a.messenger_id == messanger_handle.id)
+            .find(|data| data.handle.id == messanger_handle.id)
     }
     pub fn mut_data_from_handle(
         &mut self,
         messanger_handle: MessangerHandle,
     ) -> Option<&mut MessangerData> {
         if self.data.len() > messanger_handle.index
-            && messanger_handle.id == self.data[messanger_handle.index].messenger_id
+            && messanger_handle.id == self.data[messanger_handle.index].handle.id
         {
             return Some(&mut self.data[messanger_handle.index]);
         }
@@ -97,16 +145,16 @@ impl Messangers {
         eprintln!("Cache hit occured");
         self.data
             .iter_mut()
-            .find(|a| a.messenger_id == messanger_handle.id)
+            .find(|data| data.handle.id == messanger_handle.id)
     }
-    pub fn add_messanger(&mut self, messanger: Arc<dyn Messanger>) -> MessangerHandle {
+    pub fn add_messanger(&mut self, api: Arc<dyn Messanger>) -> MessangerHandle {
         let handle = MessangerHandle {
             id: self.id_counter,
             index: self.interface.len(),
         };
 
-        self.data.push(MessangerData::new(self.id_counter));
-        self.interface.push((handle, messanger));
+        self.data.push(MessangerData::new(handle));
+        self.interface.push(MessangerInterface { handle, api });
 
         self.id_counter += 1;
 
@@ -115,11 +163,11 @@ impl Messangers {
     pub fn remove_by_handle(&mut self, handle_to_remove: MessangerHandle) {
         self.interface.remove(handle_to_remove.index);
         // Updates all cached indexes that are now wrong.
-        for (i, (handle, _)) in self.interface[handle_to_remove.index..]
+        for (i, interface) in self.interface[handle_to_remove.index..]
             .iter_mut()
             .enumerate()
         {
-            handle.index = handle_to_remove.index + i;
+            interface.handle.index = handle_to_remove.index + i;
         }
         self.data.remove(handle_to_remove.index);
     }

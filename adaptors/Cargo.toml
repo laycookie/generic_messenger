@@ -11,7 +11,8 @@ serde_repr = "0.1.19"
 futures = "0.3.31"
 futures-locks = "0.7.1"
 futures-timer = "3.0.3"
-async-tungstenite =  { version = "0.29.1", features = ["async-std-runtime", "async-tls"] }
-async-std = "1.13.2"
+async-tungstenite =  { version = "0.32.0", features = ["async-std-runtime", "async-tls"] }
+# async-std = "1.13.2"
+smol = "2.0.2"
 async-trait = "0.1.83"
 macro = { path = "../macro" }

@@ -5,7 +5,7 @@ use crate::messanger_unifier::MessangerHandle;
 #[derive(Debug, Clone)]
 pub struct Server {
     pub handle: MessangerHandle,
-    pub channels: Vec<Identifier<Chan>>, // TODO: Move this in to cache
+    pub channels: Vec<Identifier<Chan>>, // TODO: Move this into cache
 }
 
 impl Server {

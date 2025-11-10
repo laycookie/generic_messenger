@@ -1,9 +1,9 @@
 use std::{borrow::Borrow, fmt::Debug};
 
 use crate::{
-    messanger_unifier::{MessangerHandle, Messangers},
+    messanger_unifier::{Call, MessangerHandle, MessangerInterface, Messangers},
     pages::messenger::{
-        chat::{Chat, Message as ChatMessage},
+        chat::{Action as ChatAction, Chat},
         contacts::{Contacts, Message as ContactsMessage},
         conversation_sidebar::{Action as SidebarAction, Sidebar},
         navbar::{Action as NavbarAction, Navbar},
@@ -11,7 +11,7 @@ use crate::{
     },
 };
 
-use adaptors::types::{Identifier, Msg};
+use adaptors::types::{Chan, Identifier, Msg};
 use iced::{
     Task,
     widget::{Responsive, Text, column, row},
@@ -28,13 +28,13 @@ pub(super) const PLACEHOLDER_PFP: &str = "./public/imgs/placeholder.jpg";
 
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
-    Chat(ChatMessage),
+    Chat(ChatAction),
     Contacts(ContactsMessage),
     Navbar(NavbarAction),
     Sidebar(SidebarAction),
     // ===
     ChangeMain(Main),
-    SetSidebarServer(Option<Server>),
+    SetSidebarServer(Option<Server>), // TODO: Make it just a SetSidebar
     DividerChange(f32),
     UpdateChat {
         handle: MessangerHandle,
@@ -70,13 +70,18 @@ pub enum Action {
         kv: (Identifier<()>, Vec<Identifier<Msg>>),
     },
     Run(Task<Message>),
+    Call {
+        interface: MessangerInterface,
+        channel: Identifier<Chan>,
+    },
+    DisconectFromCall(Call),
 }
 
 impl Messenger {
     pub(crate) fn update(&mut self, message: Message, messengers: &Messangers) -> Action {
         match message {
             Message::SetSidebarServer(server) => {
-                self.sidebar.server = server;
+                self.sidebar.server_selected = server;
                 Action::None
             }
             Message::ChangeMain(screen) => {
@@ -93,7 +98,23 @@ impl Messenger {
             Message::UpdateChat { handle, kv } => Action::UpdateChat { handle, kv },
             Message::Chat(msg) => {
                 if let Main::Chat(chat) = &mut self.main {
-                    return Action::Run(chat.update(msg).map(Message::Chat));
+                    return match msg {
+                        ChatAction::Call { interface, channel } => {
+                            let Some(interface) =
+                                messengers.interface_from_handle(interface.handle)
+                            else {
+                                return Action::None;
+                            };
+                            Action::Call {
+                                interface: interface.clone(),
+                                channel,
+                            }
+                        }
+                        ChatAction::Message(message) => Action::Run(
+                            chat.update(message)
+                                .map(|message| Message::Chat(ChatAction::Message(message))),
+                        ),
+                    };
                 };
                 Action::None
             }
@@ -105,6 +126,7 @@ impl Messenger {
             }
 
             Message::Navbar(action) => match action {
+                NavbarAction::GetDMs => Action::Run(Task::done(Message::SetSidebarServer(None))),
                 NavbarAction::GetGuild { handle, server } => {
                     let Some(interface) = messengers.interface_from_handle(handle) else {
                         return Action::None;
@@ -115,7 +137,7 @@ impl Messenger {
                     Action::Run(
                         Task::future(async move {
                             let server_channels = {
-                                let pq = interface.1.param_query().unwrap();
+                                let pq = interface.param_query().unwrap();
                                 pq.get_server_conversations(&server).await
                             };
 
@@ -126,7 +148,7 @@ impl Messenger {
                             println!("loading");
 
                             Task::done(Message::SetSidebarServer(Some(Server::new(
-                                interface.0,
+                                interface.handle,
                                 server_channels,
                             ))))
                         }),
@@ -134,20 +156,22 @@ impl Messenger {
                 }
             },
             Message::Sidebar(action) => match action {
+                SidebarAction::Disconect(call) => {
+                    println!("{call:#?}");
+
+                    Action::DisconectFromCall(call)
+                }
+                // TODO: Only calls server check if can be simplified
                 SidebarAction::Call(channel) => {
-                    let server = self.sidebar.server.as_ref().unwrap();
+                    let server = self.sidebar.server_selected.as_ref().unwrap();
                     let Some(interface) = messengers.interface_from_handle(server.handle) else {
                         return Action::None;
                     };
-                    let auth = interface.to_owned().1;
 
-                    Action::Run(
-                        Task::future(async move {
-                            let vc = auth.vc().await;
-                            vc.unwrap().connect(&channel).await;
-                        })
-                        .then(|_| Task::none()),
-                    )
+                    Action::Call {
+                        interface: interface.to_owned(),
+                        channel,
+                    }
                 }
                 SidebarAction::OpenContacts => {
                     self.main = Main::Contacts(Contacts::default());
@@ -175,7 +199,7 @@ impl Messenger {
                     Action::Run(
                         Task::future(async move {
                             let msgs = {
-                                let pq = interface.1.param_query().unwrap();
+                                let pq = interface.param_query().unwrap();
                                 pq.get_messanges(&conversation, None).await.unwrap()
                             };
 
@@ -184,7 +208,7 @@ impl Messenger {
                         .then(|(interface, conversation, msgs)| {
                             let channel_id: &Identifier<()> = conversation.borrow();
                             Task::done(Message::UpdateChat {
-                                handle: interface.0,
+                                handle: interface.handle,
                                 kv: (channel_id.to_owned(), msgs),
                             })
                             .chain(Task::done(Message::ChangeMain(
@@ -199,8 +223,8 @@ impl Messenger {
 
     pub(crate) fn view<'a>(&'a self, messengers: &'a Messangers) -> iced::Element<'a, Message> {
         let profiles = row![Text::from(match messengers.data_iter().next() {
-            Some(messanger_data) => {
-                match &messanger_data.profile {
+            Some(data) => {
+                match &data.profile {
                     Some(p) => p.name.as_str(),
                     None => "No connection made?",
                 }
@@ -211,7 +235,7 @@ impl Messenger {
         let navbar = Navbar::get_element(messengers).map(Message::Navbar);
 
         let window = Responsive::new(move |size| {
-            let sidebar = self.sidebar.get_bar(messengers).map(Message::Sidebar);
+            let sidebar = self.sidebar.view(messengers).map(Message::Sidebar);
 
             let main = match &self.main {
                 Main::Contacts(contacts) => contacts.get_element(messengers).map(Message::Contacts),
@@ -227,4 +251,13 @@ impl Messenger {
 
         column![profiles, row![navbar, window]].into()
     }
+}
+
+fn call(interface: &MessangerInterface, channel: Identifier<Chan>) -> Task<Message> {
+    let api = interface.api.to_owned();
+    Task::future(async move {
+        let vc = api.vc().await;
+        vc.unwrap().connect(&channel).await;
+    })
+    .then(|_| Task::none())
 }

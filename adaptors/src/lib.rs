@@ -37,11 +37,12 @@ impl PartialEq for dyn Messanger {
 /// Allows us to get data, without knowing anything about it.
 #[async_trait]
 pub trait MessangerQuery {
-    async fn get_profile(&self) -> Result<Identifier<Usr>, Box<dyn Error + Sync + Send>>; // Fetch client profile
-    async fn get_contacts(&self) -> Result<Vec<Identifier<Usr>>, Box<dyn Error + Sync + Send>>; // Users from friend list etc
-    async fn get_conversation(&self)
-    -> Result<Vec<Identifier<Chan>>, Box<dyn Error + Sync + Send>>; // List of DMs
-    async fn get_guilds(&self) -> Result<Vec<Identifier<Server>>, Box<dyn Error + Sync + Send>>; // Multi-channel groups.
+    async fn fetch_profile(&self) -> Result<Identifier<Usr>, Box<dyn Error + Sync + Send>>; // Fetch client profile
+    async fn fetch_contacts(&self) -> Result<Vec<Identifier<Usr>>, Box<dyn Error + Sync + Send>>; // Users from friend list etc
+    async fn fetch_conversation(
+        &self,
+    ) -> Result<Vec<Identifier<Chan>>, Box<dyn Error + Sync + Send>>; // List of DMs
+    async fn fetch_guilds(&self) -> Result<Vec<Identifier<Server>>, Box<dyn Error + Sync + Send>>; // Multi-channel groups.
 }
 
 /// Used to get data that we know something about. E.g. Getting messages from
@@ -87,4 +88,5 @@ pub enum VCLocation<'a> {
 #[async_trait]
 pub trait VC {
     async fn connect<'a>(&'a self, location: &Identifier<Chan>);
+    async fn disconect<'a>(&'a self, location: &Identifier<Chan>);
 }

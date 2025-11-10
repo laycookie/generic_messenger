@@ -1,4 +1,4 @@
-use crate::pages::login::Message as LoginMessage;
+use crate::{messanger_unifier::Call, pages::login::Message as LoginMessage};
 use adaptors::SocketEvent;
 use auth::MessangersGenerator;
 use futures::{Stream, StreamExt, channel::mpsc::Sender, future::join_all, try_join};
@@ -97,6 +97,7 @@ impl App {
                     .mut_data_from_handle(messanger_handle)
                     .unwrap();
                 match new_data {
+                    pages::MessangerData::Call(call_status) => d.calls.push(call_status),
                     pages::MessangerData::Everything {
                         profile,
                         contacts,
@@ -115,19 +116,20 @@ impl App {
                 Task::none()
             }
             MyAppMessage::StartUp => {
-                Task::future(join_all(self.messangers.interface_iter().map(
-                    |interface| {
-                        let (handle, interface) = interface.clone();
-                        async move {
-                            let Some(q) = interface.query() else {
+                Task::future(join_all(
+                    self.messangers
+                        .interface_iter()
+                        .map(|interface| (interface.handle, interface.api.to_owned()))
+                        .map(|(handle, api)| async move {
+                            let Some(q) = api.query() else {
                                 return Ok(None);
                             };
 
                             let (profile, conversations, contacts, servers) = match try_join!(
-                                q.get_profile(),
-                                q.get_conversation(),
-                                q.get_contacts(),
-                                q.get_guilds()
+                                q.fetch_profile(),
+                                q.fetch_conversation(),
+                                q.fetch_contacts(),
+                                q.fetch_guilds()
                             ) {
                                 Ok(t) => t,
                                 Err(e) => {
@@ -136,9 +138,8 @@ impl App {
                             };
 
                             Ok(Some((handle, profile, contacts, conversations, servers)))
-                        }
-                    },
-                )))
+                        }),
+                ))
                 .then(|outputs| {
                     if !outputs.iter().any(|m| m.is_ok()) {
                         // In case we are running this from login screen. If
@@ -186,13 +187,13 @@ impl App {
                 SocketMesg::Connect(socket_connection) => {
                     self.socket_sender = Some(socket_connection.clone());
                     Task::batch(self.messangers.interface_iter().map(|interface| {
-                        let (handle, messanger) = interface.to_owned();
+                        let interface = interface.to_owned();
                         let mut socket_connection = socket_connection.clone();
                         Task::future(async move {
                             socket_connection
                                 .try_send(ReciverEvent::Connection((
-                                    handle,
-                                    messanger.socket().await,
+                                    interface.handle,
+                                    interface.api.socket().await,
                                 )))
                                 .unwrap();
                         })
@@ -227,18 +228,15 @@ impl App {
                     pages::login::Action::None => Task::none(),
                     pages::login::Action::Login(messenger) => {
                         let handle = self.messangers.add_messanger(messenger);
-                        let (handle, messanger) = self
-                            .messangers
-                            .interface_from_handle(handle)
-                            .unwrap()
-                            .to_owned();
+                        let interface = self.messangers.interface_from_handle(handle).unwrap();
+                        let api = interface.api.clone();
                         let mut sender = self.socket_sender.clone().unwrap();
                         Task::perform(
                             async move {
                                 sender
                                     .try_send(ReciverEvent::Connection((
                                         handle,
-                                        messanger.socket().await,
+                                        api.socket().await,
                                     )))
                                     .unwrap();
                             },
@@ -259,12 +257,49 @@ impl App {
                             new_data: pages::MessangerData::Chat(kv),
                         })
                     }
+                    pages::messenger::Action::Call { interface, channel } => {
+                        let api = interface.api.to_owned();
+                        Task::future(async move {
+                            let vc = api.vc().await;
+                            vc.unwrap().connect(&channel).await;
+                            channel
+                        })
+                        .then(move |channel| {
+                            Task::done(MyAppMessage::SetMessangerData {
+                                messanger_handle: interface.handle,
+                                new_data: pages::MessangerData::Call(Call::new(
+                                    interface.handle,
+                                    channel,
+                                )),
+                            })
+                        })
+                    }
+                    pages::messenger::Action::DisconectFromCall(call) => {
+                        let interface = self
+                            .messangers
+                            .interface_from_handle(call.handle())
+                            .unwrap();
+
+                        let api = interface.api.to_owned();
+                        Task::future(async move {
+                            let vc = api.vc().await;
+                            vc.unwrap().disconect(call.source()).await;
+                        })
+                        .then(move |_| {
+                            println!("TODO: DISCONECT CALL");
+                            Task::none()
+                            // Task::done(MyAppMessage::SetMessangerData {
+                            //     messanger_handle: interface.handle,
+                            //     new_data: pages::MessangerData::Call(Call::new(channel)),
+                            // })
+                        })
+                    }
                     pages::messenger::Action::Run(task) => task.map(MyAppMessage::Chat),
                 }
             }
         }
     }
-    fn view(&self, _window: window::Id) -> Element<MyAppMessage> {
+    fn view<'a>(&'a self, _window: window::Id) -> Element<'a, MyAppMessage> {
         match &self.page {
             Screen::Login(login) => login.view().map(MyAppMessage::Login),
             Screen::Chat(chat) => chat.view(&self.messangers).map(MyAppMessage::Chat),

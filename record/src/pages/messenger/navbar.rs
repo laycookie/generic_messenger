@@ -1,7 +1,8 @@
+use std::iter;
+
 use adaptors::types::{Identifier, Server};
-use iced::advanced::{self, renderer};
-use iced::widget::scrollable::{self, Direction, Scrollbar};
-use iced::widget::{Button, Column, Scrollable, button, image};
+use iced::widget::scrollable::{Direction, Scrollbar};
+use iced::widget::{Button, Column, Scrollable, image};
 use iced::{ContentFit, Element, Length};
 
 use crate::messanger_unifier::{MessangerHandle, Messangers};
@@ -12,6 +13,7 @@ pub struct Navbar;
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    GetDMs,
     GetGuild {
         handle: MessangerHandle,
         server: Identifier<Server>,
@@ -19,20 +21,13 @@ pub enum Action {
 }
 
 impl Navbar {
-    pub fn get_element<'a, 'b, Theme, Renderer>(
-        messengers: &'a Messangers,
-    ) -> Element<'a, Action, Theme, Renderer>
-    where
-        Renderer: 'a + renderer::Renderer + advanced::image::Renderer,
-        <Renderer as advanced::image::Renderer>::Handle:
-            for<'c> From<&'c std::path::PathBuf> + From<&'static str>,
-        Action: 'a + Clone,
-        Theme: 'a + scrollable::Catalog + button::Catalog,
-    {
+    pub fn get_element<'a>(messengers: &'a Messangers) -> Element<'a, Action> {
+        let dm_switch = Element::from(Button::new("test").on_press(Action::GetDMs));
+
         let servers = messengers
             .data_iter()
             .zip(messengers.interface_iter())
-            .flat_map(|(data, (m_handle, _))| {
+            .flat_map(|(data, interface)| {
                 data.guilds.iter().map(|server| {
                     let image = match &server.icon {
                         Some(icon) => image(icon),
@@ -46,14 +41,14 @@ impl Navbar {
                                 .content_fit(ContentFit::Cover),
                         )
                         .on_press(Action::GetGuild {
-                            handle: *m_handle,
+                            handle: interface.handle,
                             server: server.to_owned(),
                         }),
                     )
                 })
             });
 
-        Scrollable::new(Column::with_children(servers))
+        Scrollable::new(Column::with_children(iter::once(dm_switch).chain(servers)))
             .direction(Direction::Vertical(
                 Scrollbar::default().width(0).scroller_width(0),
             ))

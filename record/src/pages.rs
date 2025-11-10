@@ -1,7 +1,12 @@
+//! Contains all UI related state data
+
 pub mod login;
 pub mod messenger;
 
-use crate::{SocketMesg, messanger_unifier::MessangerHandle};
+use crate::{
+    SocketMesg,
+    messanger_unifier::{Call, MessangerHandle},
+};
 use adaptors::types::{Chan, Identifier, Msg, Server, Usr};
 pub use login::Login;
 use login::Message as LoginMessage;
@@ -19,6 +24,7 @@ pub(crate) enum MessangerData {
         servers: Vec<Identifier<Server>>,
     },
     Chat((Identifier<()>, Vec<Identifier<Msg>>)),
+    Call(Call),
 }
 
 #[derive(Debug)]

@@ -22,7 +22,7 @@ impl Discord {
 
 #[async_trait]
 impl MessangerQuery for Discord {
-    async fn get_profile(&self) -> Result<Identifier<Usr>, Box<dyn Error + Sync + Send>> {
+    async fn fetch_profile(&self) -> Result<Identifier<Usr>, Box<dyn Error + Sync + Send>> {
         let profile = http_request::<Profile>(
             surf::get("https://discord.com/api/v9/users/@me"),
             self.get_auth_header(),
@@ -37,7 +37,7 @@ impl MessangerQuery for Discord {
 
         Ok(prof)
     }
-    async fn get_contacts(&self) -> Result<Vec<Identifier<Usr>>, Box<dyn Error + Sync + Send>> {
+    async fn fetch_contacts(&self) -> Result<Vec<Identifier<Usr>>, Box<dyn Error + Sync + Send>> {
         let friends = http_request::<Vec<Friend>>(
             surf::get("https://discord.com/api/v9/users/@me/relationships"),
             self.get_auth_header(),
@@ -69,7 +69,7 @@ impl MessangerQuery for Discord {
         let contacts = join_all(contacts).await;
         Ok(contacts)
     }
-    async fn get_conversation(
+    async fn fetch_conversation(
         &self,
     ) -> Result<Vec<Identifier<Chan>>, Box<dyn Error + Sync + Send>> {
         let channels = http_request::<Vec<Channel>>(
@@ -147,14 +147,20 @@ impl MessangerQuery for Discord {
             .collect::<Vec<_>>();
         let b = join_all(conversations).await;
 
-        let mut channel_data = self.channels_map.write().await;
+        let mut channel_data = self.channel_id_mappings.write().await;
         for (identifier, channel) in b.iter().zip(channels) {
-            channel_data.insert(identifier.neo_id, channel);
+            channel_data.insert(
+                identifier.neo_id,
+                super::ChannelID {
+                    guild_id: channel.guild_id,
+                    id: channel.id,
+                },
+            );
         }
 
         Ok(b)
     }
-    async fn get_guilds(&self) -> Result<Vec<Identifier<Server>>, Box<dyn Error + Sync + Send>> {
+    async fn fetch_guilds(&self) -> Result<Vec<Identifier<Server>>, Box<dyn Error + Sync + Send>> {
         let guilds = http_request::<Vec<Guild>>(
             surf::get("https://discord.com/api/v10/users/@me/guilds"),
             self.get_auth_header(),
@@ -194,9 +200,9 @@ impl MessangerQuery for Discord {
         });
         let b = join_all(g).await;
 
-        let mut channel_data = self.guild_data.write().await;
+        let mut channel_data = self.guild_id_mappings.write().await;
         for (identifier, guild) in b.iter().zip(guilds) {
-            channel_data.insert(identifier.neo_id, guild);
+            channel_data.insert(identifier.neo_id, guild.id);
         }
 
         Ok(b)
@@ -210,20 +216,20 @@ impl ParameterizedMessangerQuery for Discord {
         &self,
         location: &Identifier<Server>,
     ) -> Vec<Identifier<Chan>> {
-        let t = self.guild_data.read().await;
-        let guild = t.get(&location.neo_id).unwrap();
+        let t = self.guild_id_mappings.read().await;
+        let guild_id = t.get(&location.neo_id).unwrap();
 
         let channels = http_request::<Vec<Channel>>(
             surf::get(format!(
                 "https://discord.com/api/v10/guilds/{}/channels",
-                guild.id
+                guild_id
             )),
             self.get_auth_header(),
         )
         .await
         .unwrap();
 
-        let mut channel_data = self.channels_map.write().await;
+        let mut channel_data = self.channel_id_mappings.write().await;
         channels
             .into_iter()
             .filter_map(|channel| {
@@ -253,7 +259,13 @@ impl ParameterizedMessangerQuery for Discord {
                         },
                     },
                 );
-                channel_data.insert(identifier.neo_id, channel);
+                channel_data.insert(
+                    identifier.neo_id,
+                    crate::discord::ChannelID {
+                        guild_id: channel.guild_id,
+                        id: channel.id,
+                    },
+                );
                 Some(identifier)
             })
             .collect::<Vec<_>>()
@@ -265,14 +277,14 @@ impl ParameterizedMessangerQuery for Discord {
         msgs_location: &Identifier<Chan>,
         load_from_msg: Option<Identifier<Msg>>,
     ) -> Result<Vec<Identifier<Msg>>, Box<dyn Error + Sync + Send>> {
-        let t = self.channels_map.read().await;
-        let channel = t.get(&msgs_location.neo_id).unwrap();
+        let t = self.channel_id_mappings.read().await;
+        let channel_id = t.get(&msgs_location.neo_id).unwrap();
 
         let before = match load_from_msg {
             Some(msg) => {
                 let t2 = self.msg_data.read().await;
-                let msg = t2.get(&msg.neo_id).unwrap();
-                format!("?{}", msg.id)
+                let msg_id = t2.get(&msg.neo_id).unwrap();
+                format!("?{}", msg_id)
             }
             None => "".to_string(),
         };
@@ -280,7 +292,7 @@ impl ParameterizedMessangerQuery for Discord {
         let messages = http_request::<Vec<Message>>(
             surf::get(format!(
                 "https://discord.com/api/v10/channels/{}/messages{}",
-                channel.id, before,
+                channel_id.id, before,
             )),
             self.get_auth_header(),
         )
@@ -323,8 +335,8 @@ impl ParameterizedMessangerQuery for Discord {
         location: &Identifier<Chan>,
         contents: String,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let t = self.channels_map.read().await;
-        let channel = t.get(&location.neo_id).unwrap();
+        let t = self.channel_id_mappings.read().await;
+        let channel_ids = t.get(&location.neo_id).unwrap();
 
         let message = CreateMessage {
             content: Some(contents),
@@ -337,7 +349,7 @@ impl ParameterizedMessangerQuery for Discord {
         let _msgs = http_request::<Vec<Message>>(
             surf::post(format!(
                 "https://discord.com/api/v9/channels/{}/messages",
-                channel.id,
+                channel_ids.id,
             ))
             .body_json(&message)
             .unwrap(),

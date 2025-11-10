@@ -38,6 +38,13 @@ pub struct Server {
     pub icon: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub enum CallStatus {
+    Connected,
+    Connecting,
+    Disconected,
+}
+
 pub(crate) type ID = u32;
 #[derive(Debug, Clone)]
 #[repr(C)]

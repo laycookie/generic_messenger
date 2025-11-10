@@ -106,7 +106,7 @@ impl Login {
         Action::None
     }
 
-    pub(crate) fn view(&self) -> iced::Element<Message> {
+    pub(crate) fn view<'a>(&'a self) -> iced::Element<'a, Message> {
         let width = 360.0;
 
         let select_platform = ComboBox::new(

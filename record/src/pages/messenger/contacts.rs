@@ -16,15 +16,7 @@ pub enum Message {
 }
 
 impl Contacts {
-    pub fn get_element<'a, Theme, Renderer>(
-        &self,
-        messengers: &'a Messangers,
-    ) -> Element<'a, Message, Theme, Renderer>
-    where
-        Message: Clone,
-        Renderer: iced::advanced::Renderer + iced::advanced::text::Renderer + 'a,
-        Theme: iced::widget::text::Catalog + iced::widget::text_input::Catalog + 'a,
-    {
+    pub fn get_element<'a>(&self, messengers: &'a Messangers) -> Element<'a, Message> {
         let widget = Column::new();
         let widget =
             widget.push(TextInput::new("Search", &self.search_input).on_input(Message::MsgInput));

@@ -59,8 +59,7 @@ impl MessangersGenerator {
             //     return;
             // }
 
-            let auth = &messanger.1;
-            writeln!(file, "{}:{}", auth.name(), auth.auth()).unwrap();
+            writeln!(file, "{}:{}", messanger.name(), messanger.auth()).unwrap();
         });
     }
 }
