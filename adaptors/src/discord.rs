@@ -39,7 +39,7 @@ pub mod websocket;
 
 /// <https://discord.com/developers/docs/events/gateway-events#payload-structure>
 #[derive(Debug, Deserialize)]
-struct GateawayPayload<Opcode> {
+struct GatewayPayload<Opcode> {
     op: Opcode,
     // Event type
     t: Option<String>,
@@ -52,9 +52,9 @@ struct GateawayPayload<Opcode> {
 #[derive(Default)]
 struct DiscordSockets {
     // Main
-    gateaway_websocket: Option<WebSocketStream<ConnectStream>>,
+    gateway_websocket: Option<WebSocketStream<ConnectStream>>,
     heart_beating: Option<HeartBeatingData>,
-    last_sequance_number: Option<usize>,
+    last_sequence_number: Option<usize>,
 
     // VC
     vc_websocket: Option<WebSocketStream<ConnectStream>>,
@@ -62,22 +62,22 @@ struct DiscordSockets {
 
     vc_location: VCLoc,
     vc_connection: Option<VCConnection>,
-    vc_last_sequance_number: Option<usize>,
+    vc_last_sequence_number: Option<usize>,
 }
 
 type Events = (
-    Option<GateawayPayload<Opcode>>,
-    Option<GateawayPayload<VCOpcode>>,
+    Option<GatewayPayload<Opcode>>,
+    Option<GatewayPayload<VCOpcode>>,
 );
 impl DiscordSockets {
-    fn nuke_main_gateaway(&mut self) {
-        println!("Errasing gateway related information");
-        self.gateaway_websocket = None;
-        self.last_sequance_number = None;
+    fn nuke_main_gateway(&mut self) {
+        println!("Erasing gateway related information");
+        self.gateway_websocket = None;
+        self.last_sequence_number = None;
         self.heart_beating = None;
     }
-    fn nuke_vc_gateaway(&mut self) {
-        println!("Errasing VC related information");
+    fn nuke_vc_gateway(&mut self) {
+        println!("Erasing VC related information");
         self.vc_websocket = None;
         self.vc_heart_beating = None;
         self.vc_location.clear();
@@ -87,7 +87,7 @@ impl DiscordSockets {
     fn fetch_events(&mut self, cx: &mut Context<'_>) -> Poll<Events> {
         let mut events: Events = (None, None);
 
-        if let Some(socket) = self.gateaway_websocket.as_mut()
+        if let Some(socket) = self.gateway_websocket.as_mut()
             && let Poll::Ready(event) = socket.select_next_some().poll_unpin(cx)
         {
             let deserialized_event = match &event {
@@ -98,8 +98,8 @@ impl DiscordSockets {
             match deserialized_event {
                 Ok(unwraped_event) => events.0 = Some(unwraped_event),
                 Err(err) => {
-                    eprintln!("gateway_event deserilization failed: {err:#?}");
-                    self.nuke_main_gateaway();
+                    eprintln!("gateway_event deserialization failed: {err:#?}");
+                    self.nuke_main_gateway();
                 }
             }
         };
@@ -116,9 +116,9 @@ impl DiscordSockets {
                 Ok(unwraped_event) => events.1 = Some(unwraped_event),
                 Err(err) => {
                     eprintln!(
-                        "vc_event failed to deserilize: {vc_event:#?}\n With error: {err:#?}"
+                        "vc_event failed to deserialize: {vc_event:#?}\n With error: {err:#?}"
                     );
-                    self.nuke_vc_gateaway();
+                    self.nuke_vc_gateway();
                 }
             }
         }
@@ -221,7 +221,7 @@ impl Messanger for Discord {
     async fn socket(self: Arc<Self>) -> Option<Weak<dyn Socket + Send + Sync>> {
         let mut socket = self.socket.lock().await;
 
-        if socket.gateaway_websocket.is_none() {
+        if socket.gateway_websocket.is_none() {
             let gateway_url = "wss://gateway.discord.gg/?encoding=json&v=9";
             let (stream, response) = connect_async(gateway_url)
                 .await
@@ -229,7 +229,7 @@ impl Messanger for Discord {
 
             println!("Response HTTP code: {}", response.status());
 
-            socket.gateaway_websocket = Some(stream);
+            socket.gateway_websocket = Some(stream);
         };
         Some(Arc::<Discord>::downgrade(&self) as Weak<dyn Socket + Send + Sync>)
     }
@@ -245,19 +245,19 @@ impl Socket for Discord {
         let (event, vc_event) = loop {
             let mut socket = self.socket.lock().await;
             let DiscordSockets {
-                gateaway_websocket,
+                gateway_websocket,
                 heart_beating,
-                last_sequance_number,
+                last_sequence_number,
                 //
                 vc_websocket,
                 vc_heart_beating,
                 vc_connection,
-                vc_last_sequance_number,
+                vc_last_sequence_number,
                 ..
             } = &mut *socket;
 
             // Main socket heartbeat
-            if let Some(websocket) = gateaway_websocket
+            if let Some(websocket) = gateway_websocket
                 && let Some(heart_beating_data) = heart_beating
                 && heart_beating_data.is_beat_time().await
             {
@@ -265,7 +265,7 @@ impl Socket for Discord {
                     .send(
                         json!({
                                 "op": Opcode::Heartbeat as u8,
-                                "d": last_sequance_number,
+                                "d": last_sequence_number,
                         })
                         .to_string()
                         .into(),
@@ -296,7 +296,7 @@ impl Socket for Discord {
                         "op": VCOpcode::Heartbeat as u8,
                         "d": {
                             "t": time,
-                            "seq_ack": vc_last_sequance_number,
+                            "seq_ack": vc_last_sequence_number,
                         }
                     })
                 };
@@ -315,7 +315,7 @@ impl Socket for Discord {
             // Pull UDP VC socket
             if let Some(vc_connection) = socket.vc_connection.as_mut() {
                 match poll!(pin!(vc_connection.get_bits(&mut buff))) {
-                    Poll::Ready(n_bytes) => println!("{:#?} bytes recived", n_bytes),
+                    Poll::Ready(n_bytes) => println!("{:#?} bytes received", n_bytes),
                     Poll::Pending => pending!(),
                 }
             } else {
@@ -324,7 +324,7 @@ impl Socket for Discord {
             };
         };
         if let Some(vc_event) = vc_event {
-            println!("Excuting VC event.");
+            println!("Executing VC event.");
             match vc_event.exec(&self).await {
                 Ok(_) => {}
                 Err(err) => {
@@ -336,7 +336,7 @@ impl Socket for Discord {
 
         // Run, and return SocketEvent
         if let Some(event) = event {
-            println!("Excuting gateway event.");
+            println!("Executing gateway event.");
             match event.exec(&self).await {
                 Ok(event) => return Some(event),
                 Err(err) => {
@@ -351,10 +351,10 @@ impl Socket for Discord {
 
 fn deserialize_event<Opcode: for<'a> Deserialize<'a>>(
     event: &WebSocketMessage,
-) -> Result<GateawayPayload<Opcode>, Box<dyn std::error::Error>> {
+) -> Result<GatewayPayload<Opcode>, Box<dyn std::error::Error>> {
     let json = match event {
         WebSocketMessage::Text(text) => {
-            serde_json::from_str::<GateawayPayload<Opcode>>(text).unwrap()
+            serde_json::from_str::<GatewayPayload<Opcode>>(text).unwrap()
         }
         WebSocketMessage::Binary(_) => todo!(),
         WebSocketMessage::Frame(frame) => {

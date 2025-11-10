@@ -5,7 +5,7 @@ use futures::{Stream, StreamExt, channel::mpsc::Sender, future::join_all, try_jo
 use iced::{Element, Subscription, Task, window};
 use messanger_unifier::Messangers;
 use pages::{Login, MyAppMessage, messenger::Messenger};
-use socket::{ReciverEvent, SocketsInterface};
+use socket::{ReceiverEvent, SocketsInterface};
 
 use crate::messanger_unifier::MessangerHandle;
 
@@ -63,7 +63,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct App {
     page: Screen,
     messangers: Messangers,
-    socket_sender: Option<Sender<ReciverEvent>>,
+    socket_sender: Option<Sender<ReceiverEvent>>,
 }
 
 impl App {
@@ -191,7 +191,7 @@ impl App {
                         let mut socket_connection = socket_connection.clone();
                         Task::future(async move {
                             socket_connection
-                                .try_send(ReciverEvent::Connection((
+                                .try_send(ReceiverEvent::Connection((
                                     interface.handle,
                                     interface.api.socket().await,
                                 )))
@@ -213,8 +213,8 @@ impl App {
                                 }
                             };
                         }
-                        SocketEvent::Disconected => println!("Disconected"),
-                        SocketEvent::Skip => println!("Skiped"),
+                        SocketEvent::Disconnected => println!("Disconnected"),
+                        SocketEvent::Skip => println!("Skipped"),
                     };
                     Task::none()
                 }
@@ -234,7 +234,7 @@ impl App {
                         Task::perform(
                             async move {
                                 sender
-                                    .try_send(ReciverEvent::Connection((
+                                    .try_send(ReceiverEvent::Connection((
                                         handle,
                                         api.socket().await,
                                     )))
@@ -274,7 +274,7 @@ impl App {
                             })
                         })
                     }
-                    pages::messenger::Action::DisconectFromCall(call) => {
+                    pages::messenger::Action::DisconnectFromCall(call) => {
                         let interface = self
                             .messangers
                             .interface_from_handle(call.handle())
@@ -283,10 +283,10 @@ impl App {
                         let api = interface.api.to_owned();
                         Task::future(async move {
                             let vc = api.vc().await;
-                            vc.unwrap().disconect(call.source()).await;
+                            vc.unwrap().disconnect(call.source()).await;
                         })
                         .then(move |_| {
-                            println!("TODO: DISCONECT CALL");
+                            println!("TODO: DISCONNECT CALL");
                             Task::none()
                             // Task::done(MyAppMessage::SetMessangerData {
                             //     messanger_handle: interface.handle,
@@ -313,7 +313,7 @@ impl App {
 
 #[derive(Debug)]
 enum SocketMesg {
-    Connect(Sender<ReciverEvent>),
+    Connect(Sender<ReceiverEvent>),
     Message((MessangerHandle, SocketEvent)),
 }
 

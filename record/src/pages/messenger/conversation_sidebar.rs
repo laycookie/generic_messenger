@@ -19,7 +19,7 @@ pub struct Sidebar {
 #[derive(Debug, Clone)]
 pub enum Action {
     Call(Identifier<Chan>),
-    Disconect(Call),
+    Disconnect(Call),
     OpenContacts,
     OpenChat {
         handle: crate::messanger_unifier::MessangerHandle,
@@ -93,7 +93,7 @@ impl Sidebar {
             let active_calls = Column::from_iter(active_calls.map(|call| {
                 Element::from(row![
                     Text::from(call.status_str()),
-                    Button::new("D").on_press(Action::Disconect(call.clone()))
+                    Button::new("D").on_press(Action::Disconnect(call.clone()))
                 ])
             }));
             Some(column![

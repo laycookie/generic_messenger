@@ -31,7 +31,7 @@ impl Call {
         match self.status {
             CallStatus::Connected => "Connected",
             CallStatus::Connecting => "Connecting",
-            CallStatus::Disconected => "Disconnected",
+            CallStatus::Disconnected => "Disconnected",
         }
     }
 }

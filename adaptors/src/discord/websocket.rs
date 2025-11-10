@@ -227,15 +227,15 @@ impl VC for Discord {
 
         // socket.vc_location_id = Some(channel.guild_id.clone().unwrap_or(channel.id.clone()));
         socket
-            .gateaway_websocket
+            .gateway_websocket
             .as_mut()
             .unwrap()
             .send(payload.to_string().into())
             .await
             .unwrap();
     }
-    async fn disconect<'a>(&'a self, location: &Identifier<Chan>) {
-        println!("Initiating disconect");
+    async fn disconnect<'a>(&'a self, location: &Identifier<Chan>) {
+        println!("Initiating disconnect");
         let mut socket = self.socket.lock().await;
         println!("Socket locked");
 
@@ -259,7 +259,7 @@ impl VC for Discord {
 
         // socket.vc_location_id = Some(channel.guild_id.clone().unwrap_or(channel.id.clone()));
         socket
-            .gateaway_websocket
+            .gateway_websocket
             .as_mut()
             .unwrap()
             .send(payload.to_string().into())

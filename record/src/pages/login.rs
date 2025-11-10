@@ -33,7 +33,7 @@ impl Platform {
     fn get_login_methods(&self) -> Vec<LoginMethods> {
         match self {
             Platform::Discord => vec![LoginMethods::Token],
-            Platform::Test => vec![LoginMethods::Unkown],
+            Platform::Test => vec![LoginMethods::Unknown],
         }
     }
 }
@@ -41,7 +41,7 @@ impl Platform {
 
 enum LoginMethods {
     Token,
-    Unkown,
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -125,7 +125,7 @@ impl Login {
                     TextInput::new("Token", self.token.as_str())
                         .on_input(|text| Message::TokenInput(text)),
                 ),
-                LoginMethods::Unkown => None,
+                LoginMethods::Unknown => None,
             })
             .fold(Column::new(), |column, widget| column.push(widget));
 
