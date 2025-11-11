@@ -89,7 +89,16 @@ impl GatewayPayload<VCOpcode> {
                 discord_socket.vc_connection = Some(VCConnection::new(socket, ssrc));
 
                 let ip_discovery = IpDiscoveryPacket::new(&buf).unwrap();
-                println!("AAAAAAAAAAAA: {:?}", ip_discovery.get_address());
+                println!(
+                    "AAAAAAAAAAAA: {:?}",
+                    std::str::from_utf8(&ip_discovery.get_address()).unwrap()
+                );
+
+                let mut ip_address = ip_discovery.get_address();
+                // Get rid of extra nulls if any due to ipv4 being chosen over ipv6
+                if let Some(null_position) = ip_address.iter().position(|c| *c == 0) {
+                    ip_address.truncate(null_position);
+                };
 
                 discord_socket
                     .vc_websocket
