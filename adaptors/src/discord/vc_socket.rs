@@ -104,26 +104,30 @@ impl GatewayPayload<VCOpcode> {
                     .vc_websocket
                     .as_mut()
                     .unwrap()
-                    .send(Message::Text(json!({
-                    "op": VCOpcode::SelectProtocol as u8,
-                    "d": {
-                        "protocol": "udp",
-                        "data": {
-                            "address": std::str::from_utf8(&ip_discovery.get_address()).unwrap(),
-                            "port": ip_discovery.get_port(),
-                            // TODO: We are hard coding it just for rn
-                            "mode": "aead_xchacha20_poly1305_rtpsize",
-                        },
-                        "codecs": [
-                            {
-                                "name": "opus",
-                                "type": "audio",
-                                "priority": 1000,
-                                "payload_type": 120
-                            }
-                        ]
-                    },
-                }).to_string().into()))
+                    .send(Message::Text(
+                        json!({
+                            "op": VCOpcode::SelectProtocol as u8,
+                            "d": {
+                                "protocol": "udp",
+                                "data": {
+                                    "address": std::str::from_utf8(&ip_address).unwrap(),
+                                    "port": ip_discovery.get_port(),
+                                    // TODO: We are hard coding it just for rn
+                                    "mode": "aead_xchacha20_poly1305_rtpsize",
+                                },
+                                "codecs": [
+                                    {
+                                        "name": "opus",
+                                        "type": "audio",
+                                        "priority": 1000,
+                                        "payload_type": 120
+                                    }
+                                ]
+                            },
+                        })
+                        .to_string()
+                        .into(),
+                    ))
                     .await
                     .unwrap();
             }
