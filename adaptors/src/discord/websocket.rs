@@ -180,6 +180,10 @@ impl VCLoc {
             VCLoc::AwaitingEndpoint(vc_location) => {
                 *self = VCLoc::Ready(vc_location.clone().insert_endpoint(endpoint, token))
             }
+            VCLoc::Ready(vc_location) => {
+                vc_location.endpoint = endpoint;
+                vc_location.token = token;
+            }
             _ => panic!(),
         };
     }

@@ -103,8 +103,10 @@ impl GatewayPayload<Opcode> {
                         vc_location.insert_session(session_id);
 
                         if vc_websocket.is_some() {
+                            println!("Ignoring");
                             return Ok(SocketEvent::Skip);
                         }
+                        println!("Connecting");
 
                         if let VCLoc::Ready(vc_location) = vc_location {
                             let profile = discord.profile.read().await;

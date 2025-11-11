@@ -7,7 +7,7 @@ use crate::{
     SocketMesg,
     messanger_unifier::{Call, MessangerHandle},
 };
-use adaptors::types::{Chan, Identifier, Msg, Server, Usr};
+use adaptors::types::{Chan, ID, Identifier, Msg, Server, Usr};
 pub use login::Login;
 use login::Message as LoginMessage;
 use messenger::Message as MessangerMessage;
@@ -28,11 +28,21 @@ pub(crate) enum MessangerData {
 }
 
 #[derive(Debug)]
+pub(crate) enum MessangerDataType {
+    Call,
+}
+
+#[derive(Debug)]
 pub(crate) enum MyAppMessage {
     OpenPage(Screen),
     SetMessangerData {
         messanger_handle: MessangerHandle,
         new_data: MessangerData,
+    },
+    RemoveMessangerData {
+        messanger_handle: MessangerHandle,
+        data_type: MessangerDataType,
+        data_id: ID,
     },
     RemoveMessanger(MessangerHandle),
     SocketEvent(SocketMesg),

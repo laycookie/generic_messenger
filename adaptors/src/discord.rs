@@ -81,7 +81,7 @@ impl DiscordSockets {
         println!("Erasing VC related information");
         self.vc_websocket = None;
         self.vc_heart_beating = None;
-        self.vc_location.clear();
+        // self.vc_location.clear();
         self.vc_connection = None;
     }
 

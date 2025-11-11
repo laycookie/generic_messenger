@@ -156,11 +156,7 @@ impl Messenger {
                 }
             },
             Message::Sidebar(action) => match action {
-                SidebarAction::Disconnect(call) => {
-                    println!("{call:#?}");
-
-                    Action::DisconnectFromCall(call)
-                }
+                SidebarAction::Disconnect(call) => Action::DisconnectFromCall(call),
                 // TODO: Only calls server check if can be simplified
                 SidebarAction::Call(channel) => {
                     let server = self.sidebar.server_selected.as_ref().unwrap();

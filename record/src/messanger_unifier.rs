@@ -4,7 +4,7 @@ use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use adaptors::{
     Messanger,
-    types::{CallStatus, Chan, Identifier, Msg, Server, Usr},
+    types::{CallStatus, Chan, ID, Identifier, Msg, Server, Usr},
 };
 
 #[derive(Debug, Clone)]
@@ -13,6 +13,7 @@ pub(crate) struct Call {
     source: Identifier<Chan>,
     status: CallStatus,
 }
+
 impl Call {
     pub(crate) fn new(messanger_handle: MessangerHandle, source: Identifier<Chan>) -> Self {
         Self {
@@ -26,6 +27,9 @@ impl Call {
     }
     pub(crate) fn source(&self) -> &Identifier<Chan> {
         &self.source
+    }
+    pub(crate) fn id(&self) -> ID {
+        *self.source.get_id()
     }
     pub(crate) fn status_str(&self) -> &str {
         match self.status {
@@ -69,6 +73,11 @@ pub struct MessangerHandle {
     id: usize,
     index: usize,
 }
+impl PartialEq for MessangerHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct MessangerInterface {
@@ -105,19 +114,17 @@ impl Messangers {
         messanger_handle: MessangerHandle,
     ) -> Option<&MessangerInterface> {
         if self.interface.len() > messanger_handle.index
-            && messanger_handle.id == self.interface[messanger_handle.index].handle.id
+            && messanger_handle == self.interface[messanger_handle.index].handle
         {
             return Some(&self.interface[messanger_handle.index]);
         }
 
         eprintln!("Cache hit occured");
-        self.interface
-            .iter()
-            .find(|a| a.handle.id == messanger_handle.id)
+        self.interface.iter().find(|a| a.handle == messanger_handle)
     }
     pub fn data_from_handle(&self, messanger_handle: MessangerHandle) -> Option<&MessangerData> {
         if self.data.len() > messanger_handle.index
-            && messanger_handle.id == self.data[messanger_handle.index].handle.id
+            && messanger_handle == self.data[messanger_handle.index].handle
         {
             return Some(&self.data[messanger_handle.index]);
         }
@@ -125,14 +132,14 @@ impl Messangers {
         eprintln!("Cache hit occured");
         self.data
             .iter()
-            .find(|data| data.handle.id == messanger_handle.id)
+            .find(|data| data.handle == messanger_handle)
     }
     pub fn mut_data_from_handle(
         &mut self,
         messanger_handle: MessangerHandle,
     ) -> Option<&mut MessangerData> {
         if self.data.len() > messanger_handle.index
-            && messanger_handle.id == self.data[messanger_handle.index].handle.id
+            && messanger_handle == self.data[messanger_handle.index].handle
         {
             return Some(&mut self.data[messanger_handle.index]);
         }
@@ -140,7 +147,7 @@ impl Messangers {
         eprintln!("Cache hit occured");
         self.data
             .iter_mut()
-            .find(|data| data.handle.id == messanger_handle.id)
+            .find(|data| data.handle == messanger_handle)
     }
     pub fn add_messanger(&mut self, api: Arc<dyn Messanger>) -> MessangerHandle {
         let handle = MessangerHandle {

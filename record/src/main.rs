@@ -92,27 +92,44 @@ impl App {
                 messanger_handle,
                 new_data,
             } => {
-                let d = self
+                let data = self
                     .messangers
                     .mut_data_from_handle(messanger_handle)
                     .unwrap();
                 match new_data {
-                    pages::MessangerData::Call(call_status) => d.calls.push(call_status),
+                    pages::MessangerData::Call(call_status) => data.calls.push(call_status),
                     pages::MessangerData::Everything {
                         profile,
                         contacts,
                         conversations,
                         servers,
                     } => {
-                        d.profile = Some(profile);
-                        d.contacts = contacts;
-                        d.conversations = conversations;
-                        d.guilds = servers;
+                        data.profile = Some(profile);
+                        data.contacts = contacts;
+                        data.conversations = conversations;
+                        data.guilds = servers;
                     }
                     pages::MessangerData::Chat((k, v)) => {
-                        d.chats.insert(k.clone(), v);
+                        data.chats.insert(k.clone(), v);
                     }
                 };
+                Task::none()
+            }
+            MyAppMessage::RemoveMessangerData {
+                messanger_handle,
+                data_type,
+                data_id,
+            } => {
+                let data = self
+                    .messangers
+                    .mut_data_from_handle(messanger_handle)
+                    .unwrap();
+                match data_type {
+                    pages::MessangerDataType::Call => {
+                        data.calls.retain(|call| call.id() != data_id);
+                    }
+                };
+
                 Task::none()
             }
             MyAppMessage::StartUp => {
@@ -285,14 +302,15 @@ impl App {
                         Task::future(async move {
                             let vc = api.vc();
                             vc.unwrap().disconnect(call.source()).await;
+                            call
                         })
-                        .then(move |_| {
+                        .then(move |call| {
                             println!("TODO: DISCONNECT CALL");
-                            Task::none()
-                            // Task::done(MyAppMessage::SetMessangerData {
-                            //     messanger_handle: interface.handle,
-                            //     new_data: pages::MessangerData::Call(Call::new(channel)),
-                            // })
+                            Task::done(MyAppMessage::RemoveMessangerData {
+                                messanger_handle: call.handle(),
+                                data_type: pages::MessangerDataType::Call,
+                                data_id: call.id(),
+                            })
                         })
                     }
                     pages::messenger::Action::Run(task) => task.map(MyAppMessage::Chat),
