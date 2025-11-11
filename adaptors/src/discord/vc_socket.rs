@@ -1,4 +1,5 @@
 use async_tungstenite::tungstenite::Message;
+use discortp::discord::{IpDiscoveryPacket, IpDiscoveryType};
 use serde::Deserialize;
 use serde_json::json;
 use serde_repr::Deserialize_repr;
@@ -87,10 +88,8 @@ impl GatewayPayload<VCOpcode> {
                 }
                 discord_socket.vc_connection = Some(VCConnection::new(socket, ssrc));
 
-                let ip_discovery = unsafe { std::mem::transmute::<[u8; 74], IpDiscovery>(buf) };
-
-                println!("port:{port}\nExternal port:{}", ip_discovery.port.to_le());
-                println!("port:{port}\nExternal port:{}", ip_discovery.port.to_be());
+                let ip_discovery = IpDiscoveryPacket::new(&buf).unwrap();
+                println!("AAAAAAAAAAAA: {:?}", ip_discovery.get_address());
 
                 discord_socket
                     .vc_websocket
@@ -101,10 +100,8 @@ impl GatewayPayload<VCOpcode> {
                     "d": {
                         "protocol": "udp",
                         "data": {
-                            "address": std::str::from_utf8(&ip_discovery.address_ascii).unwrap(),
-                            "port": ip_discovery.port.to_be(), // Converts it to little endian,
-                                                               // because I'm too lazy to not use
-                                                               // transmute above
+                            "address": std::str::from_utf8(&ip_discovery.get_address()).unwrap(),
+                            "port": ip_discovery.get_port(),
                             // TODO: We are hard coding it just for rn
                             "mode": "aead_xchacha20_poly1305_rtpsize",
                         },

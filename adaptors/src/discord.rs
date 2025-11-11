@@ -15,6 +15,7 @@ use async_tungstenite::{
     async_std::{ConnectStream, connect_async},
     tungstenite::Message as WebSocketMessage,
 };
+use discortp::rtp::RtpPacket;
 use futures::{FutureExt, Stream, StreamExt, lock::Mutex, pending, poll};
 use futures_locks::RwLock as RwLockAwait;
 use serde::Deserialize;
@@ -339,41 +340,33 @@ impl Socket for Discord {
                 };
 
                 // <https://www.rfcreader.com/#rfc3550_line548>
-                let version = (buff[0] >> 6) & 0b11; // top 2 bits
-                let padding = (buff[0] >> 5) & 0b1 == 1; // next 1 bit
-                let extension = (buff[0] >> 4) & 0b1 == 1; // next 1 bit
-                let csrc_count = buff[0] & 0b1111; // last 4 bits
-                let marker = (buff[1] >> 7) & 0b1 == 1;
-                let payload_type = buff[1] & 0b1111111;
-                let sequence_number = u16::from_be_bytes(buff[2..4].try_into().unwrap());
-                let timestamp = u32::from_be_bytes(buff[4..8].try_into().unwrap());
-                let ssrc = u32::from_be_bytes(buff[8..12].try_into().unwrap());
+                // <https://docs.discord.food/topics/voice-connections#rtp-packet-structure>
+                // let version = (buff[0] >> 6) & 0b11; // top 2 bits
+                // let padding = (buff[0] >> 5) & 0b1 == 1; // next 1 bit
+                // let extension = (buff[0] >> 4) & 0b1 == 1; // next 1 bit
+                // let csrc_count = buff[0] & 0b1111; // last 4 bits
+                // let marker = (buff[1] >> 7) & 0b1 == 1;
+                // let payload_type = buff[1] & 0b1111111;
+                // let sequence_number = u16::from_be_bytes(buff[2..4].try_into().unwrap());
+                // let timestamp = u32::from_be_bytes(buff[4..8].try_into().unwrap());
+                // let ssrc = u32::from_be_bytes(buff[8..12].try_into().unwrap());
 
-                println!(
-                    "Version: {:?}\nPadding: {:?}\nExtension: {:?}\ncsrc_count: {:?}\nMarker: {:?}\nPayload_type: {:?}\n Sequance_number: {:?}\n timestamp:{:?}\n ssrc:{:?}",
-                    version,
-                    padding,
-                    extension,
-                    csrc_count,
-                    marker,
-                    payload_type,
-                    sequence_number,
-                    timestamp,
-                    ssrc
-                );
+                let rtp_packet = RtpPacket::new(&buff).unwrap();
+                println!("{:?}", rtp_packet.get_ssrc());
+
+                // println!(
+                //    "Version: {:?}\nPadding: {:?}\nExtension: {:?}\ncsrc_count: {:?}\nMarker: {:?}\nPayload_type: {:?}\n Sequance_number: {:?}\n timestamp:{:?}\n ssrc:{:?}",
+                //    version,
+                //    padding,
+                //    extension,
+                //    csrc_count,
+                //    marker,
+                //    payload_type,
+                //    sequence_number,
+                //    timestamp,
+                //    ssrc
+                //);
                 println!("Data: {:?}", &buff[0..n_bytes]);
-
-                // match poll!(fut) {
-                //     Poll::Ready(Ok((n, _))) => {
-                //         println!("Data: {:#?}", buff);
-                //     }
-                //     Poll::Ready(Err(err)) => {
-                //         panic!("{err}")
-                //     }
-                //     Poll::Pending => {
-                //         pending!()
-                //     }
-                // }
             } else {
                 pending!()
             };

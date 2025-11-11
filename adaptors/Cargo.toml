@@ -14,4 +14,5 @@ futures-timer = "3.0.3"
 async-tungstenite =  { version = "0.32.0", features = ["async-std-runtime", "async-tls"] }
 smol = "2.0.2"
 async-trait = "0.1.83"
+discortp = { version = "0.6.0", features = [ "discord" ] }
 macro = { path = "../macro" }
