@@ -189,9 +189,13 @@ impl VCLoc {
     }
     pub(super) fn insert_session(&mut self, session_id: String) {
         match self {
+            VCLoc::None => {
+                eprintln!("This should not be happening idk actually.")
+            }
             VCLoc::AwaitingData(vc_location) => {
                 *self = VCLoc::AwaitingEndpoint(vc_location.clone().insert_session(session_id))
             }
+            VCLoc::AwaitingEndpoint(vc_location) => todo!(),
             VCLoc::AwaitingSession(vc_location) => {
                 *self = VCLoc::Ready(vc_location.clone().insert_session(session_id))
             }
@@ -202,7 +206,6 @@ impl VCLoc {
                 );
                 vc_location.session_id = session_id;
             }
-            _ => panic!("Self:{:#?}\nDesc:{:#?}", &self, session_id),
         };
     }
 }
