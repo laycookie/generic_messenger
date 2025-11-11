@@ -125,6 +125,8 @@ impl GatewayPayload<Opcode> {
                             .and_then(|endpoint| endpoint.as_str().map(|s| s.to_string()))
                             .unwrap();
 
+                        println!("endpoint:{}, token:{}", endpoint, token);
+
                         socket.vc_location.insert_endpoint(endpoint, token);
 
                         let DiscordSockets {
@@ -132,6 +134,7 @@ impl GatewayPayload<Opcode> {
                             vc_location,
                             ..
                         } = &mut *socket;
+
                         if let VCLoc::Ready(vc_location) = vc_location {
                             let profile = discord.profile.read().await;
                             let profile = profile.as_ref();

@@ -2,12 +2,8 @@ use async_tungstenite::tungstenite::Message;
 use serde::Deserialize;
 use serde_json::json;
 use serde_repr::Deserialize_repr;
-use smol::{future::FutureExt, net::UdpSocket};
-use std::{
-    pin,
-    task::{Context, Poll},
-    time::Duration,
-};
+use smol::{lock::Mutex, net::UdpSocket};
+use std::{sync::Arc, time::Duration};
 
 use crate::discord::{Discord, GatewayPayload, websocket::HeartBeatingData};
 
@@ -207,21 +203,20 @@ pub(super) struct SessionDescription {
 }
 
 pub(super) struct VCConnection {
-    udp: UdpSocket,
+    udp: Arc<Mutex<UdpSocket>>,
     description: Option<SessionDescription>,
     my_ssrc: u32,
 }
 impl VCConnection {
-    pub(super) async fn get_bits(&mut self, buf: &mut [u8]) -> usize {
-        let (n_byte, _) = self.udp.recv_from(buf).await.unwrap();
-        n_byte
+    pub(super) fn udp(&self) -> Arc<Mutex<UdpSocket>> {
+        self.udp.clone()
     }
 }
 
 impl VCConnection {
     fn new(udp: UdpSocket, ssrc: u32) -> Self {
         Self {
-            udp,
+            udp: Arc::new(Mutex::new(udp)),
             description: None,
             my_ssrc: ssrc,
         }

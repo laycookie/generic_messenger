@@ -1,13 +1,13 @@
 use adaptors::types::{Chan, ChanType, Identifier};
 use iced::{
     Color, Element, Length, Padding,
-    widget::{Button, Column, Row, Scrollable, Text, button, column, container, image, row},
+    widget::{Button, Column, Scrollable, Text, button, column, container, image, row},
 };
 
 use super::PLACEHOLDER_PFP;
 use crate::{
     messanger_unifier::{Call, Messangers},
-    pages::messenger::{self, server::Server},
+    pages::messenger::server::Server,
 };
 
 #[derive(Debug)]
@@ -59,32 +59,27 @@ impl Sidebar {
                     ChanType::TextAndVoice => Text::new(chan.name.as_str()).into(),
                 }
             })),
-            None => Column::from_iter(
-                messengers
-                    .data_iter()
-                    .zip(messengers.interface_iter())
-                    .flat_map(|(data, interface)| {
-                        data.conversations.iter().map(|conversation| {
-                            Button::new({
-                                let image = match &conversation.icon {
-                                    Some(icon) => image(icon),
-                                    None => image(PLACEHOLDER_PFP),
-                                };
-                                row![
-                                    container(image.height(Length::Fixed(28.0)))
-                                        .padding(Padding::new(0.0).right(10.0)),
-                                    conversation.name.as_str()
-                                ]
-                            })
-                            .width(Length::Fill)
-                            .on_press(Action::OpenChat {
-                                handle: interface.handle,
-                                conversation: conversation.to_owned(),
-                            })
-                            .into()
-                        })
-                    }),
-            ),
+            None => Column::from_iter(messengers.data_iter().flat_map(|data| {
+                data.conversations.iter().map(|conversation| {
+                    Button::new({
+                        let image = match &conversation.icon {
+                            Some(icon) => image(icon),
+                            None => image(PLACEHOLDER_PFP),
+                        };
+                        row![
+                            container(image.height(Length::Fixed(28.0)))
+                                .padding(Padding::new(0.0).right(10.0)),
+                            conversation.name.as_str()
+                        ]
+                    })
+                    .width(Length::Fill)
+                    .on_press(Action::OpenChat {
+                        handle: data.handle(),
+                        conversation: conversation.to_owned(),
+                    })
+                    .into()
+                })
+            })),
         };
 
         let mut active_calls = messengers.data_iter().flat_map(|m| &m.calls).peekable();

@@ -234,10 +234,11 @@ impl VC for Discord {
             .await
             .unwrap();
     }
+
     async fn disconnect<'a>(&'a self, location: &Identifier<Chan>) {
-        println!("Initiating disconnect");
+        println!("Disconecting");
         let mut socket = self.socket.lock().await;
-        println!("Socket locked");
+        println!("Locked");
 
         let channels_map = self.channel_id_mappings.read().await;
         let channel = channels_map.get(location.get_id()).unwrap();
@@ -251,13 +252,10 @@ impl VC for Discord {
                 "self_deaf": false
               }
         });
-        println!("{payload:#?}");
 
-        socket.vc_location = VCLoc::AwaitingData(VCLocation::new(
-            channel.guild_id.clone().unwrap_or(channel.id.clone()),
-        ));
+        println!("Removing vc data");
+        socket.nuke_vc_gateway();
 
-        // socket.vc_location_id = Some(channel.guild_id.clone().unwrap_or(channel.id.clone()));
         socket
             .gateway_websocket
             .as_mut()

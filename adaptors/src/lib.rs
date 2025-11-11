@@ -24,7 +24,7 @@ pub trait Messanger: Send + Sync + Debug {
     async fn socket(self: Arc<Self>) -> Option<Weak<dyn Socket + Send + Sync>> {
         None
     }
-    async fn vc(&self) -> Option<&dyn VC> {
+    fn vc(&self) -> Option<&dyn VC> {
         None
     }
 }

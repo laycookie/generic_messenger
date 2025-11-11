@@ -252,12 +252,3 @@ impl Messenger {
         column![profiles, row![navbar, window]].into()
     }
 }
-
-fn call(interface: &MessangerInterface, channel: Identifier<Chan>) -> Task<Message> {
-    let api = interface.api.to_owned();
-    Task::future(async move {
-        let vc = api.vc().await;
-        vc.unwrap().connect(&channel).await;
-    })
-    .then(|_| Task::none())
-}

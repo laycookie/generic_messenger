@@ -24,29 +24,26 @@ impl Navbar {
     pub fn get_element<'a>(messengers: &'a Messangers) -> Element<'a, Action> {
         let dm_switch = Element::from(Button::new("test").on_press(Action::GetDMs));
 
-        let servers = messengers
-            .data_iter()
-            .zip(messengers.interface_iter())
-            .flat_map(|(data, interface)| {
-                data.guilds.iter().map(|server| {
-                    let image = match &server.icon {
-                        Some(icon) => image(icon),
-                        None => image(PLACEHOLDER_PFP),
-                    };
-                    Element::from(
-                        Button::new(
-                            image
-                                .height(Length::Fixed(48.0))
-                                .width(Length::Fixed(48.0))
-                                .content_fit(ContentFit::Cover),
-                        )
-                        .on_press(Action::GetGuild {
-                            handle: interface.handle,
-                            server: server.to_owned(),
-                        }),
+        let servers = messengers.data_iter().flat_map(|data| {
+            data.guilds.iter().map(|server| {
+                let image = match &server.icon {
+                    Some(icon) => image(icon),
+                    None => image(PLACEHOLDER_PFP),
+                };
+                Element::from(
+                    Button::new(
+                        image
+                            .height(Length::Fixed(48.0))
+                            .width(Length::Fixed(48.0))
+                            .content_fit(ContentFit::Cover),
                     )
-                })
-            });
+                    .on_press(Action::GetGuild {
+                        handle: data.handle(),
+                        server: server.to_owned(),
+                    }),
+                )
+            })
+        });
 
         Scrollable::new(Column::with_children(iter::once(dm_switch).chain(servers)))
             .direction(Direction::Vertical(

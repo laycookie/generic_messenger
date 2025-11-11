@@ -75,11 +75,6 @@ pub(crate) struct MessangerInterface {
     pub(crate) handle: MessangerHandle,
     pub(crate) api: Arc<dyn Messanger>,
 }
-impl MessangerInterface {
-    fn handle(&self) -> MessangerHandle {
-        self.handle
-    }
-}
 impl Deref for MessangerInterface {
     type Target = Arc<dyn Messanger>;
 

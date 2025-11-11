@@ -259,8 +259,9 @@ impl App {
                     }
                     pages::messenger::Action::Call { interface, channel } => {
                         let api = interface.api.to_owned();
+
                         Task::future(async move {
-                            let vc = api.vc().await;
+                            let vc = api.vc();
                             vc.unwrap().connect(&channel).await;
                             channel
                         })
@@ -282,7 +283,7 @@ impl App {
 
                         let api = interface.api.to_owned();
                         Task::future(async move {
-                            let vc = api.vc().await;
+                            let vc = api.vc();
                             vc.unwrap().disconnect(call.source()).await;
                         })
                         .then(move |_| {

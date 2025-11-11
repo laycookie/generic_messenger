@@ -39,8 +39,9 @@ pub mod websocket;
 
 /// <https://discord.com/developers/docs/events/gateway-events#payload-structure>
 #[derive(Debug, Deserialize)]
-struct GatewayPayload<Opcode> {
-    op: Opcode,
+struct GatewayPayload<Op> {
+    // Opcode
+    op: Op,
     // Event type
     t: Option<String>,
     // Sequence numbers
@@ -233,7 +234,7 @@ impl Messanger for Discord {
         };
         Some(Arc::<Discord>::downgrade(&self) as Weak<dyn Socket + Send + Sync>)
     }
-    async fn vc(&self) -> Option<&dyn VC> {
+    fn vc(&self) -> Option<&dyn VC> {
         Some(self)
     }
 }
@@ -251,7 +252,6 @@ impl Socket for Discord {
                 //
                 vc_websocket,
                 vc_heart_beating,
-                vc_connection,
                 vc_last_sequence_number,
                 ..
             } = &mut *socket;
@@ -313,14 +313,30 @@ impl Socket for Discord {
             };
 
             // Pull UDP VC socket
-            if let Some(vc_connection) = socket.vc_connection.as_mut() {
-                match poll!(pin!(vc_connection.get_bits(&mut buff))) {
-                    Poll::Ready(n_bytes) => println!("{:#?} bytes received", n_bytes),
-                    Poll::Pending => pending!(),
+            let udp = match socket.vc_connection.as_ref() {
+                Some(vc_connection) => {
+                    let udp = vc_connection.udp();
+                    Some(udp)
+                }
+                None => None,
+            };
+
+            drop(socket); // Otherwise it blocks socket for other things on the runtime
+
+            if let Some(udp) = udp {
+                let udp = udp.lock().await;
+                let fut = pin!(udp.recv_from(&mut buff));
+
+                match poll!(fut) {
+                    Poll::Ready(data) => {
+                        println!("Data: {:#?}", data)
+                    }
+                    Poll::Pending => {
+                        pending!()
+                    }
                 }
             } else {
-                drop(socket); // Otherwise it blocks socket for other things on the runtime
-                pending!();
+                pending!()
             };
         };
         if let Some(vc_event) = vc_event {
@@ -349,13 +365,11 @@ impl Socket for Discord {
     }
 }
 
-fn deserialize_event<Opcode: for<'a> Deserialize<'a>>(
+fn deserialize_event<Op: for<'a> Deserialize<'a>>(
     event: &WebSocketMessage,
-) -> Result<GatewayPayload<Opcode>, Box<dyn std::error::Error>> {
+) -> Result<GatewayPayload<Op>, Box<dyn std::error::Error>> {
     let json = match event {
-        WebSocketMessage::Text(text) => {
-            serde_json::from_str::<GatewayPayload<Opcode>>(text).unwrap()
-        }
+        WebSocketMessage::Text(text) => serde_json::from_str::<GatewayPayload<Op>>(text).unwrap(),
         WebSocketMessage::Binary(_) => todo!(),
         WebSocketMessage::Frame(frame) => {
             return Err(format!("Frame: {frame:?}").into());
