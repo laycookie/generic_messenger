@@ -103,10 +103,8 @@ impl GatewayPayload<Opcode> {
                         vc_location.insert_session(session_id);
 
                         if vc_websocket.is_some() {
-                            println!("Ignoring");
                             return Ok(SocketEvent::Skip);
                         }
-                        println!("Connecting");
 
                         if let VCLoc::Ready(vc_location) = vc_location {
                             let profile = discord.profile.read().await;
@@ -126,8 +124,6 @@ impl GatewayPayload<Opcode> {
                             .get("endpoint")
                             .and_then(|endpoint| endpoint.as_str().map(|s| s.to_string()))
                             .unwrap();
-
-                        println!("endpoint:{}, token:{}", endpoint, token);
 
                         socket.vc_location.insert_endpoint(endpoint, token);
 
@@ -236,7 +232,6 @@ impl Discord {
           }
         });
 
-        println!("{:#?}", identify_payload);
         stream
             .send(identify_payload.to_string().into())
             .await

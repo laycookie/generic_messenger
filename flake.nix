@@ -10,7 +10,20 @@
   outputs = { self, nixpkgs, rust-overlay, flake-utils }:
   let
     system = "x86_64-linux";
-	overlays = [ (import rust-overlay) ];
+
+	cmake_3_24_3_pkgs = import (builtins.fetchGit {
+         # Descriptive name to make the store path easier to identify
+         name = "cmake_3_24_3";
+         url = "https://github.com/NixOS/nixpkgs/";
+         ref = "refs/heads/nixpkgs-unstable";
+         rev = "55070e598e0e03d1d116c49b9eff322ef07c6ac6";
+    }) { inherit system; };
+	overlays = [ 
+		(import rust-overlay)
+		(final: prev: {
+			cmake_3_24_3 = cmake_3_24_3_pkgs.cmake;
+		})
+	];
     pkgs = import nixpkgs {
 		inherit system overlays;
 	};
@@ -26,6 +39,10 @@
     		      # rustfmt
 
 				  cargo-expand
+
+				  cmake_3_24_3
+
+				  libopus
 
 				  openssl
 				  pkg-config

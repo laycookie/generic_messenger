@@ -1,10 +1,10 @@
 use async_tungstenite::tungstenite::Message;
-use discortp::discord::{IpDiscoveryPacket, IpDiscoveryType};
+use discortp::discord::IpDiscoveryPacket;
 use serde::Deserialize;
 use serde_json::json;
 use serde_repr::Deserialize_repr;
-use smol::{lock::Mutex, net::UdpSocket};
-use std::{sync::Arc, time::Duration};
+use smol::net::UdpSocket;
+use std::time::Duration;
 
 use crate::discord::{Discord, GatewayPayload, websocket::HeartBeatingData};
 
@@ -22,6 +22,7 @@ pub(super) enum VCOpcode {
     Speaking = 5,
     Hello = 8,
     ClientConnect = 11,
+    Video = 12,
     ClientDisconnect = 13,
     ClientFlags = 18,
     ClientPlatform = 20,
@@ -31,7 +32,6 @@ impl GatewayPayload<VCOpcode> {
         let mut discord_socket = discord.socket.lock().await;
 
         if let Some(s) = self.s {
-            println!("Updating VC seq: {s:?}");
             discord_socket.vc_last_sequence_number = Some(s);
         };
 
@@ -51,7 +51,7 @@ impl GatewayPayload<VCOpcode> {
                     .collect::<Vec<_>>();
 
                 // TODO: Not hard code it maybe?
-                if !modes.contains(&"aead_xchacha20_poly1305_rtpsize") {
+                if !modes.contains(&EncryptionMode::aead_xchacha20_poly1305_rtpsize.as_str()) {
                     eprintln!("Encryption not supported");
                     return Err(());
                 };
@@ -89,10 +89,6 @@ impl GatewayPayload<VCOpcode> {
                 discord_socket.vc_connection = Some(VCConnection::new(socket, ssrc));
 
                 let ip_discovery = IpDiscoveryPacket::new(&buf).unwrap();
-                println!(
-                    "AAAAAAAAAAAA: {:?}",
-                    std::str::from_utf8(&ip_discovery.get_address()).unwrap()
-                );
 
                 let mut ip_address = ip_discovery.get_address();
                 // Get rid of extra nulls if any due to ipv4 being chosen over ipv6
@@ -113,7 +109,7 @@ impl GatewayPayload<VCOpcode> {
                                     "address": std::str::from_utf8(&ip_address).unwrap(),
                                     "port": ip_discovery.get_port(),
                                     // TODO: We are hard coding it just for rn
-                                    "mode": "aead_xchacha20_poly1305_rtpsize",
+                                    "mode": EncryptionMode::aead_xchacha20_poly1305_rtpsize.as_str(),
                                 },
                                 "codecs": [
                                     {
@@ -141,7 +137,7 @@ impl GatewayPayload<VCOpcode> {
                     .set_description(session_description);
 
                 let vc_connection = discord_socket.vc_connection.as_ref().unwrap();
-                let ssrc = vc_connection.my_ssrc;
+                let ssrc = vc_connection.client_ssrc;
                 discord_socket
                     .vc_websocket
                     .as_mut()
@@ -201,34 +197,117 @@ struct IpDiscovery {
     port: u16,
 }
 
+/// <https://docs.discord.food/topics/voice-connections#encryption-mode>
+#[allow(non_camel_case_types)]
+#[derive(Debug, Deserialize)]
+pub(super) enum EncryptionMode {
+    aead_aes256_gcm,
+    aead_aes256_gcm_rtpsize,
+    aead_xchacha20_poly1305_rtpsize,
+    xsalsa20_poly1305,
+    xsalsa20_poly1305_suffix,
+    xsalsa20_poly1305_lite,
+    xsalsa20_poly1305_lite_rtpsize,
+}
+impl EncryptionMode {
+    fn as_str(&self) -> &str {
+        match self {
+            EncryptionMode::aead_aes256_gcm => "aead_aes256_gcm",
+            EncryptionMode::aead_aes256_gcm_rtpsize => "aead_aes256_gcm_rtpsize",
+            EncryptionMode::aead_xchacha20_poly1305_rtpsize => "aead_xchacha20_poly1305_rtpsize",
+            EncryptionMode::xsalsa20_poly1305 => "xsalsa20_poly1305",
+            EncryptionMode::xsalsa20_poly1305_lite_rtpsize => "xsalsa20_poly1305_lite_rtpsize",
+            EncryptionMode::xsalsa20_poly1305_suffix => "xsalsa20_poly1305_suffix",
+            EncryptionMode::xsalsa20_poly1305_lite => "xsalsa20_poly1305_lite",
+        }
+    }
+    pub(super) fn tag_len(&self) -> usize {
+        match self {
+            EncryptionMode::aead_aes256_gcm => 16,
+            EncryptionMode::aead_aes256_gcm_rtpsize => todo!(),
+            EncryptionMode::aead_xchacha20_poly1305_rtpsize => 16,
+            EncryptionMode::xsalsa20_poly1305 => todo!(),
+            EncryptionMode::xsalsa20_poly1305_suffix => todo!(),
+            EncryptionMode::xsalsa20_poly1305_lite => todo!(),
+            EncryptionMode::xsalsa20_poly1305_lite_rtpsize => todo!(),
+        }
+    }
+    pub(super) fn nonce_size(&self) -> usize {
+        match self {
+            EncryptionMode::aead_aes256_gcm => todo!(),
+            EncryptionMode::aead_aes256_gcm_rtpsize => todo!(),
+            EncryptionMode::aead_xchacha20_poly1305_rtpsize => 4,
+            EncryptionMode::xsalsa20_poly1305 => todo!(),
+            EncryptionMode::xsalsa20_poly1305_suffix => todo!(),
+            EncryptionMode::xsalsa20_poly1305_lite => todo!(),
+            EncryptionMode::xsalsa20_poly1305_lite_rtpsize => todo!(),
+        }
+    }
+}
+
+impl From<&str> for EncryptionMode {
+    fn from(value: &str) -> Self {
+        for mode in [
+            EncryptionMode::aead_aes256_gcm_rtpsize,
+            EncryptionMode::aead_xchacha20_poly1305_rtpsize,
+            EncryptionMode::xsalsa20_poly1305_lite_rtpsize,
+            EncryptionMode::aead_aes256_gcm,
+            EncryptionMode::xsalsa20_poly1305,
+            EncryptionMode::xsalsa20_poly1305_suffix,
+            EncryptionMode::xsalsa20_poly1305_lite,
+        ] {
+            if mode.as_str() == value {
+                return mode;
+            }
+        }
+        panic!("Not implemented: {}", value);
+    }
+}
+
 /// <https://docs.discord.food/topics/voice-connections#session-description-structure>
 #[derive(Debug, Deserialize)]
 pub(super) struct SessionDescription {
     audio_codec: String,
     video_codec: String,
     media_session_id: String,
-    mode: Option<String>,
-    secret_key: Option<Vec<u32>>,
+    mode: Option<EncryptionMode>,
+    secret_key: Option<Vec<u8>>,
     keyframe_interval: Option<u32>,
+}
+impl SessionDescription {
+    pub(super) fn mode(&self) -> Option<&EncryptionMode> {
+        self.mode.as_ref()
+    }
+    pub(super) fn secret_key(&self) -> Option<&Vec<u8>> {
+        self.secret_key.as_ref()
+    }
 }
 
 pub(super) struct VCConnection {
-    udp: Arc<Mutex<UdpSocket>>,
+    decoder: opus::Decoder,
+    udp: UdpSocket,
+    client_ssrc: u32,
     description: Option<SessionDescription>,
-    my_ssrc: u32,
 }
 impl VCConnection {
-    pub(super) fn udp(&self) -> Arc<Mutex<UdpSocket>> {
+    pub(super) fn decoder(&mut self) -> &mut opus::Decoder {
+        &mut self.decoder
+    }
+    pub(super) fn udp(&self) -> UdpSocket {
         self.udp.clone()
+    }
+    pub(super) fn description(&self) -> Option<&SessionDescription> {
+        self.description.as_ref()
     }
 }
 
 impl VCConnection {
     fn new(udp: UdpSocket, ssrc: u32) -> Self {
         Self {
-            udp: Arc::new(Mutex::new(udp)),
+            decoder: opus::Decoder::new(48000, opus::Channels::Stereo).unwrap(),
+            udp,
             description: None,
-            my_ssrc: ssrc,
+            client_ssrc: ssrc,
         }
     }
     fn set_description(&mut self, description: SessionDescription) {

@@ -15,9 +15,10 @@ use async_tungstenite::{
     async_std::{ConnectStream, connect_async},
     tungstenite::Message as WebSocketMessage,
 };
-use discortp::rtp::RtpPacket;
+use discortp::{Packet, rtp::RtpPacket};
 use futures::{FutureExt, Stream, StreamExt, lock::Mutex, pending, poll};
 use futures_locks::RwLock as RwLockAwait;
+use libsodium_rs::crypto_aead;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -25,7 +26,7 @@ use crate::{
     Messanger, MessangerQuery, ParameterizedMessangerQuery, Socket,
     discord::{
         main_socket::Opcode,
-        vc_socket::{VCConnection, VCOpcode},
+        vc_socket::{EncryptionMode, VCConnection, VCOpcode},
         websocket::{HeartBeatingData, VCLoc},
     },
     types::{ID, Identifier},
@@ -243,7 +244,8 @@ impl Messanger for Discord {
 #[async_trait]
 impl Socket for Discord {
     async fn next(self: Arc<Self>) -> Option<SocketEvent> {
-        let mut buff = [0; 1024];
+        let mut rtp_packet_buff = [0; 1024];
+        let mut decoded_audio = [0; 2048];
         let (event, vc_event) = loop {
             let mut socket = self.socket.lock().await;
             let DiscordSockets {
@@ -314,40 +316,93 @@ impl Socket for Discord {
             };
 
             // Pull UDP VC socket
-            let udp = match socket.vc_connection.as_ref() {
-                Some(vc_connection) => {
+            let decrypted_payload = if let Some(vc_connection) = socket.vc_connection.as_ref()
+                && let Some(description) = vc_connection.description()
+            {
+                let n_bytes_in_packet = {
                     let udp = vc_connection.udp();
-                    Some(udp)
-                }
-                None => None,
-            };
-
-            drop(socket); // Otherwise it blocks socket for other things on the runtime
-
-            if let Some(udp) = udp {
-                let udp = udp.lock().await;
-                let n_bytes = {
-                    match poll!(pin!(udp.recv_from(&mut buff))) {
+                    match poll!(pin!(udp.recv_from(&mut rtp_packet_buff))) {
                         Poll::Ready(Ok((bytes_recived, _))) => bytes_recived,
                         Poll::Ready(Err(err)) => {
                             panic!("{err}")
                         }
                         Poll::Pending => {
+                            drop(socket); // Otherwise it blocks socket for other things on the runtime
                             pending!();
                             continue;
                         }
                     }
                 };
 
-                // <https://www.rfcreader.com/#rfc3550_line548>
-                // <https://docs.discord.food/topics/voice-connections#rtp-packet-structure>
-                let rtp_packet = RtpPacket::new(&buff).unwrap();
-                println!("{:?}", rtp_packet.get_ssrc());
+                #[derive(PartialEq)]
+                enum PacketType {
+                    Voice,
+                    Unkown,
+                }
 
-                println!("Data: {:?}", &buff[0..n_bytes]);
+                let packet_type = match rtp_packet_buff[1] {
+                    0x78 => PacketType::Voice,
+                    _ => PacketType::Unkown,
+                };
+
+                if packet_type == PacketType::Unkown {
+                    eprintln!("Unkown packet type on udp");
+                    continue;
+                };
+
+                let rtp_packet = RtpPacket::new(&rtp_packet_buff[..n_bytes_in_packet]).unwrap();
+
+                let rtp_header_len = if rtp_packet.get_extension() != 0 {
+                    rtp_packet.packet().len() - rtp_packet.payload().len() + 4
+                } else {
+                    rtp_packet.packet().len() - rtp_packet.payload().len()
+                };
+
+                let (header, body) = rtp_packet.packet().split_at(rtp_header_len);
+
+                let mode = description.mode().unwrap();
+                match mode {
+                    EncryptionMode::aead_aes256_gcm_rtpsize => todo!(),
+                    EncryptionMode::aead_xchacha20_poly1305_rtpsize => {
+                        let (voice_data, nonce_u32) = body.split_at(body.len() - mode.nonce_size());
+
+                        let mut nonce = [0; 24];
+                        nonce[..mode.nonce_size()].copy_from_slice(nonce_u32);
+
+                        let nonce = crypto_aead::xchacha20poly1305::Nonce::from_bytes(nonce);
+
+                        let key = crypto_aead::xchacha20poly1305::Key::from_bytes(
+                            &description.secret_key().unwrap()[..],
+                        )
+                        .expect("Invalid key length");
+
+                        crypto_aead::xchacha20poly1305::decrypt(
+                            voice_data,
+                            Some(header),
+                            &nonce,
+                            &key,
+                        )
+                        .unwrap()
+                    }
+                    EncryptionMode::aead_aes256_gcm => todo!("Depricated"),
+                    EncryptionMode::xsalsa20_poly1305 => todo!("Depricated"),
+                    EncryptionMode::xsalsa20_poly1305_suffix => todo!("Depricated"),
+                    EncryptionMode::xsalsa20_poly1305_lite => todo!("Depricated"),
+                    EncryptionMode::xsalsa20_poly1305_lite_rtpsize => todo!("Depricated"),
+                }
             } else {
-                pending!()
+                drop(socket); // Otherwise it blocks socket for other things on the runtime
+                pending!();
+                continue;
             };
+
+            let vc_connection = socket.vc_connection.as_mut().unwrap();
+            let decoder = vc_connection.decoder();
+            let a = decoder.decode(&decrypted_payload, &mut decoded_audio, true);
+            println!("{a:?}");
+            println!("{:?}", decrypted_payload);
+            println!("{:?}", decoded_audio);
+            panic!("test");
         };
         if let Some(vc_event) = vc_event {
             println!("Executing VC event.");
