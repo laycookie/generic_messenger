@@ -4,7 +4,7 @@ use std::{
     future::poll_fn,
     hash::{DefaultHasher, Hash, Hasher},
     pin::pin,
-    sync::{Arc, Weak},
+    sync::{Arc, Weak, mpsc::Sender},
     task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -52,7 +52,6 @@ struct GatewayPayload<Op> {
     d: serde_json::Value,
 }
 
-#[derive(Default)]
 struct DiscordSockets {
     // Main
     gateway_websocket: Option<WebSocketStream<ConnectStream>>,
@@ -66,6 +65,23 @@ struct DiscordSockets {
     vc_location: VCLoc,
     vc_connection: Option<VCConnection>,
     vc_last_sequence_number: Option<usize>,
+
+    audio_sender: Sender<i16>,
+}
+impl DiscordSockets {
+    fn new(audio_sender: Sender<i16>) -> Self {
+        Self {
+            gateway_websocket: Default::default(),
+            heart_beating: Default::default(),
+            last_sequence_number: Default::default(),
+            vc_websocket: Default::default(),
+            vc_heart_beating: Default::default(),
+            vc_location: Default::default(),
+            vc_connection: Default::default(),
+            vc_last_sequence_number: Default::default(),
+            audio_sender,
+        }
+    }
 }
 
 type Events = (
@@ -155,11 +171,11 @@ pub struct Discord {
 }
 
 impl Discord {
-    pub fn new(token: &str) -> Self {
+    pub fn new(token: &str, sender: Sender<i16>) -> Self {
         Discord {
             token: token.into(),
-            intents: 161789, // 32767,
-            socket: DiscordSockets::default().into(),
+            intents: 161789,
+            socket: DiscordSockets::new(sender).into(),
             profile: RwLockAwait::new(None),
             guild_id_mappings: RwLockAwait::new(HashMap::new()),
             channel_id_mappings: RwLockAwait::new(HashMap::new()),
@@ -245,7 +261,7 @@ impl Messanger for Discord {
 impl Socket for Discord {
     async fn next(self: Arc<Self>) -> Option<SocketEvent> {
         let mut rtp_packet_buff = [0; 1024];
-        let mut decoded_audio = [0; 2048];
+        let mut decoded_audio = [0; 8048];
         let (event, vc_event) = loop {
             let mut socket = self.socket.lock().await;
             let DiscordSockets {
@@ -316,7 +332,7 @@ impl Socket for Discord {
             };
 
             // Pull UDP VC socket
-            let decrypted_payload = if let Some(vc_connection) = socket.vc_connection.as_ref()
+            if let Some(vc_connection) = socket.vc_connection.as_mut()
                 && let Some(description) = vc_connection.description()
             {
                 let n_bytes_in_packet = {
@@ -334,41 +350,45 @@ impl Socket for Discord {
                     }
                 };
 
-                #[derive(PartialEq)]
+                #[derive(Debug, PartialEq)]
                 enum PacketType {
                     Voice,
+                    Unkown1,
                     Unkown,
                 }
 
                 let packet_type = match rtp_packet_buff[1] {
                     0x78 => PacketType::Voice,
+                    201 => PacketType::Unkown1,
                     _ => PacketType::Unkown,
                 };
 
-                if packet_type == PacketType::Unkown {
-                    eprintln!("Unkown packet type on udp");
+                if packet_type != PacketType::Voice {
+                    eprintln!("Unkown packet type on udp: {:?}", rtp_packet_buff[1]);
                     continue;
                 };
 
                 let rtp_packet = RtpPacket::new(&rtp_packet_buff[..n_bytes_in_packet]).unwrap();
+                let is_rtp_extended = rtp_packet.get_extension() != 0;
 
-                let rtp_header_len = if rtp_packet.get_extension() != 0 {
+                let rtp_header_len = if is_rtp_extended {
                     rtp_packet.packet().len() - rtp_packet.payload().len() + 4
                 } else {
+                    println!("None-extended");
                     rtp_packet.packet().len() - rtp_packet.payload().len()
                 };
 
-                let (header, body) = rtp_packet.packet().split_at(rtp_header_len);
+                let (rtp_header, rtp_body) = rtp_packet.packet().split_at(rtp_header_len);
 
                 let mode = description.mode().unwrap();
-                match mode {
+                let decrypted_payload = match mode {
                     EncryptionMode::aead_aes256_gcm_rtpsize => todo!(),
                     EncryptionMode::aead_xchacha20_poly1305_rtpsize => {
-                        let (voice_data, nonce_u32) = body.split_at(body.len() - mode.nonce_size());
+                        let (voice_data, nonce_u32) =
+                            rtp_body.split_at(rtp_body.len() - mode.nonce_size());
 
                         let mut nonce = [0; 24];
                         nonce[..mode.nonce_size()].copy_from_slice(nonce_u32);
-
                         let nonce = crypto_aead::xchacha20poly1305::Nonce::from_bytes(nonce);
 
                         let key = crypto_aead::xchacha20poly1305::Key::from_bytes(
@@ -378,7 +398,7 @@ impl Socket for Discord {
 
                         crypto_aead::xchacha20poly1305::decrypt(
                             voice_data,
-                            Some(header),
+                            Some(rtp_header),
                             &nonce,
                             &key,
                         )
@@ -389,20 +409,37 @@ impl Socket for Discord {
                     EncryptionMode::xsalsa20_poly1305_suffix => todo!("Depricated"),
                     EncryptionMode::xsalsa20_poly1305_lite => todo!("Depricated"),
                     EncryptionMode::xsalsa20_poly1305_lite_rtpsize => todo!("Depricated"),
-                }
+                };
+
+                // let packet = opus::packet::parse(&decrypted_payload[8..]);
+                println!(
+                    "packet_data: {:?}",
+                    opus::packet::get_nb_frames(&decrypted_payload[8..])
+                );
+                println!("Meta-data: {:?}", &decrypted_payload[..8]);
+
+                let n_decoded_bytes = match vc_connection.decoder().decode(
+                    &decrypted_payload[8..],
+                    &mut decoded_audio,
+                    false,
+                ) {
+                    Ok(n_bytes) => n_bytes,
+                    Err(err) => {
+                        eprintln!("{:?}", err);
+                        continue;
+                    }
+                };
+
+                decoded_audio[..n_decoded_bytes]
+                    .iter()
+                    .for_each(|byte| socket.audio_sender.send(*byte).unwrap());
+
+                println!("{:?}", &decoded_audio[..n_decoded_bytes].len());
             } else {
                 drop(socket); // Otherwise it blocks socket for other things on the runtime
                 pending!();
                 continue;
             };
-
-            let vc_connection = socket.vc_connection.as_mut().unwrap();
-            let decoder = vc_connection.decoder();
-            let a = decoder.decode(&decrypted_payload, &mut decoded_audio, true);
-            println!("{a:?}");
-            println!("{:?}", decrypted_payload);
-            println!("{:?}", decoded_audio);
-            panic!("test");
         };
         if let Some(vc_event) = vc_event {
             println!("Executing VC event.");

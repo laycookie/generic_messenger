@@ -3,8 +3,13 @@ use iced::{
     Alignment,
     widget::{Button, Column, ComboBox, Container, TextInput, column, combo_box::State},
 };
-use std::{fmt::Display, sync::Arc};
+use std::{
+    fmt::Display,
+    sync::{Arc, mpsc::Sender},
+};
 use strum::EnumString;
+
+use crate::audio::AudioSampleType;
 
 // TODO: Make adapters handle the functionality of this enum
 #[derive(Debug, Clone, EnumString)]
@@ -21,9 +26,13 @@ impl Display for Platform {
     }
 }
 impl Platform {
-    pub fn to_messanger(&self, auth: String) -> Arc<dyn Messanger> {
+    pub fn to_messanger(
+        &self,
+        auth: &str,
+        output_sender: Sender<AudioSampleType>,
+    ) -> Arc<dyn Messanger> {
         Arc::new(match self {
-            Self::Discord => Discord::new(&auth),
+            Self::Discord => Discord::new(&auth, output_sender),
             Self::Test => {
                 println!("Testing");
                 todo!()
@@ -81,7 +90,11 @@ impl Default for Login {
 }
 
 impl Login {
-    pub(crate) fn update(&mut self, message: Message) -> Action {
+    pub(crate) fn update(
+        &mut self,
+        message: Message,
+        output_sender: Sender<AudioSampleType>,
+    ) -> Action {
         match message {
             Message::ToggleButtonState => {
                 self.button_state = true;
@@ -98,7 +111,7 @@ impl Login {
                 let platform = self.selected_platform.clone();
                 let token = self.token.clone();
 
-                let messanger = platform.to_messanger(token);
+                let messanger = platform.to_messanger(&token, output_sender);
                 return Action::Login(messanger);
             }
         }

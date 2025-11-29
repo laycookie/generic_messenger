@@ -1,18 +1,22 @@
-use crate::{messanger_unifier::Call, pages::login::Message as LoginMessage};
+use crate::{audio::AudioControl, messanger_unifier::Call, pages::login::Message as LoginMessage};
 use adaptors::SocketEvent;
 use auth::MessangersGenerator;
 use futures::{Stream, StreamExt, channel::mpsc::Sender, future::join_all, try_join};
 use iced::{Element, Subscription, Task, window};
 use messanger_unifier::Messangers;
-use pages::{Login, MyAppMessage, messenger::Messenger};
+use pages::{AppMessage, Login, messenger::Messenger};
 use socket::{ReceiverEvent, SocketsInterface};
 
 use crate::messanger_unifier::MessangerHandle;
 
+mod audio;
 mod auth;
 mod messanger_unifier;
 mod pages;
 mod socket;
+
+use tracing::Level;
+use tracing_subscriber::FmtSubscriber;
 
 #[derive(Debug)]
 pub enum Screen {
@@ -22,37 +26,45 @@ pub enum Screen {
 }
 
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (app, is_loading) = match MessangersGenerator::messengers_from_file("./LoginInfo".into()) {
-        Ok(messangers) => {
-            if messangers.len() > 0 {
-                (App::new(messangers, Screen::Loading), true)
-            } else {
-                (
-                    App::new(Messangers::default(), Screen::Login(Login::default())),
-                    false,
-                )
+    // init logger
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::INFO)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    // ETC
+    let audio = AudioControl::new();
+
+    let mut app = App::new(Messangers::default(), Screen::Loading, audio);
+
+    let is_loading =
+        match MessangersGenerator::messengers_from_file("./LoginInfo".into(), &app.audio) {
+            Ok(messangers) => {
+                if messangers.len() > 0 {
+                    app.messangers = messangers;
+                    true
+                } else {
+                    false
+                }
             }
-        }
-        Err(e) => {
-            eprintln!("{e}");
-            // TODO: This will probably not handle the error well.
-            (
-                App::new(Messangers::default(), Screen::Login(Login::default())),
-                false,
-            )
-        }
-    };
+            Err(err) => {
+                // TODO: This will just freeze aplication on loading screen.
+                eprintln!("{err}");
+                app.page = Screen::Login(Login::default());
+                false
+            }
+        };
 
     iced::daemon(App::title(), App::update, App::view)
         .subscription(App::subscription)
         .run_with(move || {
             let (_window_id, window_task) = window::open(window::Settings::default());
+
             (
                 app,
-                window_task.then(move |_| match is_loading {
-                    true => Task::done(MyAppMessage::StartUp),
+                Task::batch(vec![window_task.then(move |_| match is_loading {
+                    true => Task::done(AppMessage::StartUp),
                     false => Task::none(),
-                }),
+                })]),
             )
         })
         .inspect_err(|err| println!("{err}"))?;
@@ -61,14 +73,16 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 struct App {
+    audio: AudioControl,
     page: Screen,
     messangers: Messangers,
     socket_sender: Option<Sender<ReceiverEvent>>,
 }
 
 impl App {
-    fn new(messangers: Messangers, page: Screen) -> Self {
+    fn new(messangers: Messangers, page: Screen, audio: AudioControl) -> Self {
         Self {
+            audio,
             page,
             messangers,
             socket_sender: None,
@@ -78,17 +92,17 @@ impl App {
     fn title() -> &'static str {
         "record"
     }
-    fn update(&mut self, message: MyAppMessage) -> Task<MyAppMessage> {
+    fn update(&mut self, message: AppMessage) -> Task<AppMessage> {
         match message {
-            MyAppMessage::SaveMessengers => {
+            AppMessage::SaveMessengersCredentialToDisk => {
                 MessangersGenerator::messangers_to_file(&self.messangers, "./LoginInfo".into());
                 Task::none()
             }
-            MyAppMessage::RemoveMessanger(handle) => {
+            AppMessage::RemoveMessanger(handle) => {
                 self.messangers.remove_by_handle(handle);
                 Task::none()
             }
-            MyAppMessage::SetMessangerData {
+            AppMessage::SetMessangerData {
                 messanger_handle,
                 new_data,
             } => {
@@ -115,7 +129,7 @@ impl App {
                 };
                 Task::none()
             }
-            MyAppMessage::RemoveMessangerData {
+            AppMessage::RemoveMessangerData {
                 messanger_handle,
                 data_type,
                 data_id,
@@ -132,7 +146,7 @@ impl App {
 
                 Task::none()
             }
-            MyAppMessage::StartUp => {
+            AppMessage::StartUp => {
                 Task::future(join_all(
                     self.messangers
                         .interface_iter()
@@ -164,7 +178,7 @@ impl App {
 
                         // TODO: Make it also clear all messengers
                         // TODO: This might potentially get us stuck on loading screen
-                        return Task::done(MyAppMessage::Login(LoginMessage::ToggleButtonState));
+                        return Task::done(AppMessage::Login(LoginMessage::ToggleButtonState));
                     };
 
                     let tasks_itr = outputs.into_iter().map(|m| {
@@ -172,12 +186,12 @@ impl App {
                             Ok(m) => m,
                             Err((handle, e)) => {
                                 eprintln!("Failed to fetch the data: {e}");
-                                return Task::done(MyAppMessage::RemoveMessanger(handle));
+                                return Task::done(AppMessage::RemoveMessanger(handle));
                             }
                         };
                         let (handle, profile, contacts, conversations, servers) = m.unwrap();
 
-                        Task::done(MyAppMessage::SetMessangerData {
+                        Task::done(AppMessage::SetMessangerData {
                             messanger_handle: handle,
                             new_data: pages::MessangerData::Everything {
                                 profile,
@@ -189,18 +203,18 @@ impl App {
                     });
 
                     Task::batch(tasks_itr)
-                        .chain(Task::done(MyAppMessage::OpenPage(Screen::Chat(
+                        .chain(Task::done(AppMessage::OpenPage(Screen::Chat(
                             Messenger::new(),
                         ))))
-                        .chain(Task::done(MyAppMessage::SaveMessengers))
+                        .chain(Task::done(AppMessage::SaveMessengersCredentialToDisk))
                 })
             }
             // Global Actions
-            MyAppMessage::OpenPage(page) => {
+            AppMessage::OpenPage(page) => {
                 self.page = page;
                 Task::none()
             }
-            MyAppMessage::SocketEvent(event) => match event {
+            AppMessage::SocketEvent(event) => match event {
                 SocketMesg::Connect(socket_connection) => {
                     self.socket_sender = Some(socket_connection.clone());
                     Task::batch(self.messangers.interface_iter().map(|interface| {
@@ -219,10 +233,9 @@ impl App {
                 }
                 SocketMesg::Message((handle, socket_event)) => {
                     match socket_event {
+                        SocketEvent::Skip => println!("Skipped"),
                         SocketEvent::MessageCreated { channel, msg } => {
                             let d = self.messangers.mut_data_from_handle(handle).unwrap();
-                            // println!("{:#?}", d.chats);
-                            // println!("{channel:#?}");
                             match d.chats.get_mut(&channel) {
                                 Some(msgs) => msgs.push(msg),
                                 None => {
@@ -230,18 +243,20 @@ impl App {
                                 }
                             };
                         }
+                        SocketEvent::ChannelCreated { server, channel } => {
+                            todo!()
+                        }
                         SocketEvent::Disconnected => println!("Disconnected"),
-                        SocketEvent::Skip => println!("Skipped"),
                     };
                     Task::none()
                 }
             },
             // ====== Pages ======
-            MyAppMessage::Login(message) => {
+            AppMessage::Login(message) => {
                 let Screen::Login(login) = &mut self.page else {
                     return Task::none();
                 };
-                match login.update(message) {
+                match login.update(message, self.audio.get_sender()) {
                     pages::login::Action::None => Task::none(),
                     pages::login::Action::Login(messenger) => {
                         let handle = self.messangers.add_messanger(messenger);
@@ -257,19 +272,19 @@ impl App {
                                     )))
                                     .unwrap();
                             },
-                            |_| MyAppMessage::StartUp,
+                            |_| AppMessage::StartUp,
                         )
                     }
                 }
             }
-            MyAppMessage::Chat(message) => {
+            AppMessage::Chat(message) => {
                 let Screen::Chat(chat) = &mut self.page else {
                     return Task::none();
                 };
                 match chat.update(message, &self.messangers) {
                     pages::messenger::Action::None => Task::none(),
                     pages::messenger::Action::UpdateChat { handle, kv } => {
-                        Task::done(MyAppMessage::SetMessangerData {
+                        Task::done(AppMessage::SetMessangerData {
                             messanger_handle: handle,
                             new_data: pages::MessangerData::Chat(kv),
                         })
@@ -283,7 +298,7 @@ impl App {
                             channel
                         })
                         .then(move |channel| {
-                            Task::done(MyAppMessage::SetMessangerData {
+                            Task::done(AppMessage::SetMessangerData {
                                 messanger_handle: interface.handle,
                                 new_data: pages::MessangerData::Call(Call::new(
                                     interface.handle,
@@ -306,27 +321,27 @@ impl App {
                         })
                         .then(move |call| {
                             println!("TODO: DISCONNECT CALL");
-                            Task::done(MyAppMessage::RemoveMessangerData {
+                            Task::done(AppMessage::RemoveMessangerData {
                                 messanger_handle: call.handle(),
                                 data_type: pages::MessangerDataType::Call,
                                 data_id: call.id(),
                             })
                         })
                     }
-                    pages::messenger::Action::Run(task) => task.map(MyAppMessage::Chat),
+                    pages::messenger::Action::Run(task) => task.map(AppMessage::Chat),
                 }
             }
         }
     }
-    fn view<'a>(&'a self, _window: window::Id) -> Element<'a, MyAppMessage> {
+    fn view<'a>(&'a self, _window: window::Id) -> Element<'a, AppMessage> {
         match &self.page {
-            Screen::Login(login) => login.view().map(MyAppMessage::Login),
-            Screen::Chat(chat) => chat.view(&self.messangers).map(MyAppMessage::Chat),
+            Screen::Login(login) => login.view().map(AppMessage::Login),
+            Screen::Chat(chat) => chat.view(&self.messangers).map(AppMessage::Chat),
             Screen::Loading => iced::widget::text("Loading").into(),
         }
     }
-    fn subscription(&self) -> Subscription<MyAppMessage> {
-        Subscription::run(spawn_sockets_interface).map(MyAppMessage::SocketEvent)
+    fn subscription(&self) -> Subscription<AppMessage> {
+        Subscription::run(spawn_sockets_interface).map(AppMessage::SocketEvent)
     }
 }
 
@@ -341,8 +356,8 @@ fn spawn_sockets_interface() -> impl Stream<Item = SocketMesg> {
         let (mut interface, sender) = SocketsInterface::new();
         output.try_send(SocketMesg::Connect(sender)).unwrap();
         loop {
-            let a = interface.next().await.unwrap();
-            output.try_send(SocketMesg::Message(a)).unwrap();
+            let msg = interface.next().await.unwrap();
+            output.try_send(SocketMesg::Message(msg)).unwrap();
         }
     })
 }

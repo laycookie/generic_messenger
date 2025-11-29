@@ -284,10 +284,10 @@ impl SessionDescription {
 }
 
 pub(super) struct VCConnection {
-    decoder: opus::Decoder,
     udp: UdpSocket,
     client_ssrc: u32,
     description: Option<SessionDescription>,
+    decoder: opus::Decoder,
 }
 impl VCConnection {
     pub(super) fn decoder(&mut self) -> &mut opus::Decoder {
@@ -304,10 +304,10 @@ impl VCConnection {
 impl VCConnection {
     fn new(udp: UdpSocket, ssrc: u32) -> Self {
         Self {
-            decoder: opus::Decoder::new(48000, opus::Channels::Stereo).unwrap(),
             udp,
             description: None,
             client_ssrc: ssrc,
+            decoder: opus::Decoder::new(48000, opus::Channels::Stereo).unwrap(),
         }
     }
     fn set_description(&mut self, description: SessionDescription) {

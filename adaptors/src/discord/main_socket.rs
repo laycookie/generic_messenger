@@ -19,6 +19,7 @@ use crate::{
 };
 
 /// <https://discord.com/developers/docs/topics/opcodes-and-status-codes#gateway-gateway-opcodes>
+/// <https://docs.discord.food/topics/opcodes-and-status-codes#gateway-opcodes>
 #[repr(u8)]
 #[derive(Debug, Deserialize_repr)]
 pub(crate) enum Opcode {

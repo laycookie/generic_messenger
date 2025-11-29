@@ -72,6 +72,10 @@ pub enum SocketEvent {
         channel: Identifier<()>,
         msg: Identifier<Msg>,
     },
+    ChannelCreated {
+        server: Option<Identifier<()>>,
+        channel: Identifier<Chan>,
+    },
     Disconnected,
     Skip,
 }

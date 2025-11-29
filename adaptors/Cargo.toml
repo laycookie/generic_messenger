@@ -16,6 +16,8 @@ smol = "2.0.2"
 async-trait = "0.1.83"
 macro = { path = "../macro" }
 libsodium-rs = "0.2.1"
+
+symphonia = "0.5.5"
 opus = "0.3.0"
 
 discortp = { version = "0.6.0", features = [ "discord" ] } # Don't really need it

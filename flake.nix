@@ -42,6 +42,7 @@
 
 				  cmake_3_24_3
 
+				  alsa-lib
 				  libopus
 
 				  openssl

@@ -8,14 +8,19 @@ use futures::{
 
 use crate::messanger_unifier::MessangerHandle;
 
-pub enum ReceiverEvent {
-    Connection((MessangerHandle, Option<Weak<dyn Socket + Send + Sync>>)),
-}
-
 struct ActiveStream {
     handle: MessangerHandle,
     socket: Weak<dyn Socket + Send + Sync>,
     fut: Option<Pin<Box<dyn Future<Output = Option<SocketEvent>> + Send>>>,
+}
+impl ActiveStream {
+    fn new(handle: MessangerHandle, socket: Weak<dyn Socket + Send + Sync>) -> Self {
+        Self {
+            handle,
+            socket,
+            fut: None,
+        }
+    }
 }
 impl Debug for ActiveStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -26,14 +31,9 @@ impl Debug for ActiveStream {
             .finish()
     }
 }
-impl ActiveStream {
-    fn new(handle: MessangerHandle, socket: Weak<dyn Socket + Send + Sync>) -> Self {
-        Self {
-            handle,
-            socket,
-            fut: None,
-        }
-    }
+
+pub enum ReceiverEvent {
+    Connection((MessangerHandle, Option<Weak<dyn Socket + Send + Sync>>)),
 }
 
 pub struct SocketsInterface {
@@ -71,7 +71,8 @@ impl Stream for SocketsInterface {
                 }
             }
         };
-        // Prep some stuff pre-pulling events
+
+        // Confirm no streams got closed
         let mut open_streams = Vec::new();
         self.active_streams.retain(|stream| {
             if let Some(socket) = stream.socket.upgrade() {
@@ -80,8 +81,7 @@ impl Stream for SocketsInterface {
             };
             false
         });
-
-        // Pull events
+        // Pull events on streams that are still opened
         for (i, stream) in open_streams.iter().enumerate() {
             if self.active_streams[i].fut.is_none() {
                 self.active_streams[i].fut = Some(stream.clone().next());
@@ -95,7 +95,10 @@ impl Stream for SocketsInterface {
                     cx.waker().wake_by_ref();
                     continue;
                 }
-                Poll::Ready(None) => self.active_streams.remove(i),
+                Poll::Ready(None) => {
+                    eprintln!("Stream {:#?} got closed.", self.active_streams[i].handle);
+                    self.active_streams.remove(i);
+                }
                 Poll::Pending => continue,
             };
         }

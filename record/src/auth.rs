@@ -1,17 +1,18 @@
-use adaptors::{Messanger as Auth, discord::Discord};
 use std::{
     fs::OpenOptions,
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::PathBuf,
     str::FromStr,
-    sync::Arc,
 };
 
-use crate::{messanger_unifier::Messangers, pages::login::Platform};
+use crate::{AudioControl, messanger_unifier::Messangers, pages::login::Platform};
 
 pub struct MessangersGenerator;
 impl MessangersGenerator {
-    pub fn messengers_from_file(path: PathBuf) -> Result<Messangers, Box<dyn std::error::Error>> {
+    pub fn messengers_from_file(
+        path: PathBuf,
+        audio_controler: &AudioControl,
+    ) -> Result<Messangers, Box<dyn std::error::Error>> {
         let auth_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -30,10 +31,13 @@ impl MessangersGenerator {
             };
 
             // In theory should never return false
-            let auth: Arc<dyn Auth> = Arc::new(match Platform::from_str(platform).unwrap() {
-                Platform::Discord => Discord::new(token),
-                Platform::Test => todo!(),
-            });
+            let auth = Platform::from_str(platform)
+                .unwrap()
+                .to_messanger(token, audio_controler.get_sender());
+            // let auth: Arc<dyn Auth> = Arc::new(match Platform::from_str(platform).unwrap() {
+            //     Platform::Discord => Discord::new(token),
+            //     Platform::Test => todo!(),
+            // });
 
             messangers.add_messanger(auth);
         }

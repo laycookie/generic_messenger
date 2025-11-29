@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-	"adaptors",
 	"macro",
-	"record",
+	"adaptors",
 	"widgets",
+	"record",
 ]

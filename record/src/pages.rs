@@ -33,8 +33,10 @@ pub(crate) enum MessangerDataType {
 }
 
 #[derive(Debug)]
-pub(crate) enum MyAppMessage {
+pub(crate) enum AppMessage {
+    // === UI ===
     OpenPage(Screen),
+    // === Control Messenger Obj Data ===
     SetMessangerData {
         messanger_handle: MessangerHandle,
         new_data: MessangerData,
@@ -45,10 +47,12 @@ pub(crate) enum MyAppMessage {
         data_id: ID,
     },
     RemoveMessanger(MessangerHandle),
-    SocketEvent(SocketMesg),
-    SaveMessengers,
+    // === State Managers ===
     StartUp,
+    SaveMessengersCredentialToDisk,
     // === Pages ===
     Login(LoginMessage),
     Chat(MessangerMessage),
+    // === Socket ===
+    SocketEvent(SocketMesg),
 }
