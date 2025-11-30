@@ -9,7 +9,10 @@ use iced::{
     },
 };
 
-use crate::messanger_unifier::{MessangerInterface, Messangers};
+use crate::{
+    components::message_text::message_text,
+    messanger_unifier::{MessangerInterface, Messangers},
+};
 
 #[derive(Debug, Clone)]
 pub struct Chat {
@@ -69,7 +72,7 @@ impl Chat {
                         column![
                             container(Text::from(msg.data.author.data.name.as_str()))
                                 .center_y(image_height),
-                            container(Text::from(msg.data.text.as_str()))
+                            container(message_text(msg.data.text.as_str()))
                         ]
                         .padding(Padding::new(0.0).left(5.0))
                     ]

@@ -15,7 +15,11 @@ use async_tungstenite::{
     async_std::{ConnectStream, connect_async},
     tungstenite::Message as WebSocketMessage,
 };
-use discortp::{Packet, rtp::RtpPacket};
+use discortp::PacketSize;
+use discortp::{
+    Packet,
+    rtp::{RtpExtensionPacket, RtpPacket},
+};
 use futures::{FutureExt, Stream, StreamExt, lock::Mutex, pending, poll};
 use futures_locks::RwLock as RwLockAwait;
 use libsodium_rs::crypto_aead;
@@ -384,7 +388,7 @@ impl Socket for Discord {
                 let decrypted_payload = match mode {
                     EncryptionMode::aead_aes256_gcm_rtpsize => todo!(),
                     EncryptionMode::aead_xchacha20_poly1305_rtpsize => {
-                        let (voice_data, nonce_u32) =
+                        let (voice_payload, nonce_u32) =
                             rtp_body.split_at(rtp_body.len() - mode.nonce_size());
 
                         let mut nonce = [0; 24];
@@ -397,7 +401,7 @@ impl Socket for Discord {
                         .expect("Invalid key length");
 
                         crypto_aead::xchacha20poly1305::decrypt(
-                            voice_data,
+                            voice_payload,
                             Some(rtp_header),
                             &nonce,
                             &key,
@@ -411,24 +415,20 @@ impl Socket for Discord {
                     EncryptionMode::xsalsa20_poly1305_lite_rtpsize => todo!("Depricated"),
                 };
 
-                // let packet = opus::packet::parse(&decrypted_payload[8..]);
-                println!(
-                    "packet_data: {:?}",
-                    opus::packet::get_nb_frames(&decrypted_payload[8..])
-                );
-                println!("Meta-data: {:?}", &decrypted_payload[..8]);
+                // <https://datatracker.ietf.org/doc/html/rfc6464>
+                let (potentially, voice_data) = decrypted_payload.split_at(8);
 
-                let n_decoded_bytes = match vc_connection.decoder().decode(
-                    &decrypted_payload[8..],
-                    &mut decoded_audio,
-                    false,
-                ) {
-                    Ok(n_bytes) => n_bytes,
-                    Err(err) => {
-                        eprintln!("{:?}", err);
-                        continue;
-                    }
-                };
+                let n_decoded_bytes =
+                    match vc_connection
+                        .decoder()
+                        .decode(voice_data, &mut decoded_audio, false)
+                    {
+                        Ok(n_bytes) => n_bytes,
+                        Err(err) => {
+                            eprintln!("{:?}", err);
+                            continue;
+                        }
+                    };
 
                 decoded_audio[..n_decoded_bytes]
                     .iter()

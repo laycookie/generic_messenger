@@ -11,6 +11,7 @@ use crate::messanger_unifier::MessangerHandle;
 
 mod audio;
 mod auth;
+mod components;
 mod messanger_unifier;
 mod pages;
 mod socket;

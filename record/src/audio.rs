@@ -1,15 +1,12 @@
-use std::{
-    sync::{
-        Arc, Mutex,
-        mpsc::{self, Sender},
-    },
-    time::{SystemTime, UNIX_EPOCH},
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{self, Sender},
 };
 
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{
     StaticRb,
-    traits::{Consumer, Observer, Producer, RingBuffer},
+    traits::{Consumer, RingBuffer},
 };
 use tracing::info;
 
@@ -51,17 +48,11 @@ impl AudioControl {
                     &config,
                     move |data: &mut [AudioSampleType], _| {
                         let rx = rx.lock().unwrap();
+                        // println!("{data:?}");
 
                         while let Ok(sample) = rx.try_recv() {
                             rb.push_overwrite(sample);
                         }
-
-                        let a = rb.occupied_len();
-
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis();
                         for (i, sample) in data.iter_mut().enumerate() {
                             // *sample = rx.try_recv().unwrap_or(0);
 
@@ -79,7 +70,7 @@ impl AudioControl {
                             //     }
                             // };
                         }
-                        println!("cpal buffer: {:?}", data.len());
+                        // println!("cpal buffer: {:?}", data.len());
                     },
                     move |err| {
                         eprintln!("{err:?}");
@@ -87,6 +78,8 @@ impl AudioControl {
                     None,
                 )
                 .unwrap();
+
+            a.play().unwrap();
             audio_settings.output_stream = Some(a);
         }
         if let Some(input) = host.default_input_device() {
