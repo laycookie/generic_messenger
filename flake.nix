@@ -45,6 +45,8 @@
 				  alsa-lib
 				  libopus
 
+				  fontconfig
+
 				  openssl
 				  pkg-config
     		    ];

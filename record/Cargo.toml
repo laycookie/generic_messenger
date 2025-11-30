@@ -14,6 +14,8 @@ cpal = "0.16.0"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
 
+# fontconfig = "0.10.0"
+font-kit = "0.14.3"
 nom = "8.0.0"
 
 ringbuf = "0.4.8"
