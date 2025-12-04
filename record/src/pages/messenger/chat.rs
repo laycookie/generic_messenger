@@ -69,12 +69,7 @@ impl Chat {
                     let image_height = Length::Fixed(36.0);
                     row![
                         image(&icon).height(image_height),
-                        column![
-                            container(Text::from(msg.data.author.data.name.as_str()))
-                                .center_y(image_height),
-                            container(message_text(msg.data.text.as_str()))
-                        ]
-                        .padding(Padding::new(0.0).left(5.0))
+                        container(message_text(msg)).padding(Padding::new(0.0).left(5.0))
                     ]
                 })
                 .fold(Column::new().spacing(15.0), |column, widget| {

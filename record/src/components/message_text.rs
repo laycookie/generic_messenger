@@ -1,10 +1,14 @@
+use adaptors::types::{Identifier, Msg};
 use iced::{
     Color, Element, Font,
     advanced::graphics::core::font,
-    widget::text::{Rich, Span},
+    widget::{
+        Button, Row, Text, column, rich_text, row,
+        text::{Rich, Span},
+    },
 };
 use nom::{
-    IResult, Parser,
+    AsChar, IResult, Parser,
     branch::alt,
     bytes::complete::{tag, tag_no_case, take_until},
     character::complete::{alphanumeric1, one_of},
@@ -55,10 +59,14 @@ where
     }
 }
 
-pub fn message_text<'a, M: Clone + 'static>(text: &'a str) -> Element<'a, M> {
+pub fn message_text<'a, M: Clone + 'static>(msg: &'a Identifier<Msg>) -> Element<'a, M> {
+    // === Author ===
+    let author = Text::from(msg.author.name.as_str());
+
+    // === Create Message text box ===
     let mut spans = Vec::new();
 
-    let mut text_left = text;
+    let mut text_left = msg.text.as_str();
     while let Ok((text_span, (left, special_markdown))) =
         until_parser(alt((url_parser, bold_parser))).parse(text_left)
     {
@@ -76,5 +84,16 @@ pub fn message_text<'a, M: Clone + 'static>(text: &'a str) -> Element<'a, M> {
     }
     spans.push(Span::new(text_left));
 
-    Rich::from_iter(spans).into()
+    let message = Rich::from_iter(spans);
+
+    // === Reactions ===
+    let reactions = Row::from_iter(msg.reactions.iter().map(|reaction| {
+        Button::new(row![
+            Rich::with_spans([Span::new(reaction.emoji)]),
+            Text::new(reaction.count)
+        ])
+        .into()
+    }));
+
+    column![author, message, reactions].into()
 }

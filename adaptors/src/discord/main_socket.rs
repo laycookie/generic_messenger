@@ -186,6 +186,7 @@ impl GatewayPayload<Opcode> {
                                         },
                                     },
                                     text,
+                                    reactions: Vec::new(),
                                 },
                             },
                         });

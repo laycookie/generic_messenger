@@ -110,8 +110,8 @@ pub struct CountDetails {
 
 #[derive(Deserialize, Debug)]
 pub struct Emoji {
-    // id: Option<String>,
-    // name: String,
+    pub id: Option<String>,
+    pub name: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -119,9 +119,9 @@ pub struct Reaction {
     // burst_colors: Vec<String>,
     // burst_count: u32,
     // burst_me: bool,
-    // count: u32,
+    pub count: u32,
     // count_details: CountDetails,
-    // emoji: Emoji,
+    pub emoji: Emoji,
     // me: bool,
     // me_burst: bool,
 }
@@ -141,7 +141,7 @@ pub struct Message {
     // mention_roles: Vec<String>,
     // mentions: Vec<String>,
     // pinned: bool,
-    // reactions: Option<Vec<Reaction>>,
+    pub reactions: Option<Vec<Reaction>>,
     // timestamp: String,
     // tts: bool,
     // type: u32,

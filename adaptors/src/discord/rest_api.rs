@@ -1,8 +1,8 @@
 use crate::{
     MessangerQuery, ParameterizedMessangerQuery,
-    discord::json_structs,
+    discord::json_structs::{self},
     network::{cache_download, http_request},
-    types::{Chan, ChanType, Identifier, Msg, Server, Usr},
+    types::{Chan, ChanType, Identifier, Msg, Reaction, Server, Usr},
 };
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -312,6 +312,18 @@ impl ParameterizedMessangerQuery for Discord {
                     path.exists().then_some(path)
                 });
 
+                let reactions = message
+                    .reactions
+                    .unwrap_or(Vec::new())
+                    .iter()
+                    .map(|reaction| {
+                        Reaction {
+                            emoji: reaction.emoji.name.chars().next().unwrap(), // TODO: Will break
+                            count: reaction.count,
+                        }
+                    })
+                    .collect();
+
                 Discord::identifier_generator(
                     message.id.as_str(),
                     Msg {
@@ -323,6 +335,7 @@ impl ParameterizedMessangerQuery for Discord {
                             },
                         ),
                         text: message.content,
+                        reactions,
                     },
                 )
             })

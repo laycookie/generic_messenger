@@ -15,6 +15,13 @@ pub struct Usr {
 pub struct Msg {
     pub author: Identifier<Usr>,
     pub text: String,
+    pub reactions: Vec<Reaction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Reaction {
+    pub emoji: char,
+    pub count: u32,
 }
 
 #[derive(Debug, Clone)]
