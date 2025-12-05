@@ -49,7 +49,7 @@ where
             Err(err) => err,
         };
 
-        for (i, _) in input.chars().enumerate().skip(1) {
+        for (i, _) in input.char_indices().skip(1) {
             if let Ok((left, parsed)) = parser.parse(&input[i..]) {
                 return Ok((&input[..i], (left, parsed)));
             }
