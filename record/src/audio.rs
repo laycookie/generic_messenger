@@ -8,13 +8,10 @@ use ringbuf::{
     StaticRb,
     traits::{Consumer, RingBuffer},
 };
-use rodio::{OutputStream, OutputStreamBuilder, Sink, buffer::SamplesBuffer};
 use tracing::info;
 
 pub type AudioSampleType = i16;
 pub(super) struct AudioControl {
-    rodio: OutputStream,
-    //
     output_sender: Sender<AudioSampleType>,
     output_reciver: Arc<Mutex<mpsc::Receiver<AudioSampleType>>>,
     input_device: Option<cpal::Device>,
@@ -23,12 +20,9 @@ pub(super) struct AudioControl {
 
 impl AudioControl {
     pub fn new() -> Self {
-        let stream_handle = OutputStreamBuilder::open_default_stream().unwrap();
-
         let (output_sender, output_reciver) = mpsc::channel();
 
         let mut audio_settings = AudioControl {
-            rodio: stream_handle,
             output_sender,
             output_reciver: Arc::new(Mutex::new(output_reciver)),
             input_device: Default::default(),
@@ -47,7 +41,6 @@ impl AudioControl {
             config.buffer_size = cpal::BufferSize::Default;
             info!("{config:?}");
 
-            let sink = Sink::connect_new(&audio_settings.rodio.mixer());
             // let mut rb = StaticRb::<i16, 2560>::default();
 
             let a = output
