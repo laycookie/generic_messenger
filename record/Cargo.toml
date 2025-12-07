@@ -9,7 +9,10 @@ iced = { version = "0.13.1",  features = ["image", "advanced", "lazy"] }
 strum = { version = "0.27.1", features = ["derive"] }
 futures = "0.3.31"
 widgets = { path = "../widgets" }
+
 cpal = "0.16.0"
+rodio = "0.21.1"
+hound = "3.5.1"
 
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"

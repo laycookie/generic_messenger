@@ -15,11 +15,7 @@ use async_tungstenite::{
     async_std::{ConnectStream, connect_async},
     tungstenite::Message as WebSocketMessage,
 };
-use discortp::PacketSize;
-use discortp::{
-    Packet,
-    rtp::{RtpExtensionPacket, RtpPacket},
-};
+use discortp::{Packet, rtp::RtpPacket};
 use futures::{FutureExt, Stream, StreamExt, lock::Mutex, pending, poll};
 use futures_locks::RwLock as RwLockAwait;
 use libsodium_rs::crypto_aead;
@@ -363,7 +359,7 @@ impl Socket for Discord {
 
                 let packet_type = match rtp_packet_buff[1] {
                     0x78 => PacketType::Voice,
-                    201 => PacketType::Unkown1,
+                    0xc9 => PacketType::Unkown1,
                     _ => PacketType::Unkown,
                 };
 
@@ -414,11 +410,36 @@ impl Socket for Discord {
                     EncryptionMode::xsalsa20_poly1305_lite => todo!("Depricated"),
                     EncryptionMode::xsalsa20_poly1305_lite_rtpsize => todo!("Depricated"),
                 };
+                println!();
 
                 // <https://datatracker.ietf.org/doc/html/rfc6464>
                 let (potentially, voice_data) = decrypted_payload.split_at(8);
+                let unkown_const = &potentially[..1]; // CONST 55
+                let timecode_unkown = &potentially[1..4]; // Timecode
+                let unkown_const_2 = &potentially[4..5]; // CONST 16
+                let avrage_volume = &potentially[5..6]; // Avrage volume of the frame?
+                let unkown_const_3 = &potentially[6..7]; // CONST 144
+                let channels = &potentially[7..]; // Channels?
+                if unkown_const != [50] {
+                    eprintln!("ANOMOLY const1");
+                }
+                if unkown_const_2 != [16] {
+                    eprintln!("ANOMOLY const2");
+                }
+                if unkown_const_3 != [144] {
+                    eprintln!("ANOMOLY const2");
+                }
+                // println!("timecode: {:?}", timecode_unkown);
+                // println!("Avrage volume: {:?}", avrage_volume[0] as i8);
+                // println!("Channels: {:?}", channels);
+                // println!("{:?}", potentially);
+                // println!();
 
-                let n_decoded_bytes =
+                // let out = Vec::new();
+
+                println!("{:?}", voice_data);
+                println!("{:?}", voice_data.len());
+                let n_decoded_samples =
                     match vc_connection
                         .decoder()
                         .decode(voice_data, &mut decoded_audio, false)
@@ -430,11 +451,12 @@ impl Socket for Discord {
                         }
                     };
 
-                decoded_audio[..n_decoded_bytes]
+                // if channels[0] != 0 {
+                decoded_audio[..(2 * n_decoded_samples)]
                     .iter()
                     .for_each(|byte| socket.audio_sender.send(*byte).unwrap());
-
-                println!("{:?}", &decoded_audio[..n_decoded_bytes].len());
+                // }
+                println!("{:?}", &decoded_audio[..(2 * n_decoded_samples)].len());
             } else {
                 drop(socket); // Otherwise it blocks socket for other things on the runtime
                 pending!();
