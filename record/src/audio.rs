@@ -49,14 +49,6 @@ impl AudioControl {
 
             let sink = Sink::connect_new(&audio_settings.rodio.mixer());
             // let mut rb = StaticRb::<i16, 2560>::default();
-            let spec = hound::WavSpec {
-                channels: 2,
-                sample_rate: 48000,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
-            };
-
-            let mut writer = hound::WavWriter::create("output.wav", spec).unwrap();
 
             let a = output
                 .build_output_stream(
@@ -66,31 +58,8 @@ impl AudioControl {
                         // println!("{data:?}");
 
                         for (i, sample) in data.iter_mut().enumerate() {
-                            let sample_recv = match rx.try_recv() {
-                                Ok(sample) => {
-                                    writer.write_sample(sample).unwrap();
-                                    sample
-                                }
-                                Err(_) => 0,
-                            };
-                            *sample = sample_recv;
-                            // *sample = rx.try_recv().unwrap_or(0);
-
-                            // *sample = rb.try_pop().unwrap_or(0);
+                            *sample = rx.try_recv().unwrap_or(0);
                         }
-
-                        // while let Ok(sample) = rx.try_recv() {
-                        //     rb.push(sample);
-                        // }
-                        // let samples_f32 = rb
-                        //     .iter()
-                        //     .map(|s| *s as f32 / i16::MAX as f32)
-                        //     .collect::<Vec<f32>>();
-
-                        // let bf = SamplesBuffer::new(2, 48_000, samples_f32);
-                        // sink.append(bf);
-                        // rb.clear();
-                        // println!("cpal buffer: {:?}", data.len());
                     },
                     move |err| {
                         eprintln!("{err:?}");
