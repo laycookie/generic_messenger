@@ -42,6 +42,7 @@ impl AudioControl {
             info!("{config:?}");
 
             // let mut rb = StaticRb::<i16, 2560>::default();
+            let mut rb = StaticRb::<i16, 5120>::default();
 
             let a = output
                 .build_output_stream(
@@ -50,8 +51,12 @@ impl AudioControl {
                         let rx = rx.lock().unwrap();
                         // println!("{data:?}");
 
+                        while let Ok(sample) = rx.try_recv() {
+                            rb.push_overwrite(sample);
+                        }
+
                         for (i, sample) in data.iter_mut().enumerate() {
-                            *sample = rx.try_recv().unwrap_or(0);
+                            *sample = rb.try_pop().unwrap_or(0);
                         }
                     },
                     move |err| {

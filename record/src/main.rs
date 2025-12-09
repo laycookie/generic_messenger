@@ -1,12 +1,11 @@
-use std::{borrow::Cow, fs, rc::Rc};
+use std::borrow::Cow;
 
 use crate::{audio::AudioControl, messanger_unifier::Call, pages::login::Message as LoginMessage};
 use adaptors::SocketEvent;
 use auth::MessangersGenerator;
 use font_kit::{family_name::FamilyName, source::SystemSource};
-// use fontconfig::Fontconfig;
 use futures::{Stream, StreamExt, channel::mpsc::Sender, future::join_all, try_join};
-use iced::{Element, Font, Subscription, Task, window};
+use iced::{Element, Subscription, Task, window};
 use messanger_unifier::Messangers;
 use pages::{AppMessage, Login, messenger::Messenger};
 use socket::{ReceiverEvent, SocketsInterface};
@@ -20,7 +19,7 @@ mod messanger_unifier;
 mod pages;
 mod socket;
 
-use tracing::{Level, info};
+use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Debug)]
@@ -37,27 +36,6 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
     // ETC
-    let audio = AudioControl::new();
-
-    let mut app = App::new(Messangers::default(), Screen::Loading, audio);
-
-    let is_loading =
-        match MessangersGenerator::messengers_from_file("./LoginInfo".into(), &app.audio) {
-            Ok(messangers) => {
-                if messangers.len() > 0 {
-                    app.messangers = messangers;
-                    true
-                } else {
-                    false
-                }
-            }
-            Err(err) => {
-                // TODO: This will just freeze aplication on loading screen.
-                eprintln!("{err}");
-                app.page = Screen::Login(Login::default());
-                false
-            }
-        };
 
     let fonts_handle = SystemSource::new()
         .select_best_match(&[FamilyName::SansSerif], &Default::default())
@@ -65,23 +43,13 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let font_data = fonts_handle.load().unwrap().copy_font_data().unwrap();
     let sytem_font = font_data.as_ref().clone().leak();
 
-    iced::daemon(App::title(), App::update, App::view)
+    iced::daemon(App::boot, App::update, App::view)
         .settings(iced::Settings {
             fonts: vec![Cow::Borrowed(sytem_font)],
             ..Default::default()
         })
         .subscription(App::subscription)
-        .run_with(move || {
-            let (_window_id, window_task) = window::open(window::Settings::default());
-
-            (
-                app,
-                Task::batch(vec![window_task.then(move |_| match is_loading {
-                    true => Task::done(AppMessage::StartUp),
-                    false => Task::none(),
-                })]),
-            )
-        })
+        .run()
         .inspect_err(|err| println!("{err}"))?;
 
     Ok(())
@@ -104,8 +72,37 @@ impl App {
         }
     }
 
-    fn title() -> &'static str {
-        "record"
+    fn boot() -> (Self, Task<AppMessage>) {
+        let audio = AudioControl::new();
+
+        let mut app = App::new(Messangers::default(), Screen::Loading, audio);
+
+        let is_loading =
+            match MessangersGenerator::messengers_from_file("./LoginInfo".into(), &app.audio) {
+                Ok(messangers) => {
+                    if messangers.len() > 0 {
+                        app.messangers = messangers;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Err(err) => {
+                    // TODO: This will just freeze aplication on loading screen.
+                    eprintln!("{err}");
+                    app.page = Screen::Login(Login::default());
+                    false
+                }
+            };
+
+        let (_window_id, window_task) = window::open(window::Settings::default());
+        (
+            app,
+            Task::batch(vec![window_task.then(move |_| match is_loading {
+                true => Task::done(AppMessage::StartUp),
+                false => Task::none(),
+            })]),
+        )
     }
     fn update(&mut self, message: AppMessage) -> Task<AppMessage> {
         match message {
@@ -367,12 +364,12 @@ enum SocketMesg {
 }
 
 fn spawn_sockets_interface() -> impl Stream<Item = SocketMesg> {
-    iced::stream::channel(128, |mut output| async move {
+    iced::task::sipper(|mut output| async move {
         let (mut interface, sender) = SocketsInterface::new();
-        output.try_send(SocketMesg::Connect(sender)).unwrap();
+        output.send(SocketMesg::Connect(sender)).await;
         loop {
             let msg = interface.next().await.unwrap();
-            output.try_send(SocketMesg::Message(msg)).unwrap();
+            output.send(SocketMesg::Message(msg)).await;
         }
     })
 }

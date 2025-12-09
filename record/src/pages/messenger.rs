@@ -239,7 +239,7 @@ impl Messenger {
             };
             row![
                 sidebar,
-                divider::Divider::new(10.0, size.height, Message::DividerChange),
+                // divider::Divider::new(10.0, size.height, Message::DividerChange),
                 main
             ]
             .into()

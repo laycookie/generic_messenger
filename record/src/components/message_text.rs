@@ -3,12 +3,12 @@ use iced::{
     Color, Element, Font,
     advanced::graphics::core::font,
     widget::{
-        Button, Row, Text, column, rich_text, row,
+        Button, Row, Text, column, row,
         text::{Rich, Span},
     },
 };
 use nom::{
-    AsChar, IResult, Parser,
+    IResult, Parser,
     branch::alt,
     bytes::complete::{tag, tag_no_case, take_until},
     character::complete::{alphanumeric1, one_of},
@@ -59,12 +59,15 @@ where
     }
 }
 
+#[derive(Clone)]
+enum Link {}
+
 pub fn message_text<'a, M: Clone + 'static>(msg: &'a Identifier<Msg>) -> Element<'a, M> {
     // === Author ===
     let author = Text::from(msg.author.name.as_str());
 
     // === Create Message text box ===
-    let mut spans = Vec::new();
+    let mut spans: std::vec::Vec<iced::advanced::text::Span<'_, Link>> = Vec::new();
 
     let mut text_left = msg.text.as_str();
     while let Ok((text_span, (left, special_markdown))) =
@@ -74,7 +77,7 @@ pub fn message_text<'a, M: Clone + 'static>(msg: &'a Identifier<Msg>) -> Element
             spans.push(Span::new(text_span));
         }
         spans.push(match special_markdown {
-            MarkdownText::Link(link) => Span::new(link).color(Color::new(0.0, 0.0, 1.0, 1.0)),
+            MarkdownText::Link(link) => Span::new(link).color(Color::from_rgb(0.0, 0.0, 1.0)),
             MarkdownText::Bold(text) => Span::new(text).font(Font {
                 weight: font::Weight::Bold,
                 ..Default::default()
@@ -89,7 +92,7 @@ pub fn message_text<'a, M: Clone + 'static>(msg: &'a Identifier<Msg>) -> Element
     // === Reactions ===
     let reactions = Row::from_iter(msg.reactions.iter().map(|reaction| {
         Button::new(row![
-            Rich::with_spans([Span::new(reaction.emoji)]),
+            Rich::with_spans([Span::<Link>::new(reaction.emoji)]),
             Text::new(reaction.count)
         ])
         .into()

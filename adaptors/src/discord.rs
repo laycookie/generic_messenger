@@ -444,7 +444,7 @@ impl Socket for Discord {
                         .decoder()
                         .decode(voice_data, &mut decoded_audio, false)
                     {
-                        Ok(n_bytes) => n_bytes,
+                        Ok(n_samples) => n_samples,
                         Err(err) => {
                             eprintln!("{:?}", err);
                             continue;

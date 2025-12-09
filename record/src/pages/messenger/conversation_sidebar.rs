@@ -107,7 +107,7 @@ impl Sidebar {
             ])
             .height(Length::Fill),
         ]
-        .push_maybe(panel)
+        .push(panel)
         .width(self.width)
         .into()
     }
