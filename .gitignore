@@ -3,3 +3,5 @@
 LoginInfo
 
 /.idea
+
+cargo.lock
