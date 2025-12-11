@@ -3,79 +3,160 @@ use std::sync::{
     mpsc::{self, Sender},
 };
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{
+    Sample, SampleFormat, SampleRate,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+};
+use crossbeam::atomic::AtomicCell;
 use ringbuf::{
     StaticRb,
-    traits::{Consumer, RingBuffer},
+    traits::{Consumer as _, Split},
+    wrap::caching::Caching,
 };
 use tracing::info;
 
-pub type AudioSampleType = i16;
-pub(super) struct AudioControl {
-    output_sender: Sender<AudioSampleType>,
-    output_reciver: Arc<Mutex<mpsc::Receiver<AudioSampleType>>>,
-    input_device: Option<cpal::Device>,
-    output_stream: Option<cpal::Stream>,
-}
-
-impl AudioControl {
-    pub fn new() -> Self {
-        let (output_sender, output_reciver) = mpsc::channel();
-
-        let mut audio_settings = AudioControl {
-            output_sender,
-            output_reciver: Arc::new(Mutex::new(output_reciver)),
-            input_device: Default::default(),
-            output_stream: Default::default(),
-        };
-
-        let host = cpal::default_host();
-        if let Some(output) = host.default_output_device() {
-            let rx = audio_settings.output_reciver.clone();
-
-            let config = output.default_output_config().unwrap();
-            let mut config = config.config();
-            // TODO: Remove those
-            config.sample_rate = cpal::SampleRate(48000);
-            config.channels = 2;
-            config.buffer_size = cpal::BufferSize::Default;
-            info!("{config:?}");
-
-            // let mut rb = StaticRb::<i16, 2560>::default();
-            let mut rb = StaticRb::<i16, 5120>::default();
-
-            let a = output
-                .build_output_stream(
-                    &config,
-                    move |data: &mut [AudioSampleType], _| {
-                        let rx = rx.lock().unwrap();
-                        // println!("{data:?}");
-
-                        while let Ok(sample) = rx.try_recv() {
-                            rb.push_overwrite(sample);
-                        }
-
-                        for (i, sample) in data.iter_mut().enumerate() {
-                            *sample = rb.try_pop().unwrap_or(0);
-                        }
-                    },
-                    move |err| {
-                        eprintln!("{err:?}");
-                    },
-                    None,
-                )
-                .unwrap();
-
-            a.play().unwrap();
-            audio_settings.output_stream = Some(a);
-        }
-        if let Some(input) = host.default_input_device() {
-            audio_settings.input_device = Some(input);
-        }
-
-        audio_settings
-    }
-    pub fn get_sender(&self) -> Sender<AudioSampleType> {
-        self.output_sender.clone()
-    }
-}
+// ===============================
+// struct Producer<const N: usize> {
+//     producer: Caching<
+//         ringbuf::Arc<
+//             ringbuf::SharedRb<
+//                 ringbuf::storage::Owning<[std::mem::MaybeUninit<AudioSampleType>; N]>,
+//             >,
+//         >,
+//         true,
+//         false,
+//     >,
+//     active: Arc<AtomicCell<bool>>,
+// }
+// impl<const N: usize> Drop for Producer<N> {
+//     fn drop(&mut self) {
+//         self.active.store(false);
+//     }
+// }
+// struct Consumer<const N: usize> {
+//     consumer: Caching<
+//         ringbuf::Arc<
+//             ringbuf::SharedRb<
+//                 ringbuf::storage::Owning<[std::mem::MaybeUninit<AudioSampleType>; N]>,
+//             >,
+//         >,
+//         false,
+//         true,
+//     >,
+//     active: Arc<AtomicCell<bool>>,
+// }
+//
+// struct Channel<const N: usize> {
+//     channel_mode: u8,
+//     sample_format: SampleFormat,
+//     sample_rate: SampleRate,
+//     effects: f32,
+//     sample_consumer: Consumer<N>,
+// }
+// impl<const N: usize> Channel<N> {
+//     fn new(
+//         channel_mode: u8,
+//         sample_format: SampleFormat,
+//         sample_rate: SampleRate,
+//     ) -> (Channel<N>, Producer<N>) {
+//         let buffer = StaticRb::default();
+//         let (producer, consumer) = buffer.split();
+//
+//         let active = Arc::new(AtomicCell::new(true));
+//
+//         (
+//             Self {
+//                 channel_mode,
+//                 sample_format,
+//                 sample_rate,
+//                 effects: 1.0,
+//                 sample_consumer: Consumer {
+//                     active: active.clone(),
+//                     consumer,
+//                 },
+//             },
+//             Producer { producer, active },
+//         )
+//     }
+// }
+//
+// // ==================================
+//
+// pub type AudioSampleType = f32;
+// pub struct AudioMixer {
+//     // Devices Selected
+//     input_device: Option<cpal::Device>,
+//     output_device: Option<cpal::Device>,
+//     // Streams
+//     output_stream: Option<cpal::Stream>,
+//     // Mixer
+//     channels: Arc<Mutex<Vec<Channel<5120>>>>,
+//
+//     // === Lagacy ===
+//     output_sender: Sender<AudioSampleType>,
+//     output_reciver: Arc<Mutex<mpsc::Receiver<AudioSampleType>>>,
+// }
+//
+// impl AudioMixer {
+//     pub fn new() -> Self {
+//         let (output_sender, output_reciver) = mpsc::channel();
+//
+//         let mut audio_mixer = AudioMixer {
+//             output_sender,
+//             output_reciver: Arc::new(Mutex::new(output_reciver)),
+//             input_device: Default::default(),
+//             output_device: Default::default(),
+//             output_stream: Default::default(),
+//             channels: Arc::new(Mutex::new(Vec::new())),
+//         };
+//
+//         let host = cpal::default_host();
+//         if let Some(output) = host.default_output_device() {
+//             audio_mixer.output_device = Some(output);
+//         }
+//         if let Some(input) = host.default_input_device() {
+//             audio_mixer.input_device = Some(input);
+//         }
+//
+//         audio_mixer
+//     }
+//     fn channel<S: Sample>(
+//         &self,
+//         channel_mode: u8,
+//         sample_format: SampleFormat,
+//         sample_rate: SampleRate,
+//     ) -> Producer<5120> {
+//         let (channel, producer) = Channel::new(channel_mode, sample_format, sample_rate);
+//         self.channels.lock().unwrap().push(channel);
+//
+//         if let None = self.output_stream
+//             && let Some(output) = &self.output_device
+//         {
+//             let config = output.default_output_config().unwrap();
+//             let config = config.config();
+//
+//             let channels = self.channels.clone();
+//             let stream = output
+//                 .build_output_stream(
+//                     &config,
+//                     move |data: &mut [AudioSampleType], _| {
+//                         let locekd = channels.lock().unwrap();
+//                         println!("{:?}", locekd.len());
+//                         // println!("{data:?}");
+//                     },
+//                     move |err| {
+//                         eprintln!("{err:?}");
+//                     },
+//                     None,
+//                 )
+//                 .unwrap();
+//
+//             stream.play().unwrap();
+//         };
+//
+//         producer
+//     }
+//     // pub fn get_sender(&self) -> Sender<AudioSampleType> {
+//     //     self.output_sender.clone()
+//     // }
+// }

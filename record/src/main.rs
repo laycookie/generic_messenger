@@ -1,6 +1,10 @@
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    sync::{Arc, Mutex},
+};
 
-use crate::{audio::AudioControl, messanger_unifier::Call, pages::login::Message as LoginMessage};
+use crate::{messanger_unifier::Call, pages::login::Message as LoginMessage};
+use ::audio::AudioMixer;
 use adaptors::SocketEvent;
 use auth::MessangersGenerator;
 use font_kit::{family_name::FamilyName, source::SystemSource};
@@ -56,14 +60,14 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 struct App {
-    audio: AudioControl,
+    audio: Arc<Mutex<AudioMixer>>,
     page: Screen,
     messangers: Messangers,
     socket_sender: Option<Sender<ReceiverEvent>>,
 }
 
 impl App {
-    fn new(messangers: Messangers, page: Screen, audio: AudioControl) -> Self {
+    fn new(messangers: Messangers, page: Screen, audio: Arc<Mutex<AudioMixer>>) -> Self {
         Self {
             audio,
             page,
@@ -73,7 +77,7 @@ impl App {
     }
 
     fn boot() -> (Self, Task<AppMessage>) {
-        let audio = AudioControl::new();
+        let audio = Arc::new(Mutex::new(AudioMixer::new()));
 
         let mut app = App::new(Messangers::default(), Screen::Loading, audio);
 
@@ -268,7 +272,7 @@ impl App {
                 let Screen::Login(login) = &mut self.page else {
                     return Task::none();
                 };
-                match login.update(message, self.audio.get_sender()) {
+                match login.update(message, &self.audio) {
                     pages::login::Action::None => Task::none(),
                     pages::login::Action::Login(messenger) => {
                         let handle = self.messangers.add_messanger(messenger);

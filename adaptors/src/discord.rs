@@ -4,7 +4,7 @@ use std::{
     future::poll_fn,
     hash::{DefaultHasher, Hash, Hasher},
     pin::pin,
-    sync::{Arc, Weak, mpsc::Sender},
+    sync::{Arc, Mutex, Weak},
     task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -15,8 +15,9 @@ use async_tungstenite::{
     async_std::{ConnectStream, connect_async},
     tungstenite::Message as WebSocketMessage,
 };
+use audio::AudioMixer;
 use discortp::{Packet, rtp::RtpPacket};
-use futures::{FutureExt, Stream, StreamExt, lock::Mutex, pending, poll};
+use futures::{FutureExt, Stream, StreamExt, lock::Mutex as AsyncMutex, pending, poll};
 use futures_locks::RwLock as RwLockAwait;
 use libsodium_rs::crypto_aead;
 use serde::Deserialize;
@@ -66,10 +67,17 @@ struct DiscordSockets {
     vc_connection: Option<VCConnection>,
     vc_last_sequence_number: Option<usize>,
 
-    audio_sender: Sender<i16>,
+    audio_mixer: Arc<Mutex<AudioMixer>>,
+
+    audio_thingy: HashMap<u32, audio::Producer<5120>>,
 }
+
+type Events = (
+    Option<GatewayPayload<Opcode>>,
+    Option<GatewayPayload<VCOpcode>>,
+);
 impl DiscordSockets {
-    fn new(audio_sender: Sender<i16>) -> Self {
+    fn new(audio_mixer: Arc<Mutex<AudioMixer>>) -> Self {
         Self {
             gateway_websocket: Default::default(),
             heart_beating: Default::default(),
@@ -79,16 +87,11 @@ impl DiscordSockets {
             vc_location: Default::default(),
             vc_connection: Default::default(),
             vc_last_sequence_number: Default::default(),
-            audio_sender,
+            audio_mixer,
+            audio_thingy: Default::default(),
         }
     }
-}
 
-type Events = (
-    Option<GatewayPayload<Opcode>>,
-    Option<GatewayPayload<VCOpcode>>,
-);
-impl DiscordSockets {
     fn nuke_main_gateway(&mut self) {
         println!("Erasing gateway related information");
         self.gateway_websocket = None;
@@ -162,7 +165,7 @@ pub struct Discord {
     token: String, // TODO: Make it secure
     intents: u32,
     // Owned data
-    socket: Mutex<DiscordSockets>,
+    socket: AsyncMutex<DiscordSockets>,
     // Cache (External IDs, to internal)
     profile: RwLockAwait<Option<json_structs::Profile>>,
     channel_id_mappings: RwLockAwait<HashMap<ID, ChannelID>>,
@@ -171,7 +174,7 @@ pub struct Discord {
 }
 
 impl Discord {
-    pub fn new(token: &str, sender: Sender<i16>) -> Self {
+    pub fn new(token: &str, sender: Arc<Mutex<AudioMixer>>) -> Self {
         Discord {
             token: token.into(),
             intents: 161789,
@@ -410,7 +413,6 @@ impl Socket for Discord {
                     EncryptionMode::xsalsa20_poly1305_lite => todo!("Depricated"),
                     EncryptionMode::xsalsa20_poly1305_lite_rtpsize => todo!("Depricated"),
                 };
-                println!();
 
                 // <https://datatracker.ietf.org/doc/html/rfc6464>
                 let (potentially, voice_data) = decrypted_payload.split_at(8);
@@ -435,10 +437,6 @@ impl Socket for Discord {
                 // println!("{:?}", potentially);
                 // println!();
 
-                // let out = Vec::new();
-
-                println!("{:?}", voice_data);
-                println!("{:?}", voice_data.len());
                 let n_decoded_samples =
                     match vc_connection
                         .decoder()
@@ -451,12 +449,16 @@ impl Socket for Discord {
                         }
                     };
 
-                // if channels[0] != 0 {
-                decoded_audio[..(2 * n_decoded_samples)]
-                    .iter()
-                    .for_each(|byte| socket.audio_sender.send(*byte).unwrap());
-                // }
-                println!("{:?}", &decoded_audio[..(2 * n_decoded_samples)].len());
+                let audio_mixer = socket.audio_mixer.clone();
+                let producer = socket
+                    .audio_thingy
+                    .entry(rtp_packet.get_ssrc())
+                    .or_insert_with(|| {
+                        let mut a = audio_mixer.lock().unwrap();
+                        a.create_channel(2, audio::SampleFormat::I16, audio::SampleRate(48_000))
+                    });
+
+                producer.push_iter(decoded_audio[..(2 * n_decoded_samples)].iter().copied());
             } else {
                 drop(socket); // Otherwise it blocks socket for other things on the runtime
                 pending!();

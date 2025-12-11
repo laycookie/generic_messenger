@@ -21,3 +21,5 @@ symphonia = "0.5.5"
 opus = "0.3.0"
 
 discortp = { version = "0.6.0", features = [ "discord" ] } # Don't really need it
+
+audio = { path = "../audio" }
