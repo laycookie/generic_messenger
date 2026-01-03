@@ -7,9 +7,9 @@ use crate::{
     SocketMesg,
     messanger_unifier::{Call, MessangerHandle},
 };
-use adaptors::types::{Chan, ID, Identifier, Msg, Server, Usr};
 pub use login::Login;
 use login::Message as LoginMessage;
+use messaging_interface::types::{Chan, ID, Identifier, Message, Server, Usr};
 use messenger::Message as MessangerMessage;
 use std::fmt::Debug;
 
@@ -23,7 +23,7 @@ pub(crate) enum MessangerData {
         conversations: Vec<Identifier<Chan>>,
         servers: Vec<Identifier<Server>>,
     },
-    Chat((Identifier<()>, Vec<Identifier<Msg>>)),
+    Chat((Identifier<()>, Vec<Identifier<Message>>)),
     Call(Call),
 }
 
@@ -32,7 +32,6 @@ pub(crate) enum MessangerDataType {
     Call,
 }
 
-#[derive(Debug)]
 pub(crate) enum AppMessage {
     // === UI ===
     OpenPage(Screen),

@@ -5,3 +5,5 @@ LoginInfo
 /.idea
 
 cargo.lock
+
+.direnv

@@ -32,7 +32,8 @@
 		devShells.${system} = {
 			default = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
     		    packages = with pkgs; [
-				  rust-bin.stable.latest.default
+				  rust-bin.nightly.latest.default
+				  # rust-bin.stable.latest.default
     		      # cargo
     		      # rustc
     		      rust-analyzer

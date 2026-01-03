@@ -2,8 +2,18 @@
 resolver = "2"
 members = [
 	"macro",
-	"adaptors",
-	"widgets",
 	"record",
-	"audio"
+	"crate/audio",
+	"crate/messaging_interface",
+	"interface/discord"
 ]
+
+[workspace.dependencies]
+facet = "0.35.0"
+facet-value = "0.35.0"
+facet-format-json = "0.35.0"
+facet-pretty = "0.35.0"
+# facet = { path = "../facet/facet" }
+# facet-value = { path = "../facet/facet-value" }
+# facet-json = { path = "../facet/facet-json" }
+# facet-format-json = { path = "../facet/facet-format-json" }

@@ -1,8 +1,8 @@
-use iced::advanced::graphics::core::event;
+use iced::advanced::graphics::core::Element;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{self, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Shell, renderer};
-use iced::{Color, Element, Event, Length, Point, Rectangle, Size, mouse, touch};
+use iced::{Color, Event, Length, Point, Rectangle, Size, mouse, touch};
 pub struct Divider<'a, Message>
 where
     Message: Clone,
@@ -47,7 +47,7 @@ where
     }
 
     fn layout(
-        &self,
+        &mut self,
         _tree: &mut widget::Tree,
         _renderer: &Renderer,
         _limits: &layout::Limits,
@@ -71,38 +71,32 @@ where
 
                 ..renderer::Quad::default()
             },
-            Color::new(0.5, 0.5, 0.5, 0.5),
+            Color::from_rgba(0.5, 0.5, 0.5, 0.5),
         );
     }
     fn state(&self) -> tree::State {
         tree::State::new(State::new())
     }
 
-    fn on_event(
+    fn update(
         &mut self,
         tree: &mut Tree,
-        event: Event,
+        event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _renderer: &Renderer,
         _clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
-    ) -> event::Status {
+    ) {
         let foo = tree.state.downcast_mut::<State>();
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerPressed { .. }) => {
-                //Imma leave these commented for println for later purpose
                 if let Some(cursor_position) = cursor.position_over(layout.bounds()) {
                     foo.is_dragging = true;
                     foo.prev = cursor_position;
-                    // println!("Clicked inside the divider: {:?}", cursor_position);
                 }
-                return event::Status::Captured;
-                // println!("x: {}, y: {}", layout.bounds().x, layout.bounds().y);
-                // println!("Cursor: {:?}", cursor);
-                // println!("Circle clicked");
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. }) => {
@@ -111,8 +105,6 @@ where
                         shell.publish(on_release);
                     }
                     foo.is_dragging = false;
-
-                    return event::Status::Captured;
                 }
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
@@ -122,18 +114,17 @@ where
                     if (delta < 0.0 && position.x > divider_bound)
                         || (delta > 0.0 && position.x < divider_bound)
                     {
-                        foo.prev = position;
-                        return event::Status::Captured;
+                        foo.prev = *position;
+                        return;
                     }
                     shell.publish((self.on_change)(delta));
                 }
-                foo.prev = position;
-                return event::Status::Captured;
+                foo.prev = *position;
             }
             _ => (),
         }
-        event::Status::Ignored
     }
+
     fn mouse_interaction(
         &self,
         tree: &Tree,

@@ -11,11 +11,31 @@ pub struct Usr {
     pub icon: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
-pub struct Msg {
-    pub author: Identifier<Usr>,
+#[derive(Debug, Clone, Default)]
+pub struct MessageContents {
     pub text: String,
     pub reactions: Vec<Reaction>,
+}
+impl MessageContents {
+    pub fn simple_text(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub author: Identifier<Usr>,
+    pub contents: MessageContents,
+}
+impl Deref for Message {
+    type Target = MessageContents;
+
+    fn deref(&self) -> &Self::Target {
+        &self.contents
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -56,16 +76,16 @@ pub type ID = u32;
 #[derive(Debug, Clone)]
 #[repr(C)]
 pub struct Identifier<D> {
-    pub(crate) neo_id: ID,
+    pub id: ID,
     pub data: D,
 }
 impl<D> Identifier<D> {
     pub fn get_id(&self) -> &ID {
-        &self.neo_id
+        &self.id
     }
     pub fn remove_data(self) -> Identifier<()> {
         Identifier {
-            neo_id: self.neo_id,
+            id: self.id,
             data: (),
         }
     }

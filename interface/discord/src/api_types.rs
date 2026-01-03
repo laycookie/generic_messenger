@@ -1,9 +1,7 @@
-use serde::{Deserialize, Serialize};
-use serde_repr::Deserialize_repr;
+use facet::Facet;
 
 // === Users ===
-
-#[derive(Deserialize)]
+#[derive(Facet)]
 pub struct Profile {
     // accent_color: Option<String>,
     // authenticator_types: Vec<String>,
@@ -29,7 +27,7 @@ pub struct Profile {
     // verified: bool,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Facet)]
 pub struct User {
     pub avatar: Option<String>,
     // avatar_decoration_data: Option<String>,
@@ -39,7 +37,7 @@ pub struct User {
     pub username: String,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Facet)]
 pub struct Friend {
     pub id: String,
     // is_spam_request: bool,
@@ -49,7 +47,7 @@ pub struct Friend {
     pub user: User,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Facet)]
 pub struct Recipient {
     pub(crate) avatar: Option<String>,
     // avatar_decoration_data: Option<String>,
@@ -63,14 +61,15 @@ pub struct Recipient {
 
 // === Chennels ===
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Facet)]
 pub(crate) struct OverwriteObject {
     // pub(crate) id: String,
     // pub(crate) allow: String,
     pub(crate) deny: String,
 }
 
-#[derive(Deserialize_repr, Debug, Clone)]
+#[derive(Facet)]
+#[facet(is_numeric)]
 #[repr(u8)]
 pub enum ChannelTypes {
     GuildText,
@@ -88,11 +87,11 @@ pub enum ChannelTypes {
     GuildMedia,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Facet)]
 pub struct Channel {
     pub(crate) id: String,
     pub(crate) guild_id: Option<String>,
-    #[serde(rename = "type")]
+    #[facet(rename = "type")]
     pub(crate) channel_type: ChannelTypes,
     // flags: i32,
     pub(crate) icon: Option<String>,
@@ -102,19 +101,19 @@ pub struct Channel {
     pub(crate) permission_overwrites: Option<Vec<OverwriteObject>>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Facet)]
 pub struct CountDetails {
     // burst: u32,
     // normal: u32,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Facet)]
 pub struct Emoji {
     pub id: Option<String>,
     pub name: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Facet)]
 pub struct Reaction {
     // burst_colors: Vec<String>,
     // burst_count: u32,
@@ -126,11 +125,11 @@ pub struct Reaction {
     // me_burst: bool,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Facet)]
 pub struct Message {
     // attachments: Vec<String>,
     pub author: User,
-    // channel_id: String,
+    pub channel_id: String,
     // components: Vec<String>,
     pub content: String,
     // edited_timestamp: Option<String>,
@@ -148,7 +147,7 @@ pub struct Message {
 }
 
 // https://discord.com/developers/docs/resources/message#create-message-jsonform-params
-#[derive(Debug, Serialize)]
+#[derive(Facet)]
 pub struct CreateMessage {
     pub nonce: Option<String>, // Can be used to verify a message was sent (up to 25 characters). Value will appear in the Message Create event.
     pub enforce_nonce: Option<bool>, // If true, checks nonce uniqueness
@@ -165,12 +164,11 @@ pub struct CreateMessage {
     // attachments: Option<Vec<Attachment>>,       // Attachments (filename, description)
     //
     pub flags: Option<u32>, // Bitfield (only certain flags allowed)
-
                             // poll: Option<Poll>, // Poll object
 }
 
 // https://discord.com/developers/docs/resources/guild#guild-object
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Facet)]
 pub struct Guild {
     pub id: String,
     pub name: String,

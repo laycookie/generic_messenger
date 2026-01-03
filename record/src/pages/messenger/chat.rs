@@ -1,6 +1,5 @@
 use std::borrow::Borrow;
 
-use adaptors::types::{Chan, Identifier};
 use iced::{
     Element, Length, Padding, Task,
     widget::{
@@ -8,20 +7,22 @@ use iced::{
         text::LineHeight,
     },
 };
+use messaging_interface::types::{Chan, Identifier, MessageContents};
+use tracing::error;
 
 use crate::{
     components::message_text::message_text,
     messanger_unifier::{MessangerInterface, Messangers},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Chat {
     interface: MessangerInterface,
     channel_data: Identifier<Chan>,
     msg_box: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Action {
     Call {
         interface: MessangerInterface,
@@ -63,15 +64,7 @@ impl Chat {
         let chat = Scrollable::new(match messages {
             Some(messages) => messages
                 .iter()
-                .map(|msg| {
-                    let icon = msg.data.author.data.icon.clone();
-                    let icon = icon.unwrap_or_else(|| "./public/imgs/placeholder.jpg".into());
-                    let image_height = Length::Fixed(36.0);
-                    row![
-                        image(&icon).height(image_height),
-                        container(message_text(msg)).padding(Padding::new(0.0).left(5.0))
-                    ]
-                })
+                .map(|msg| message_text(msg))
                 .fold(Column::new().spacing(15.0), |column, widget| {
                     column.push(widget)
                 }),
@@ -102,8 +95,11 @@ impl Chat {
 
                 Task::future(async move {
                     let param = auth.param_query().unwrap();
-                    if let Err(e) = param.send_message(&meta_data, contents).await {
-                        eprintln!("{e:#?}");
+                    if let Err(e) = param
+                        .send_message(&meta_data, MessageContents::simple_text(&contents))
+                        .await
+                    {
+                        error!("{e:#?}");
                     };
                 })
                 .then(|_| Task::done(Message::MsgInput(String::new())))

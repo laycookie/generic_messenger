@@ -1,9 +1,9 @@
 use std::iter;
 
-use adaptors::types::{Identifier, Server};
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::{Button, Column, Scrollable, image};
 use iced::{ContentFit, Element, Length};
+use messaging_interface::types::{Identifier, Server};
 
 use crate::messanger_unifier::{MessangerHandle, Messangers};
 use crate::pages::messenger::PLACEHOLDER_PFP;

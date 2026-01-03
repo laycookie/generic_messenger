@@ -1,9 +1,10 @@
-use adaptors::{Messanger, discord::Discord};
 use audio::AudioMixer;
+use discord::Discord;
 use iced::{
     Alignment,
     widget::{Button, Column, ComboBox, Container, TextInput, column, combo_box::State},
 };
+use messaging_interface::interface::Messanger as NeoMessanger;
 use std::{
     fmt::Display,
     sync::{Arc, Mutex},
@@ -29,11 +30,11 @@ impl Platform {
         &self,
         auth: &str,
         audio_mixer: &Arc<Mutex<AudioMixer>>,
-    ) -> Arc<dyn Messanger> {
+    ) -> Arc<dyn NeoMessanger> {
         Arc::new(match self {
+            // Self::Discord => Discord::new(&auth, audio_mixer.clone()),
             Self::Discord => Discord::new(&auth, audio_mixer.clone()),
             Self::Test => {
-                println!("Testing");
                 todo!()
             }
         })
@@ -62,7 +63,7 @@ pub enum Message {
 
 pub enum Action {
     None,
-    Login(Arc<dyn Messanger>),
+    Login(Arc<dyn NeoMessanger>),
 }
 
 #[derive(Debug, Clone)]

@@ -1,14 +1,23 @@
-use adaptors::types::{Chan, ChanType, Identifier};
 use iced::{
     Color, Element, Length, Padding,
     widget::{Button, Column, Scrollable, Text, button, column, container, image, row},
 };
+use messaging_interface::types::{Chan, ChanType, Identifier};
 
 use super::PLACEHOLDER_PFP;
-use crate::{
-    messanger_unifier::{Call, Messangers},
-    pages::messenger::server::Server,
-};
+use crate::messanger_unifier::{Call, MessangerHandle, Messangers};
+
+#[derive(Debug, Clone)]
+pub struct Server {
+    pub handle: MessangerHandle,
+    pub channels: Vec<Identifier<Chan>>, // TODO: Move this into cache
+}
+
+impl Server {
+    pub fn new(handle: MessangerHandle, channels: Vec<Identifier<Chan>>) -> Self {
+        Self { handle, channels }
+    }
+}
 
 #[derive(Debug)]
 pub struct Sidebar {

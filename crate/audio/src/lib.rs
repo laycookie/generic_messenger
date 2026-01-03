@@ -11,6 +11,7 @@ use ringbuf::{
     traits::{Consumer as _, Observer, Producer as _, Split},
     wrap::caching::Caching,
 };
+use tracing::{error, info};
 
 // ===============================
 type Prod<const N: usize> = Caching<
@@ -132,7 +133,7 @@ impl AudioMixer {
             let config = output.default_output_config().unwrap();
             let mut config = config.config();
             config.sample_rate = SampleRate(48_000); // TODO
-            println!("{:#?}", config);
+            info!("{:#?}", config);
 
             let channels = self.channels.clone();
             let stream = output
@@ -149,10 +150,10 @@ impl AudioMixer {
                                 })
                                 .sum::<AudioSampleType>();
                         }
-                        println!("{:?}", channels.len());
+                        info!("{:?}", channels.len());
                     },
                     move |err| {
-                        eprintln!("{err:?}");
+                        error!("{err:?}");
                     },
                     None,
                 )

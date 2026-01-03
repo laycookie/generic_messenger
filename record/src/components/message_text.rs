@@ -1,12 +1,12 @@
-use adaptors::types::{Identifier, Msg};
 use iced::{
-    Color, Element, Font,
+    Color, Element, Font, Length, Padding,
     advanced::graphics::core::font,
     widget::{
-        Button, Row, Text, column, row,
+        Button, Row, Text, column, container, image, row,
         text::{Rich, Span},
     },
 };
+use messaging_interface::types::{Identifier, Message};
 use nom::{
     IResult, Parser,
     branch::alt,
@@ -17,31 +17,39 @@ use nom::{
     sequence::delimited,
 };
 
+/// Excludes regular text type
 #[derive(Debug)]
-enum MarkdownText<'a> {
-    Link(&'a str),
+enum Markdown<'a> {
     Bold(&'a str),
+    Italicized(&'a str),
+    Link(&'a str),
 }
 
-fn bold_parser(input: &str) -> IResult<&str, MarkdownText<'_>> {
+// === Parsers ===
+fn bold_parser(input: &str) -> IResult<&str, Markdown<'_>> {
     let (left, parsed) = delimited(tag("**"), take_until("**"), tag("**")).parse(input)?;
-    Ok((left, MarkdownText::Bold(parsed)))
+    Ok((left, Markdown::Bold(parsed)))
+}
+fn italicized_parser(input: &str) -> IResult<&str, Markdown<'_>> {
+    let (left, parsed) = delimited(tag("*"), take_until("*"), tag("*")).parse(input)?;
+    Ok((left, Markdown::Italicized(parsed)))
 }
 
 // TODO: Very loose rn, solidify it
-fn url_parser(input: &str) -> IResult<&str, MarkdownText<'_>> {
+fn url_parser(input: &str) -> IResult<&str, Markdown<'_>> {
     let protocol_scheme = alt((tag_no_case("https://"), tag_no_case("http://")));
     let valid_url_char = alt((alphanumeric1, recognize(one_of("-._~:/?#[]@!$&'()*+,;=%"))));
 
     let (left, parsed) = recognize((protocol_scheme, many1(valid_url_char))).parse(input)?;
-    Ok((left, MarkdownText::Link(parsed)))
+    Ok((left, Markdown::Link(parsed)))
 }
 
+// === Special parsers ===
 fn until_parser<'a, F>(
     mut parser: F,
-) -> impl FnMut(&'a str) -> IResult<&'a str, (&'a str, MarkdownText<'a>)>
+) -> impl FnMut(&'a str) -> IResult<&'a str, (&'a str, Markdown<'a>)>
 where
-    F: Parser<&'a str, Output = MarkdownText<'a>, Error = nom::error::Error<&'a str>>,
+    F: Parser<&'a str, Output = Markdown<'a>, Error = nom::error::Error<&'a str>>,
 {
     move |input: &str| {
         let err = match parser.parse(input) {
@@ -58,32 +66,37 @@ where
         Err(err)
     }
 }
+// ======================
 
-#[derive(Clone)]
-enum Link {}
-
-pub fn message_text<'a, M: Clone + 'static>(msg: &'a Identifier<Msg>) -> Element<'a, M> {
+pub fn message_text<'a, M: Clone + 'static>(msg: &'a Identifier<Message>) -> Element<'a, M> {
     // === Author ===
+    let icon = msg.data.author.data.icon.clone();
+    let icon = icon.unwrap_or_else(|| "./public/imgs/placeholder.jpg".into());
+    let image_height = Length::Fixed(36.0);
     let author = Text::from(msg.author.name.as_str());
 
     // === Create Message text box ===
-    let mut spans: std::vec::Vec<iced::advanced::text::Span<'_, Link>> = Vec::new();
+    let mut spans: std::vec::Vec<Span<'_>> = Vec::new();
 
     let mut text_left = msg.text.as_str();
-    while let Ok((text_span, (left, special_markdown))) =
-        until_parser(alt((url_parser, bold_parser))).parse(text_left)
+    while let Ok((regular_text_parsed, (unparssed, parsed_markdown))) =
+        until_parser(alt((url_parser, italicized_parser, bold_parser))).parse(text_left)
     {
-        if !text_span.is_empty() {
-            spans.push(Span::new(text_span));
+        if !regular_text_parsed.is_empty() {
+            spans.push(Span::new(regular_text_parsed));
         }
-        spans.push(match special_markdown {
-            MarkdownText::Link(link) => Span::new(link).color(Color::from_rgb(0.0, 0.0, 1.0)),
-            MarkdownText::Bold(text) => Span::new(text).font(Font {
+        spans.push(match parsed_markdown {
+            Markdown::Italicized(text) => Span::new(text).font(Font {
+                style: font::Style::Italic,
+                ..Default::default()
+            }),
+            Markdown::Bold(text) => Span::new(text).font(Font {
                 weight: font::Weight::Bold,
                 ..Default::default()
             }),
+            Markdown::Link(link) => Span::new(link).color(Color::from_rgb(0.0, 0.0, 1.0)),
         });
-        text_left = left;
+        text_left = unparssed;
     }
     spans.push(Span::new(text_left));
 
@@ -92,11 +105,15 @@ pub fn message_text<'a, M: Clone + 'static>(msg: &'a Identifier<Msg>) -> Element
     // === Reactions ===
     let reactions = Row::from_iter(msg.reactions.iter().map(|reaction| {
         Button::new(row![
-            Rich::with_spans([Span::<Link>::new(reaction.emoji)]),
+            Rich::with_spans([Span::<M>::new(reaction.emoji)]),
             Text::new(reaction.count)
         ])
         .into()
     }));
 
-    column![author, message, reactions].into()
+    row![
+        image(&icon).height(image_height),
+        container(column![author, message, reactions]).padding(Padding::new(0.0).left(5.0))
+    ]
+    .into()
 }

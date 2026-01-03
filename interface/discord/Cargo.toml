@@ -1,0 +1,36 @@
+[package]
+name = "discord"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+# Logs
+tracing = "0.1.43"
+# Async
+async-trait = "0.1.89"
+async-tungstenite =  { version = "0.32.0", features = ["async-std-runtime", "async-tls"] }
+# Futures
+futures = "0.3.31"
+futures-locks = "0.7.1"
+futures-timer = "3.0.3"
+# Fetch
+surf = "2.3.2"
+# Serialize/Deserialize
+facet = { workspace = true }
+facet-value = { workspace = true }
+facet-format-json = { workspace = true }
+facet-pretty = { workspace = true }
+# Networking
+smol = "2.0.2"
+pnet_macros = "0.35.0"
+pnet_macros_support = "0.35.0"
+# Audio
+audio = { path = "../../crate/audio" }
+opus = "0.3.0"
+# Security
+secure-string = "0.3.0"
+libsodium-rs = "0.2.1"
+# Interface
+messaging_interface = { path = "../../crate/messaging_interface" }
+# enums
+num_enum = "0.7.5"

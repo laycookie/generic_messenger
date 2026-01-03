@@ -1,20 +1,24 @@
 [package]
 name = "record"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 
 [dependencies]
-adaptors = { path = "../adaptors" }
-audio = { path = "../audio" }
+# adaptors = { path = "../adaptors" }
+audio = { path = "../crate/audio" }
+
+messaging_interface = { path = "../crate/messaging_interface" }
+discord = { path = "../interface/discord" }
+
+
 iced = { version = "0.14.0",  features = ["image", "advanced", "lazy", "sipper"] }
 strum = { version = "0.27.1", features = ["derive"] }
 futures = "0.3.31"
-widgets = { path = "../widgets" }
 
-cpal = "0.16.0"
+cpal = "0.17.0"
 
-tracing = "0.1.41"
-tracing-subscriber = "0.3.20"
+tracing = "0.1.43"
+tracing-subscriber = "0.3.22"
 
 # fontconfig = "0.10.0"
 font-kit = "0.14.3"
@@ -23,3 +27,5 @@ nom = "8.0.0"
 crossbeam = "0.8.4"
 ringbuf = "0.4.8"
 rand = "0.9.2"
+
+

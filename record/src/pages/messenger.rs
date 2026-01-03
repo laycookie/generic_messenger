@@ -1,32 +1,31 @@
-use std::{borrow::Borrow, fmt::Debug};
+use std::{borrow::Borrow, error::Error};
 
 use crate::{
+    components::divider::Divider,
     messanger_unifier::{Call, MessangerHandle, MessangerInterface, Messangers},
     pages::messenger::{
         chat::{Action as ChatAction, Chat},
         contacts::{Contacts, Message as ContactsMessage},
-        conversation_sidebar::{Action as SidebarAction, Sidebar},
+        conversation_sidebar::{Action as SidebarAction, Server, Sidebar},
         navbar::{Action as NavbarAction, Navbar},
-        server::Server,
     },
 };
 
-use adaptors::types::{Chan, Identifier, Msg};
 use iced::{
     Task,
     widget::{Responsive, Text, column, row},
 };
-use widgets::divider;
+use messaging_interface::types::{Chan, Identifier, Message as InterfaceMessage};
+use tracing::error;
 
 mod chat;
 mod contacts;
 mod conversation_sidebar;
 mod navbar;
-mod server;
 
 pub(super) const PLACEHOLDER_PFP: &str = "./public/imgs/placeholder.jpg";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) enum Message {
     Chat(ChatAction),
     Contacts(ContactsMessage),
@@ -38,17 +37,16 @@ pub(crate) enum Message {
     DividerChange(f32),
     UpdateChat {
         handle: MessangerHandle,
-        kv: (Identifier<()>, Vec<Identifier<Msg>>),
+        kv: (Identifier<()>, Vec<Identifier<InterfaceMessage>>),
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) enum Main {
     Contacts(Contacts),
     Chat(Chat),
 }
 
-#[derive(Debug)]
 pub struct Messenger {
     sidebar: Sidebar,
     main: Main,
@@ -67,7 +65,7 @@ pub enum Action {
     None,
     UpdateChat {
         handle: MessangerHandle,
-        kv: (Identifier<()>, Vec<Identifier<Msg>>),
+        kv: (Identifier<()>, Vec<Identifier<InterfaceMessage>>),
     },
     Run(Task<Message>),
     Call {
@@ -145,8 +143,6 @@ impl Messenger {
                         })
                         .then(|(interface, server_channels)| {
                             // TODO
-                            println!("loading");
-
                             Task::done(Message::SetSidebarServer(Some(Server::new(
                                 interface.handle,
                                 server_channels,
@@ -180,38 +176,56 @@ impl Messenger {
                     let Some(interface) = messengers.interface_from_handle(handle) else {
                         return Action::None;
                     };
-                    let interface = interface.to_owned();
 
                     // Check cache
                     if let Some(messanger) = messengers.data_from_handle(handle)
                         && messanger.chats.contains_key(conversation.borrow())
                     {
                         return Action::Run(Task::done(Message::ChangeMain(Main::Chat(
-                            Chat::new(interface, conversation),
+                            Chat::new(interface.to_owned(), conversation),
                         ))));
                     }
 
                     // Otherwise fetch
-                    Action::Run(
-                        Task::future(async move {
-                            let msgs = {
-                                let pq = interface.param_query().unwrap();
-                                pq.get_messages(&conversation, None).await.unwrap()
-                            };
+                    Action::Run(Task::batch([
+                        Task::done(Message::ChangeMain(Main::Chat(Chat::new(
+                            interface.to_owned(),
+                            conversation.clone(),
+                        )))),
+                        Task::future({
+                            let interface = interface.to_owned();
+                            async move {
+                                let msgs_wraped = match interface.param_query() {
+                                    Ok(pq) => pq.get_messages(&conversation, None).await,
+                                    Err(err) => {
+                                        return Err(Box::new(err) as Box<dyn Error + Send + Sync>);
+                                    }
+                                };
+                                let msgs = match msgs_wraped {
+                                    Ok(msgs) => msgs,
+                                    Err(err) => {
+                                        return Err(err);
+                                    }
+                                };
+                                let handle = interface.handle;
 
-                            (interface, conversation, msgs)
+                                Ok((handle, conversation, msgs))
+                            }
                         })
-                        .then(|(interface, conversation, msgs)| {
-                            let channel_id: &Identifier<()> = conversation.borrow();
-                            Task::done(Message::UpdateChat {
-                                handle: interface.handle,
-                                kv: (channel_id.to_owned(), msgs),
-                            })
-                            .chain(Task::done(Message::ChangeMain(
-                                Main::Chat(Chat::new(interface, conversation)),
-                            )))
+                        .then(|t| match t {
+                            Ok((handle, conversation, msgs)) => {
+                                let id = conversation.remove_data();
+                                Task::done(Message::UpdateChat {
+                                    handle,
+                                    kv: (id, msgs),
+                                })
+                            }
+                            Err(err) => {
+                                error!("{err}");
+                                Task::none()
+                            }
                         }),
-                    )
+                    ]))
                 }
             },
         }
@@ -239,7 +253,7 @@ impl Messenger {
             };
             row![
                 sidebar,
-                // divider::Divider::new(10.0, size.height, Message::DividerChange),
+                Divider::new(10.0, size.height, Message::DividerChange),
                 main
             ]
             .into()

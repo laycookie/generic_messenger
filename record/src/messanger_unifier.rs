@@ -2,9 +2,9 @@
 
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
-use adaptors::{
-    Messanger,
-    types::{CallStatus, Chan, ID, Identifier, Msg, Server, Usr},
+use messaging_interface::{
+    interface::Messanger,
+    types::{CallStatus, Chan, ID, Identifier, Message, Server, Usr},
 };
 
 #[derive(Debug, Clone)]
@@ -47,7 +47,7 @@ pub struct MessangerData {
     pub(crate) contacts: Vec<Identifier<Usr>>,
     pub(crate) conversations: Vec<Identifier<Chan>>,
     pub(crate) guilds: Vec<Identifier<Server>>,
-    pub(crate) chats: HashMap<Identifier<()>, Vec<Identifier<Msg>>>,
+    pub(crate) chats: HashMap<Identifier<()>, Vec<Identifier<Message>>>,
     pub(crate) calls: Vec<Call>,
 }
 
@@ -79,7 +79,7 @@ impl PartialEq for MessangerHandle {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct MessangerInterface {
     pub(crate) handle: MessangerHandle,
     pub(crate) api: Arc<dyn Messanger>,

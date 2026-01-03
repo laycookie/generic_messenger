@@ -1,10 +1,11 @@
+use core::error;
 use std::{fmt::Debug, pin::Pin, sync::Weak, task::Poll};
 
-use adaptors::{Socket, SocketEvent};
 use futures::{
     FutureExt, Stream, StreamExt,
     channel::mpsc::{self, Receiver, Sender},
 };
+use messaging_interface::interface::{Socket, SocketEvent};
 
 use crate::messanger_unifier::MessangerHandle;
 
@@ -33,7 +34,12 @@ impl Debug for ActiveStream {
 }
 
 pub enum ReceiverEvent {
-    Connection((MessangerHandle, Option<Weak<dyn Socket + Send + Sync>>)),
+    Connection(
+        (
+            MessangerHandle,
+            Result<Box<dyn Socket + Send + Sync>, Box<dyn error::Error + Send + Sync>>,
+        ),
+    ),
 }
 
 pub struct SocketsInterface {
@@ -64,7 +70,7 @@ impl Stream for SocketsInterface {
         if let Poll::Ready(event) = self.receiver.select_next_some().poll_unpin(cx) {
             match event {
                 ReceiverEvent::Connection((handle, socket)) => {
-                    if let Some(socket) = socket {
+                    if let Ok(socket) = socket {
                         self.active_streams.push(ActiveStream::new(handle, socket));
                         println!("Pushed as active");
                     }

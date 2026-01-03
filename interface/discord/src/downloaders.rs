@@ -5,10 +5,11 @@ use std::{
     path::PathBuf,
 };
 
-use serde::de::DeserializeOwned;
+use facet::Facet;
 use surf::{RequestBuilder, StatusCode};
+use tracing::{error, info};
 
-pub async fn http_request<T: DeserializeOwned>(
+pub async fn http_request<T: for<'a> Facet<'a>>(
     mut req: RequestBuilder,
     headers: Vec<(&str, String)>,
 ) -> Result<T, Box<dyn Error + Sync + Send>> {
@@ -18,15 +19,18 @@ pub async fn http_request<T: DeserializeOwned>(
 
     let mut res = req.send().await?;
 
-    if StatusCode::Ok != res.status() {
-        return Err(surf::Error::from_str(
-            StatusCode::Unauthorized,
-            "TODO: Is ussualy caused by an outdated token",
-        )
-        .into());
+    let status = res.status();
+    if StatusCode::Ok != status {
+        // Ussualy a result of an outdated token
+        error!("Failed to fetch http with status code: {status:?}");
+        return Err(
+            surf::Error::from_str(status, "Failed to fetch data from http endpoint.").into(),
+        );
     }
 
-    let json = res.body_json::<T>().await?;
+    let json_stringified = res.body_string().await?;
+    let json = facet_format_json::from_str(&json_stringified)?;
+
     Ok(json)
 }
 
@@ -50,8 +54,8 @@ pub async fn cache_download(
 
     // Create a file at the specified path
     match fs::create_dir_all(&path) {
-        Ok(_) => println!("Directory created successfully: {:?}", path),
-        Err(e) => eprintln!("Failed to create directory: {}", e),
+        Ok(_) => info!("Directory created successfully: {:?}", path),
+        Err(e) => error!("Failed to create directory: {}", e),
     }
 
     let mut file = File::create(&file_path)?;
