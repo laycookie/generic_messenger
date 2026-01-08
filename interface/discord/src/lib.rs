@@ -49,7 +49,7 @@ impl Discord {
     pub fn new(token: &str, sender: Arc<Mutex<AudioMixer>>) -> Self {
         Discord {
             token: token.into(),
-            intents: 161789,
+            intents: 194557,
             gateaway: None.into(),
             voice_gateaway: VoiceGateawayState::default().into(),
             profile: RwLockAwait::new(None),
