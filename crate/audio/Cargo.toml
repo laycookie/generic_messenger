@@ -4,7 +4,6 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
-tracing = "0.1.43"
-crossbeam = "0.8.4"
-ringbuf = "0.4.8"
-cpal = "0.16.0"
+tracing = { workspace = true }
+ringbuf = { workspace = true }
+cpal = "0.17.0"

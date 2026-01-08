@@ -7,10 +7,10 @@ edition = "2024"
 # Logs
 tracing = "0.1.43"
 # Async
-async-trait = "0.1.89"
+async-trait = { workspace = true }
 async-tungstenite =  { version = "0.32.0", features = ["async-std-runtime", "async-tls"] }
 # Futures
-futures = "0.3.31"
+futures = { workspace = true }
 futures-locks = "0.7.1"
 futures-timer = "3.0.3"
 # Fetch
@@ -34,3 +34,5 @@ libsodium-rs = "0.2.1"
 messaging_interface = { path = "../../crate/messaging_interface" }
 # enums
 num_enum = "0.7.5"
+# Data structures
+ringbuf = { workspace = true }

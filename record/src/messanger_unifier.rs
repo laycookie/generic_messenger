@@ -8,30 +8,30 @@ use messaging_interface::{
 };
 
 #[derive(Debug, Clone)]
-pub(crate) struct Call {
+pub struct Call {
     messanger_handle: MessangerHandle,
     source: Identifier<Chan>,
     status: CallStatus,
 }
 
 impl Call {
-    pub(crate) fn new(messanger_handle: MessangerHandle, source: Identifier<Chan>) -> Self {
+    pub fn new(messanger_handle: MessangerHandle, source: Identifier<Chan>) -> Self {
         Self {
             messanger_handle,
             source,
             status: CallStatus::Connecting,
         }
     }
-    pub(crate) fn handle(&self) -> MessangerHandle {
+    pub fn handle(&self) -> MessangerHandle {
         self.messanger_handle
     }
-    pub(crate) fn source(&self) -> &Identifier<Chan> {
+    pub fn source(&self) -> &Identifier<Chan> {
         &self.source
     }
-    pub(crate) fn id(&self) -> ID {
+    pub fn id(&self) -> ID {
         *self.source.get_id()
     }
-    pub(crate) fn status_str(&self) -> &str {
+    pub fn status_str(&self) -> &str {
         match self.status {
             CallStatus::Connected => "Connected",
             CallStatus::Connecting => "Connecting",
@@ -43,12 +43,12 @@ impl Call {
 pub struct MessangerData {
     handle: MessangerHandle,
 
-    pub(crate) profile: Option<Identifier<Usr>>,
-    pub(crate) contacts: Vec<Identifier<Usr>>,
-    pub(crate) conversations: Vec<Identifier<Chan>>,
-    pub(crate) guilds: Vec<Identifier<Server>>,
-    pub(crate) chats: HashMap<Identifier<()>, Vec<Identifier<Message>>>,
-    pub(crate) calls: Vec<Call>,
+    pub profile: Option<Identifier<Usr>>,
+    pub contacts: Vec<Identifier<Usr>>,
+    pub conversations: Vec<Identifier<Chan>>,
+    pub guilds: Vec<Identifier<Server>>,
+    pub chats: HashMap<Identifier<()>, Vec<Identifier<Message>>>,
+    pub calls: Vec<Call>,
 }
 
 impl MessangerData {
@@ -63,7 +63,7 @@ impl MessangerData {
             calls: Vec::new(),
         }
     }
-    pub(crate) fn handle(&self) -> MessangerHandle {
+    pub fn handle(&self) -> MessangerHandle {
         self.handle
     }
 }
@@ -80,9 +80,9 @@ impl PartialEq for MessangerHandle {
 }
 
 #[derive(Clone)]
-pub(crate) struct MessangerInterface {
-    pub(crate) handle: MessangerHandle,
-    pub(crate) api: Arc<dyn Messanger>,
+pub struct MessangerInterface {
+    pub handle: MessangerHandle,
+    pub api: Arc<dyn Messanger>,
 }
 impl Deref for MessangerInterface {
     type Target = Arc<dyn Messanger>;
@@ -119,7 +119,6 @@ impl Messangers {
             return Some(&self.interface[messanger_handle.index]);
         }
 
-        eprintln!("Cache hit occured");
         self.interface.iter().find(|a| a.handle == messanger_handle)
     }
     pub fn data_from_handle(&self, messanger_handle: MessangerHandle) -> Option<&MessangerData> {
@@ -129,7 +128,6 @@ impl Messangers {
             return Some(&self.data[messanger_handle.index]);
         }
 
-        eprintln!("Cache hit occured");
         self.data
             .iter()
             .find(|data| data.handle == messanger_handle)
@@ -144,7 +142,6 @@ impl Messangers {
             return Some(&mut self.data[messanger_handle.index]);
         }
 
-        eprintln!("Cache hit occured");
         self.data
             .iter_mut()
             .find(|data| data.handle == messanger_handle)

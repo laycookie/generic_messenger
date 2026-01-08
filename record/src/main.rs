@@ -1,20 +1,19 @@
 use std::{
     borrow::Cow,
     pin::Pin,
-    sync::{Arc, Mutex, Weak},
+    sync::Weak,
     task::{Context, Poll},
 };
 
 use crate::messanger_unifier::Call;
-use audio::AudioMixer;
+use audio::{AudioMixer, SampleFormat};
 use auth::MessangersGenerator;
 use font_kit::{family_name::FamilyName, source::SystemSource};
 use futures::{Stream, StreamExt, future::join_all, join};
-use iced::{Element, Subscription, Task, window};
+use iced::{Element, Task, window};
 use messaging_interface::interface::{Socket, SocketEvent};
 use messanger_unifier::Messangers;
 use pages::{AppMessage, Login, messenger::Messenger};
-// use socket::{ReceiverEvent, SocketsInterface};
 
 use crate::messanger_unifier::MessangerHandle;
 
@@ -22,9 +21,8 @@ mod auth;
 mod components;
 mod messanger_unifier;
 mod pages;
-// mod socket;
 
-use tracing::{Level, error, info, trace};
+use tracing::{Level, error, info, trace, warn};
 use tracing_subscriber::FmtSubscriber;
 
 pub enum Screen {
@@ -56,7 +54,6 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             fonts: vec![Cow::Borrowed(sytem_font)],
             ..Default::default()
         })
-        .subscription(App::subscription)
         .run()
         .inspect_err(|err| error!("{err}"))?;
     Ok(())
@@ -126,16 +123,15 @@ impl Stream for WeakSocketStream {
 }
 
 struct App {
-    audio: Arc<Mutex<AudioMixer>>,
+    audio: AudioMixer,
     page: Screen,
     messangers: Messangers,
-    // socket_sender: Option<Sender<ReceiverEvent>>,
 }
 
 impl App {
     fn new(messangers: Messangers, page: Screen) -> Self {
         Self {
-            audio: Arc::new(Mutex::new(AudioMixer::new())),
+            audio: AudioMixer::default(),
             page,
             messangers,
             // socket_sender: None,
@@ -145,8 +141,7 @@ impl App {
     fn boot() -> (Self, Task<AppMessage>) {
         let mut app = App::new(Messangers::default(), Screen::Loading);
 
-        let messangers =
-            MessangersGenerator::messengers_from_file("./LoginInfo".into(), &app.audio);
+        let messangers = MessangersGenerator::messengers_from_file("./LoginInfo".into());
 
         match messangers {
             Ok(messangers) => {
@@ -163,7 +158,7 @@ impl App {
         };
 
         let loaded_messangers =
-            match MessangersGenerator::messengers_from_file("./LoginInfo".into(), &app.audio) {
+            match MessangersGenerator::messengers_from_file("./LoginInfo".into()) {
                 Ok(messangers) => {
                     if messangers.len() > 0 {
                         app.messangers = messangers;
@@ -184,10 +179,10 @@ impl App {
         let (_window_id, window_task) = window::open(window::Settings::default());
         (
             app,
-            Task::batch(vec![window_task.then(move |_| match loaded_messangers {
+            window_task.then(move |_| match loaded_messangers {
                 true => Task::done(AppMessage::StartUp),
                 false => Task::none(),
-            })]),
+            }),
         )
     }
     fn update(&mut self, message: AppMessage) -> Task<AppMessage> {
@@ -317,10 +312,7 @@ impl App {
 
                         if let Ok(socket) = socket {
                             let stream = WeakSocketStream::new(socket, handle);
-                            task =
-                                task.chain(Task::stream(stream.map(move |(handle, message)| {
-                                    AppMessage::SocketEvent(SocketMesg::Message((handle, message)))
-                                })));
+                            task = task.chain(Task::stream(stream.map(AppMessage::SocketEvent)));
                         };
 
                         task
@@ -342,49 +334,37 @@ impl App {
                 self.page = page;
                 Task::none()
             }
-            AppMessage::SocketEvent(event) => match event {
-                // SocketMesg::Connect(socket_connection) => {
-                //     self.socket_sender = Some(socket_connection.clone());
-                //     Task::batch(self.messangers.interface_iter().map(|interface| {
-                //         let interface = interface.to_owned();
-                //         let mut socket_connection = socket_connection.clone();
-                //         Task::future(async move {
-                //             socket_connection
-                //                 .try_send(ReceiverEvent::Connection((
-                //                     interface.handle,
-                //                     interface.api.socket().await,
-                //                 )))
-                //                 .unwrap();
-                //         })
-                //         .then(|_| Task::none())
-                //     }))
-                // }
-                SocketMesg::Message((handle, socket_event)) => {
-                    match socket_event {
-                        SocketEvent::Skip => info!("Skipped"),
-                        SocketEvent::MessageCreated { channel, msg } => {
-                            let d = self.messangers.mut_data_from_handle(handle).unwrap();
-                            match d.chats.get_mut(&channel) {
-                                Some(msgs) => msgs.push(msg),
-                                None => {
-                                    d.chats.insert(channel, vec![msg]);
-                                }
-                            };
-                        }
-                        SocketEvent::ChannelCreated { .. } => {
-                            todo!()
-                        }
-                        SocketEvent::Disconnected => info!("Disconnected"),
-                    };
-                    Task::none()
-                }
-            },
+            AppMessage::SocketEvent((handle, socket_event)) => {
+                match socket_event {
+                    SocketEvent::Skip => info!("Skipped"),
+                    SocketEvent::MessageCreated { channel, msg } => {
+                        let d = self.messangers.mut_data_from_handle(handle).unwrap();
+                        match d.chats.get_mut(&channel) {
+                            Some(msgs) => msgs.push(msg),
+                            None => {
+                                d.chats.insert(channel, vec![msg]);
+                            }
+                        };
+                    }
+                    SocketEvent::ChannelCreated { .. } => {}
+                    SocketEvent::Disconnected => info!("Disconnected"),
+                    SocketEvent::AddAudioSource(sender) => {
+                        let producer =
+                            self.audio
+                                .create_output_channel(2, SampleFormat::I16, 48_000);
+                        if sender.send(producer).is_err() {
+                            warn!("Couldn't send audio channel to the adapter");
+                        };
+                    }
+                };
+                Task::none()
+            }
             // ====== Pages ======
             AppMessage::Login(message) => {
                 let Screen::Login(login) = &mut self.page else {
                     return Task::none();
                 };
-                match login.update(message, &self.audio) {
+                match login.update(message) {
                     pages::login::Action::None => Task::none(),
                     pages::login::Action::Login(messenger) => {
                         let handle = self.messangers.add_messanger(messenger);
@@ -467,25 +447,4 @@ impl App {
             Screen::Loading => iced::widget::text("Loading").into(),
         }
     }
-    fn subscription(&self) -> Subscription<AppMessage> {
-        Subscription::none()
-        // Subscription::run(spawn_sockets_interface).map(AppMessage::SocketEvent)
-    }
 }
-
-#[derive(Debug)]
-enum SocketMesg {
-    // Connect(Sender<ReceiverEvent>),
-    Message((MessangerHandle, SocketEvent)),
-}
-//
-// fn spawn_sockets_interface() -> impl Stream<Item = SocketMesg> {
-//     iced::task::sipper(|mut output| async move {
-//         let (mut interface, sender) = SocketsInterface::new();
-//         output.send(SocketMesg::Connect(sender)).await;
-//         loop {
-//             let msg = interface.next().await.unwrap();
-//             output.send(SocketMesg::Message(msg)).await;
-//         }
-//     })
-// }

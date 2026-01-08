@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     error::Error,
     io, mem,
     task::{Context, Poll},
@@ -10,8 +11,9 @@ use async_tungstenite::{
     async_std::{ConnectStream, connect_async},
     tungstenite::Message,
 };
+use audio::SampleProducer;
 use facet::Facet;
-use futures::StreamExt as _;
+use futures::{StreamExt as _, channel::oneshot};
 use smol::net::UdpSocket;
 use surf::http::convert::json;
 use tracing::{info, warn};
@@ -20,7 +22,7 @@ use crate::{
     Discord,
     gateaways::{
         GateawayStream, GatewayPayload, HeartBeatingData, deserialize_event,
-        voice::connection::{Connection, EncryptionMode, SessionDescription},
+        voice::connection::{Connection, EncryptionMode, SessionDescription, Ssrc},
     },
 };
 
@@ -57,7 +59,7 @@ struct HelloPayload {
 /// https://docs.discord.food/topics/voice-connections#ready-structure
 #[derive(Facet)]
 struct ReadyPayload {
-    ssrc: u32,
+    ssrc: Ssrc,
     ip: String,
     port: u16,
     modes: Vec<EncryptionMode>,
@@ -186,10 +188,16 @@ impl VoiceGateawayState {
     }
 }
 
+pub enum AudioChannel {
+    Initilizing(oneshot::Receiver<SampleProducer<5120>>),
+    Connected(SampleProducer<5120>),
+}
+
 pub struct VoiceGateaway {
     pub websocket: WebSocketStream<ConnectStream>,
     pub heart_beating: HeartBeatingData,
     pub last_sequence_number: Option<usize>,
+    pub ssrc_to_audio_channel: HashMap<Ssrc, AudioChannel>,
     pub connection: Option<Connection>,
 }
 
@@ -236,6 +244,7 @@ impl VoiceGateaway {
             heart_beating: HeartBeatingData::new(heart_beating_duration),
             last_sequence_number: None,
             connection: None,
+            ssrc_to_audio_channel: HashMap::new(),
         })
     }
     pub fn fetch_event(

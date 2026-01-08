@@ -26,14 +26,10 @@ impl Display for Platform {
     }
 }
 impl Platform {
-    pub fn to_messanger(
-        &self,
-        auth: &str,
-        audio_mixer: &Arc<Mutex<AudioMixer>>,
-    ) -> Arc<dyn NeoMessanger> {
+    pub fn to_messanger(&self, auth: &str) -> Arc<dyn NeoMessanger> {
         Arc::new(match self {
             // Self::Discord => Discord::new(&auth, audio_mixer.clone()),
-            Self::Discord => Discord::new(&auth, audio_mixer.clone()),
+            Self::Discord => Discord::new(&auth),
             Self::Test => {
                 todo!()
             }
@@ -90,11 +86,7 @@ impl Default for Login {
 }
 
 impl Login {
-    pub(crate) fn update(
-        &mut self,
-        message: Message,
-        audio_mixer: &Arc<Mutex<AudioMixer>>,
-    ) -> Action {
+    pub(crate) fn update(&mut self, message: Message) -> Action {
         match message {
             Message::ToggleButtonState => {
                 self.button_state = true;
@@ -111,7 +103,7 @@ impl Login {
                 let platform = self.selected_platform.clone();
                 let token = self.token.clone();
 
-                let messanger = platform.to_messanger(&token, audio_mixer);
+                let messanger = platform.to_messanger(&token);
                 return Action::Login(messanger);
             }
         }

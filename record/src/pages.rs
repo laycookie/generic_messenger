@@ -3,13 +3,13 @@
 pub mod login;
 pub mod messenger;
 
-use crate::{
-    SocketMesg,
-    messanger_unifier::{Call, MessangerHandle},
-};
+use crate::messanger_unifier::{Call, MessangerHandle};
 pub use login::Login;
 use login::Message as LoginMessage;
-use messaging_interface::types::{Chan, ID, Identifier, Message, Server, Usr};
+use messaging_interface::{
+    interface::SocketEvent,
+    types::{Chan, ID, Identifier, Message, Server, Usr},
+};
 use messenger::Message as MessangerMessage;
 use std::fmt::Debug;
 
@@ -53,5 +53,5 @@ pub(crate) enum AppMessage {
     Login(LoginMessage),
     Chat(MessangerMessage),
     // === Socket ===
-    SocketEvent(SocketMesg),
+    SocketEvent((MessangerHandle, SocketEvent)),
 }

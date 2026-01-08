@@ -34,7 +34,7 @@ type MessageID = String;
 
 pub struct Discord {
     // Metadata
-    token: SecureString, // TODO: Make it secure
+    token: SecureString,
     intents: u32,
     // gateaways
     gateaway: AsyncMutex<Option<Gateaway>>,
@@ -46,7 +46,7 @@ pub struct Discord {
     msg_data: RwLockAwait<HashMap<ID, MessageID>>,
 }
 impl Discord {
-    pub fn new(token: &str, sender: Arc<Mutex<AudioMixer>>) -> Self {
+    pub fn new(token: &str) -> Self {
         Discord {
             token: token.into(),
             intents: 194557,

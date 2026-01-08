@@ -1,12 +1,13 @@
 use std::error::Error;
 use std::fmt::Debug;
-use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
 use crate::types::MessageContents;
 use crate::types::{Chan, Identifier, Message, Server, Usr};
 use async_trait::async_trait;
+use audio::SampleProducer;
 use futures::Stream;
+use futures::channel::oneshot;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MessamgerError {
@@ -85,7 +86,7 @@ pub trait ParameterizedMessangerQuery: Send + Sync {
 }
 
 // === Sockets ===
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum SocketEvent {
     MessageCreated {
         channel: Identifier<()>,
@@ -95,6 +96,7 @@ pub enum SocketEvent {
         server: Option<Identifier<()>>,
         channel: Identifier<Chan>,
     },
+    AddAudioSource(oneshot::Sender<SampleProducer<5120>>),
     Disconnected,
     Skip,
 }

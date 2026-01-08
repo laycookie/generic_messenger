@@ -12,7 +12,7 @@ use std::{
     num::Wrapping,
     ops::{Add, AddAssign, Sub, SubAssign},
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 // <https://docs.discord.food/topics/voice-connections#encryption-mode>
 #[allow(non_camel_case_types)]
@@ -100,9 +100,10 @@ impl SessionDescription {
     }
 }
 
+pub type Ssrc = u32;
 pub struct Connection {
     udp: UdpSocket,
-    ssrc: u32,
+    ssrc: Ssrc,
     description: Option<SessionDescription>,
     decoder: opus::Decoder,
     rtp_packet_buf: [u8; 1024],
@@ -126,7 +127,12 @@ impl Connection {
         self.description = Some(description);
     }
 
-    pub async fn next(&mut self) -> Option<()> {
+    /// Poll next UDP voice packet.
+    ///
+    /// When a new inbound SSRC is discovered, this emits `SocketEvent::AddAudioSource(sender)`.
+    /// The UI answers by calling `sender.send(audio_source_id)`. We keep the receiver internally
+    /// and store the mapping once it resolves.
+    pub async fn recv_audio(&mut self) -> Option<(Ssrc, &[i16])> {
         let n_bytes_recived = self.udp.recv(&mut self.rtp_packet_buf).await.ok()?;
         let rtp_packet_buf = &self.rtp_packet_buf[..n_bytes_recived];
 
@@ -134,16 +140,17 @@ impl Connection {
 
         if packet_type.is_err() || packet_type != Ok(DiscordPacketType::Voice) {
             warn!("Unkown packet type on udp: {:?}", rtp_packet_buf[1]);
-            return Some(());
+            return None;
         };
 
         let rtp_packet = RtpPacket::new(rtp_packet_buf).unwrap();
+
         let is_rtp_extended = rtp_packet.get_extension() != 0;
 
         let rtp_header_len = if is_rtp_extended {
             rtp_packet.packet.len() - rtp_packet.payload().len() + 4
         } else {
-            println!("None-extended");
+            info!("None-extended");
             rtp_packet.packet.len() - rtp_packet.payload().len()
         };
         let (rtp_header, rtp_body) = rtp_packet.packet().split_at(rtp_header_len);
@@ -183,9 +190,9 @@ impl Connection {
         // <https://datatracker.ietf.org/doc/html/rfc6464>
         let (potentially, voice_data) = decrypted_payload.split_at(8);
         let unkown_const = &potentially[..1]; // CONST 55
-        let timecode_unkown = &potentially[1..4]; // Timecode
+        // let timecode = &potentially[1..4]; // Timecode
         let unkown_const_2 = &potentially[4..5]; // CONST 16
-        let avrage_volume = &potentially[5..6]; // Avrage volume of the frame?
+        // let avrage_volume = &potentially[5..6]; // Avrage volume of the frame?
         let unkown_const_3 = &potentially[6..7]; // CONST 144
         let channels = &potentially[7..]; // Channels?
         if unkown_const != [50] {
@@ -205,13 +212,15 @@ impl Connection {
             {
                 Ok(n_samples) => n_samples,
                 Err(err) => {
-                    eprintln!("{:?}", err);
-                    return Some(());
+                    error!("{:?}", err);
+                    return None;
                 }
             };
 
-        info!("{n_decoded_samples:?}");
-        Some(())
+        Some((
+            rtp_packet.get_ssrc(),
+            &self.decoded_audio_buf[..n_decoded_samples * 2], // TODO: Replace with num of channels
+        ))
     }
 }
 

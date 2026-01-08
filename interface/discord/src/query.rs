@@ -10,7 +10,7 @@ use messaging_interface::{
     types::{Chan, ChanType, Identifier, Message, MessageContents, Reaction, Server, Usr},
 };
 use std::{error::Error, path::PathBuf};
-use tracing::{error, info};
+use tracing::error;
 
 impl Discord {
     fn get_auth_header(&self) -> Vec<(&str, String)> {

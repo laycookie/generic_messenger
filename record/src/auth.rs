@@ -3,19 +3,13 @@ use std::{
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex},
 };
-
-use audio::AudioMixer;
 
 use crate::{messanger_unifier::Messangers, pages::login::Platform};
 
 pub struct MessangersGenerator;
 impl MessangersGenerator {
-    pub fn messengers_from_file(
-        path: PathBuf,
-        audio_mixer: &Arc<Mutex<AudioMixer>>,
-    ) -> Result<Messangers, Box<dyn std::error::Error>> {
+    pub fn messengers_from_file(path: PathBuf) -> Result<Messangers, Box<dyn std::error::Error>> {
         let auth_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -34,9 +28,7 @@ impl MessangersGenerator {
             };
 
             // In theory should never return false
-            let auth = Platform::from_str(platform)
-                .unwrap()
-                .to_messanger(token, audio_mixer);
+            let auth = Platform::from_str(platform).unwrap().to_messanger(token);
 
             messangers.add_messanger(auth);
         }

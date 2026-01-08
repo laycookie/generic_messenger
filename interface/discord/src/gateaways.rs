@@ -1,4 +1,5 @@
 use std::{
+    collections::hash_map,
     pin::{Pin, pin},
     sync::Arc,
     task::Poll,
@@ -10,9 +11,12 @@ use async_tungstenite::{
     WebSocketStream, async_std::ConnectStream, tungstenite::Message as WebsocketMessage,
 };
 use facet::Facet;
-use futures::{FutureExt as _, Stream, StreamExt, future::poll_fn, pending, poll};
+use futures::{
+    FutureExt as _, Stream, StreamExt, channel::oneshot, future::poll_fn, pending, poll,
+};
 use futures_timer::Delay;
 use messaging_interface::interface::{Socket, SocketEvent};
+use ringbuf::traits::Producer;
 use surf::http::convert::json;
 use tracing::{error, info, warn};
 
@@ -167,7 +171,32 @@ impl Socket for Discord {
                 && let Some(description) = connection.description()
                 && description.mode().is_some()
             {
-                connection.next().await;
+                if let Some((ssrc, audio_frame)) = connection.recv_audio().await {
+                    let mut channel = match voice_gateaway.ssrc_to_audio_channel.entry(ssrc) {
+                        hash_map::Entry::Occupied(channel) => channel,
+                        hash_map::Entry::Vacant(e) => {
+                            let (sender, reciver) = oneshot::channel();
+                            e.insert(voice::AudioChannel::Initilizing(reciver));
+                            return Some(SocketEvent::AddAudioSource(sender));
+                        }
+                    };
+                    match channel.get_mut() {
+                        voice::AudioChannel::Initilizing(receiver) => {
+                            let producer = match receiver.try_recv().unwrap() {
+                                Some(producer) => producer,
+                                None => continue,
+                            };
+                            channel.insert(voice::AudioChannel::Connected(producer));
+                        }
+                        voice::AudioChannel::Connected(producer) => {
+                            producer.push_iter(
+                                audio_frame
+                                    .iter()
+                                    .map(|sample| *sample as f32 / i16::MAX as f32),
+                            );
+                        }
+                    };
+                }
                 continue;
             };
 
