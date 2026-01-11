@@ -4,12 +4,14 @@ use crate::{
     downloaders::{cache_download, http_request},
 };
 use async_trait::async_trait;
-use futures::future::join_all;
-use messaging_interface::{
-    interface::{MessangerQuery, ParameterizedMessangerQuery},
-    types::{Chan, ChanType, Identifier, Message, MessageContents, Reaction, Server, Usr},
+use futures::{future::join_all, join};
+use messenger_interface::{
+    interface::{Query, Text},
+    types::{
+        House, Identifier, Message, Place, QueryPlace, Reaction, Room, RoomCapabilities, User,
+    },
 };
-use std::{error::Error, path::PathBuf};
+use std::error::Error;
 use tracing::error;
 
 impl Discord {
@@ -18,24 +20,229 @@ impl Discord {
     }
 }
 
+impl Discord {
+    async fn fetch_dms(&self) -> Result<Vec<Identifier<Place>>, Box<dyn Error + Sync + Send>> {
+        // DMs / group DMs
+        let channels = http_request::<Vec<api_types::Channel>>(
+            surf::get("https://discord.com/api/v10/users/@me/channels"),
+            self.get_auth_header(),
+        )
+        .await?;
+
+        let rooms_producer = channels
+                    .iter()
+                    .map(async move |channel| {
+                        let name = channel.name.to_owned().unwrap_or(
+                            match channel.recipients.as_ref().unwrap_or(&Vec::new()).first() {
+                                Some(user) => user.username.clone(),
+                                None => "Unknown".to_string(),
+                            },
+                        );
+
+                        let mut room = Room {
+                            // NOTE: DMs can have voice calls; treat as both for now.
+                            room_capabilities: RoomCapabilities::Text | RoomCapabilities::Voice,
+                            name,
+                            icon: None,
+                            participants: Vec::new(),
+                        };
+
+                        // If channel has icon, use that
+                        if let Some(hash) = &channel.icon {
+                            let icon = cache_download(
+                                format!(
+                                    "https://cdn.discordapp.com/channel-icons/{}/{}.webp?size=80&quality=lossless",
+                                    channel.id, hash
+                                ),
+                                format!("./cache/imgs/channels/discord/{}", channel.id).into(),
+                                format!("{hash}.webp"),
+                            )
+                            .await;
+                            match icon {
+                                Ok(path) => room.icon = Some(path),
+                                Err(e) => {
+                                    error!(
+                                        "Failed to download icon for channel: {}\n{}",
+                                        room.name, e
+                                    );
+                                }
+                            };
+                        } else if let Some(first) = channel
+                            .recipients
+                            .as_ref()
+                            .unwrap_or(&Vec::new())
+                            .first()
+                        {
+                            // If first recipient has an avatar, use that as room icon
+                            if let Some(hash) = &first.avatar {
+                                let icon = cache_download(
+                                    format!(
+                                        "https://cdn.discordapp.com/avatars/{}/{}.webp?size=80&quality=lossless",
+                                        first.id, hash
+                                    ),
+                                    format!("./cache/imgs/channels/discord/{}", channel.id).into(),
+                                    format!("{hash}.webp"),
+                                )
+                                .await;
+                                match icon {
+                                    Ok(path) => room.icon = Some(path),
+                                    Err(e) => {
+                                        error!(
+                                            "Failed to download icon for channel: {}\n{}",
+                                            room.name, e
+                                        );
+                                    }
+                                };
+                            }
+                        }
+
+                        Discord::identifier_generator(channel.id.as_str(), Place::Room(room))
+                    })
+                    .collect::<Vec<_>>();
+
+        let places = join_all(rooms_producer).await;
+
+        // Cache mapping internal room id -> discord channel id
+        let mut channel_data = self.channel_id_mappings.write().await;
+        for (identifier, channel) in places.iter().zip(channels) {
+            channel_data.insert(
+                *identifier.id(),
+                super::ChannelID {
+                    guild_id: channel.guild_id,
+                    id: channel.id,
+                },
+            );
+        }
+
+        Ok(places)
+    }
+
+    async fn fetch_guilds(&self) -> Result<Vec<Identifier<Place>>, Box<dyn Error + Sync + Send>> {
+        // Guilds / servers
+        let guilds = http_request::<Vec<api_types::Guild>>(
+            surf::get("https://discord.com/api/v10/users/@me/guilds"),
+            self.get_auth_header(),
+        )
+        .await?;
+
+        let house_producer = guilds.iter().map(async move |g| {
+            let icon = g.icon.as_ref().map(async move |hash| {
+                let icon = cache_download(
+                    format!(
+                        "https://cdn.discordapp.com/icons/{}/{}.webp?size=80&quality=lossless",
+                        g.id, hash
+                    ),
+                    format!("./cache/imgs/guilds/discord/{}", g.id).into(),
+                    format!("{hash}.webp"),
+                )
+                .await;
+                match icon {
+                    Ok(path) => Some(path),
+                    Err(e) => {
+                        error!("Failed to download icon for guild: {}\n{}", g.name, e);
+                        None
+                    }
+                }
+            });
+
+            let rooms = self.fetch_guild_channels(&g.id).await.unwrap_or_default();
+
+            Discord::identifier_generator(
+                g.id.as_str(),
+                Place::House(House {
+                    name: g.name.clone(),
+                    icon: match icon {
+                        Some(icon) => icon.await,
+                        None => None,
+                    },
+                    rooms,
+                }),
+            )
+        });
+
+        let places = join_all(house_producer).await;
+
+        let mut guild_map = self.guild_id_mappings.write().await;
+        for (identifier, guild) in places.iter().zip(guilds) {
+            guild_map.insert(*identifier.id(), guild.id);
+        }
+
+        Ok(places)
+    }
+
+    async fn fetch_guild_channels(
+        &self,
+        guild_id: &str,
+    ) -> Result<Vec<Identifier<Room>>, Box<dyn Error + Sync + Send>> {
+        let channels = http_request::<Vec<api_types::Channel>>(
+            surf::get(format!(
+                "https://discord.com/api/v10/guilds/{}/channels",
+                guild_id
+            )),
+            self.get_auth_header(),
+        )
+        .await?;
+
+        let mut channel_data = self.channel_id_mappings.write().await;
+        Ok(channels
+            .into_iter()
+            .filter_map(|channel| {
+                if channel
+                    .permission_overwrites
+                    .as_ref()?
+                    .iter()
+                    // TODO: Rewrite
+                    .any(|a| a.deny.parse::<u32>().unwrap() & (1 << 10) == (1 << 10))
+                {
+                    return None;
+                };
+
+                let identifier = Discord::identifier_generator(
+                    channel.id.as_str(),
+                    Room {
+                        name: channel.name.clone().unwrap(),
+                        icon: None,
+                        participants: Vec::new(),
+                        room_capabilities: RoomCapabilities::from(channel.channel_type),
+                    },
+                );
+                channel_data.insert(
+                    *identifier.id(),
+                    crate::ChannelID {
+                        guild_id: channel.guild_id,
+                        id: channel.id,
+                    },
+                );
+                Some(identifier)
+            })
+            .collect::<Vec<_>>())
+    }
+}
+
 #[async_trait]
-impl MessangerQuery for Discord {
-    async fn fetch_profile(&self) -> Result<Identifier<Usr>, Box<dyn Error + Sync + Send>> {
+impl Query for Discord {
+    async fn query_client_user(&self) -> Result<Identifier<User>, Box<dyn Error + Sync + Send>> {
         let profile = http_request::<api_types::Profile>(
             surf::get("https://discord.com/api/v9/users/@me"),
             self.get_auth_header(),
         )
         .await?;
-        let name = profile.username.clone();
 
-        let prof = Discord::identifier_generator(profile.id.as_str(), Usr { name, icon: None });
+        let prof = Discord::identifier_generator(
+            profile.id.as_str(),
+            User {
+                name: profile.username.clone(),
+                icon: None,
+            },
+        );
 
         let mut profile_cache = self.profile.write().await;
         *profile_cache = Some(profile);
 
         Ok(prof)
     }
-    async fn fetch_contacts(&self) -> Result<Vec<Identifier<Usr>>, Box<dyn Error + Sync + Send>> {
+
+    async fn query_contacts(&self) -> Result<Vec<Identifier<User>>, Box<dyn Error + Sync + Send>> {
         let friends = http_request::<Vec<api_types::Friend>>(
             surf::get("https://discord.com/api/v9/users/@me/relationships"),
             self.get_auth_header(),
@@ -56,233 +263,65 @@ impl MessangerQuery for Discord {
 
                         cache_download(url, dir.into(), filename).await.ok()
                     }
-                    None => None
+                    None => None,
                 };
-                Discord::identifier_generator(friend.id.as_str(), Usr {
+
+                Discord::identifier_generator(
+                    friend.id.as_str(),
+                    User {
                         name: friend.user.username.clone(),
                         icon: hash,
-                    })
-            })
-            .collect::<Vec<_>>();
-        let contacts = join_all(contact_producer).await;
-        Ok(contacts)
-    }
-    async fn fetch_conversation(
-        &self,
-    ) -> Result<Vec<Identifier<Chan>>, Box<dyn Error + Sync + Send>> {
-        let channels = http_request::<Vec<api_types::Channel>>(
-            surf::get("https://discord.com/api/v10/users/@me/channels"),
-            self.get_auth_header(),
-        )
-        .await?;
-
-        let conversation_producer = channels
-            .iter()
-            .map(async move |channel| {
-                let mut id = Discord::identifier_generator(channel.id.as_str(), Chan {
-                        name: channel
-                              .name
-                              .to_owned()
-                              .unwrap_or(match channel.recipients.as_ref().unwrap_or(&Vec::new()).first() {
-                                    Some(test) => test.username.clone(),
-                                    None => "Fix later".to_string(),
-                        }),
-                        icon: None,
-                        participants: Vec::new(),
-                        chan_type: ChanType::TextAndVoice,
-                    });
-
-                // If channel has icon, insert that, and return it
-                if let Some(hash) = &channel.icon {
-                    let icon = cache_download(
-                        format!(
-                            "https://cdn.discordapp.com/channel-icons/{}/{}.webp?size=80&quality=lossless",
-                            channel.id, hash
-                        ),
-                        format!("./cache/imgs/channels/discord/{}", channel.id).into(),
-                        format!("{hash}.webp"),
-                    )
-                    .await;
-                    match icon {
-                        Ok(path) => {
-                            id.data.icon = Some(path);
-                            return id;
-                        }
-                        Err(e) => {
-                            error!("Failed to download icon for channel: {}\n{}", id.data.name, e);
-                        }
-                    };
-                }
-
-                // If first recipient has a profile picture, insert that, and return
-                match channel.recipients.as_ref().unwrap_or(&Vec::new()).first() {
-                    Some(first_recipients) => {
-                        if let Some(hash) = &first_recipients.avatar {
-                            let icon = cache_download(
-                                format!(
-                                    "https://cdn.discordapp.com/avatars/{}/{}.webp?size=80&quality=lossless",
-                                    first_recipients.id, hash
-                                ),
-                                format!("./cache/imgs/channels/discord/{}", channel.id).into(),
-                                format!("{hash}.webp"),
-                            )
-                            .await;
-                            match icon {
-                                Ok(path) => {
-                                    id.data.icon = Some(path);
-                                    return id;
-                                }
-                                Err(e) => {
-                                    error!("Failed to download icon for channel: {}\n{}", id.data.name, e);
-                                }
-                            };
-                        }
-                        id
                     },
-                    None => id,
-                }
-            })
-            .collect::<Vec<_>>();
-        let conversations = join_all(conversation_producer).await;
-
-        let mut channel_data = self.channel_id_mappings.write().await;
-        for (identifier, channel) in conversations.iter().zip(channels) {
-            channel_data.insert(
-                identifier.id,
-                super::ChannelID {
-                    guild_id: channel.guild_id,
-                    id: channel.id,
-                },
-            );
-        }
-
-        Ok(conversations)
-    }
-    async fn fetch_guilds(&self) -> Result<Vec<Identifier<Server>>, Box<dyn Error + Sync + Send>> {
-        let guilds = http_request::<Vec<api_types::Guild>>(
-            surf::get("https://discord.com/api/v10/users/@me/guilds"),
-            self.get_auth_header(),
-        )
-        .await?;
-
-        let server_producer = guilds.iter().map(async move |g| {
-            let icon = g.icon.as_ref().map(async move |hash| {
-                let icon = cache_download(
-                    format!(
-                        "https://cdn.discordapp.com/icons/{}/{}.webp?size=80&quality=lossless",
-                        g.id, hash
-                    ),
-                    format!("./cache/imgs/guilds/discord/{}", g.id).into(),
-                    format!("{hash}.webp"),
                 )
-                .await;
-                match icon {
-                    Ok(path) => Some(path),
-                    Err(e) => {
-                        error!("Failed to download icon for guild: {}\n{}", g.name, e);
-                        None
-                    }
-                }
-            });
+            })
+            .collect::<Vec<_>>();
 
-            Discord::identifier_generator(
-                g.id.as_str(),
-                Server {
-                    name: g.name.clone(),
-                    icon: match icon {
-                        Some(icon) => icon.await,
-                        None => None,
-                    },
-                },
-            )
-        });
-        let servers = join_all(server_producer).await;
+        Ok(join_all(contact_producer).await)
+    }
 
-        let mut channel_data = self.guild_id_mappings.write().await;
-        for (identifier, guild) in servers.iter().zip(guilds) {
-            channel_data.insert(identifier.id, guild.id);
+    async fn query_place(
+        &self,
+        query_place: QueryPlace,
+    ) -> Result<Vec<Identifier<Place>>, Box<dyn Error + Sync + Send>> {
+        match query_place {
+            QueryPlace::Room => self.fetch_dms().await,
+            QueryPlace::House => self.fetch_guilds().await,
+            QueryPlace::All => {
+                let (dms, guilds) = join!(self.fetch_dms(), self.fetch_guilds());
+                let Ok(dms) = dms else {
+                    return guilds;
+                };
+                let Ok(guilds) = guilds else {
+                    return Ok(dms);
+                };
+                let mut all = Vec::with_capacity(dms.len() + guilds.len());
+                all.extend(dms);
+                all.extend(guilds);
+                Ok(all)
+            }
         }
-
-        Ok(servers)
     }
 }
 
 #[async_trait]
-impl ParameterizedMessangerQuery for Discord {
-    // Docs: https://discord.com/developers/docs/resources/guild#get-guild
-    async fn get_server_conversations(
-        &self,
-        location: &Identifier<Server>,
-    ) -> Vec<Identifier<Chan>> {
-        let t = self.guild_id_mappings.read().await;
-        let guild_id = t.get(&location.id).unwrap();
-
-        let channels = http_request::<Vec<api_types::Channel>>(
-            surf::get(format!(
-                "https://discord.com/api/v10/guilds/{}/channels",
-                guild_id
-            )),
-            self.get_auth_header(),
-        )
-        .await
-        .unwrap();
-
-        let mut channel_data = self.channel_id_mappings.write().await;
-        channels
-            .into_iter()
-            .filter_map(|channel| {
-                if channel
-                    .permission_overwrites
-                    .as_ref()?
-                    .iter()
-                    // TODO: Rewrite
-                    .any(|a| a.deny.parse::<u32>().unwrap() & (1 << 10) == (1 << 10))
-                {
-                    return None;
-                };
-
-                let identifier = Discord::identifier_generator(
-                    channel.id.as_str(),
-                    Chan {
-                        name: channel.name.clone().unwrap(),
-                        icon: None,
-                        participants: Vec::new(),
-                        chan_type: match channel.channel_type {
-                            api_types::ChannelTypes::GuildCategory => ChanType::Spacer,
-                            api_types::ChannelTypes::GuildText => ChanType::Text,
-                            api_types::ChannelTypes::GuildAnnouncement => ChanType::Text,
-                            api_types::ChannelTypes::GuildVoice => ChanType::Voice,
-                            api_types::ChannelTypes::GuildStageVoice => ChanType::Voice,
-                            _ => ChanType::Spacer,
-                        },
-                    },
-                );
-                channel_data.insert(
-                    identifier.id,
-                    crate::ChannelID {
-                        guild_id: channel.guild_id,
-                        id: channel.id,
-                    },
-                );
-                Some(identifier)
-            })
-            .collect::<Vec<_>>()
-    }
-    // Docs: https://discord.com/developers/docs/resources/channel#get-channel
-    // https://discord.com/developers/docs/resources/message#get-channel-message
+impl Text for Discord {
     async fn get_messages(
         &self,
-        msgs_location: &Identifier<Chan>,
-        load_from_msg: Option<Identifier<Message>>,
+        location: &Identifier<Room>,
+        load_messages_before: Option<Identifier<Message>>,
     ) -> Result<Vec<Identifier<Message>>, Box<dyn Error + Sync + Send>> {
         let t = self.channel_id_mappings.read().await;
-        let channel_id = t.get(&msgs_location.id).unwrap();
+        let channel_id = t
+            .get(location.id())
+            .ok_or("No discord channel id mapping for this room")?;
 
-        let before = match load_from_msg {
+        let before = match load_messages_before {
             Some(msg) => {
                 let t2 = self.msg_data.read().await;
-                let msg_id = t2.get(&msg.id).unwrap();
-                format!("?{}", msg_id)
+                let msg_id = t2
+                    .get(msg.id())
+                    .ok_or("No discord message id mapping for before-pagination")?;
+                format!("?before={}", msg_id)
             }
             None => "".to_string(),
         };
@@ -296,48 +335,35 @@ impl ParameterizedMessangerQuery for Discord {
         )
         .await?;
 
+        let mut msg_data = self.msg_data.write().await;
         Ok(messages
             .into_iter()
             .rev()
             .map(|message| {
-                //NOTE: I have no idea if this will ever be desynchronized
-                //For the time being, I dont want to turn this into asyncrhonous map and use cache_download()
-                let icon = message.author.avatar.and_then(|hash| {
-                    let path = PathBuf::from(format!(
-                        "./cache/imgs/users/discord/{}/{}.webp",
-                        message.author.id, hash
-                    ));
-                    path.exists().then_some(path)
-                });
-
                 let reactions = message
                     .reactions
                     .unwrap_or(Vec::new())
                     .iter()
-                    .map(|reaction| {
-                        Reaction {
-                            emoji: reaction.emoji.name.chars().next().unwrap(), // TODO: Will break
-                            count: reaction.count,
-                        }
+                    .map(|reaction| Reaction {
+                        // NOTE: Discord reactions can be custom emojis (name may not be a unicode emoji).
+                        // TODO(discord-migration): represent custom emojis (needs richer type than `char`).
+                        emoji: reaction.emoji.name.chars().next().unwrap_or('�'),
+                        count: reaction.count,
                     })
                     .collect();
 
-                Discord::identifier_generator(
+                // TODO(discord-migration): messenger_interface::types::Message currently has no author field.
+                // If UI needs author, we should reintroduce it in the interface types.
+                let identifier = Discord::identifier_generator(
                     message.id.as_str(),
                     Message {
-                        author: Discord::identifier_generator(
-                            message.author.id.as_str(),
-                            Usr {
-                                name: message.author.username,
-                                icon,
-                            },
-                        ),
-                        contents: MessageContents {
-                            text: message.content,
-                            reactions,
-                        },
+                        text: message.content,
+                        reactions,
                     },
-                )
+                );
+
+                msg_data.insert(*identifier.id(), message.id);
+                identifier
             })
             .collect())
     }
@@ -345,11 +371,13 @@ impl ParameterizedMessangerQuery for Discord {
     // Docs: https://discord.com/developers/docs/resources/message#create-message
     async fn send_message(
         &self,
-        location: &Identifier<Chan>,
-        contents: MessageContents,
+        location: &Identifier<Room>,
+        contents: Message,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
         let channel_to_id = self.channel_id_mappings.read().await;
-        let channel_id = channel_to_id.get(&location.id).unwrap();
+        let channel_id = channel_to_id
+            .get(location.id())
+            .ok_or("No discord channel id mapping for this room")?;
 
         let message = api_types::CreateMessage {
             content: Some(contents.text),
@@ -360,7 +388,7 @@ impl ParameterizedMessangerQuery for Discord {
         };
         let msg_string = facet_format_json::to_vec(&message).unwrap();
 
-        let _msgs = http_request::<api_types::Message>(
+        let _msg = http_request::<api_types::Message>(
             surf::post(format!(
                 "https://discord.com/api/v9/channels/{}/messages",
                 channel_id.id,

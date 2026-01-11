@@ -8,6 +8,8 @@ pub use cpal::{SampleFormat, SampleRate};
 use ringbuf::{CachingCons, CachingProd, traits::Consumer as _, wrap::caching::Caching};
 use tracing::{error, info};
 
+pub use ringbuf::traits::Producer;
+
 pub type AudioSampleType = f32;
 
 // === Effects ===
@@ -69,27 +71,27 @@ impl<const N: usize> Channel<N, Output> {
         (channel, producer)
     }
 }
-// impl<const N: usize> Channel<N, Input> {
-//     fn new(
-//         channel_mode: ChannelCount,
-//         sample_format: SampleFormat,
-//         sample_rate: SampleRate,
-//     ) -> (Self, SampleConsumer<N>) {
-//         let rb: SampleRb<N> = ringbuf::SharedRb::default().into();
-//         let (_, consumer) = rb.clone().split();
-//
-//         let channel = Channel {
-//             channel_count: channel_mode,
-//             sample_format,
-//             sample_rate,
-//             effects: Vec::new(),
-//             rb,
-//             _marker: PhantomData,
-//         };
-//
-//         (channel, consumer)
-//     }
-// }
+impl<const N: usize> Channel<N, Input> {
+    fn new(
+        channel_mode: ChannelCount,
+        sample_format: SampleFormat,
+        sample_rate: SampleRate,
+    ) -> (Self, SampleConsumer<N>) {
+        let rb: SampleRb<N> = ringbuf::SharedRb::default().into();
+        let consumer = CachingCons::new(rb.clone());
+
+        let channel = Channel {
+            channel_count: channel_mode,
+            sample_format,
+            sample_rate,
+            effects: Vec::new(),
+            rb,
+            _marker: PhantomData,
+        };
+
+        (channel, consumer)
+    }
+}
 
 // ==================================
 struct Master {
@@ -99,12 +101,14 @@ struct Master {
 
 pub struct AudioMixer {
     output: Option<Master>,
+    input: Option<Master>,
     output_channels: Vec<Channel<5120, Output>>,
 }
 impl Default for AudioMixer {
     fn default() -> Self {
         let mut audio_mixer = AudioMixer {
             output: None,
+            input: None,
             output_channels: Vec::new(),
         };
 
@@ -116,6 +120,13 @@ impl Default for AudioMixer {
                 stream: None,
             };
             audio_mixer.output = Some(main);
+        }
+        if let Some(input) = host.default_input_device() {
+            let main = Master {
+                device: input,
+                stream: None,
+            };
+            audio_mixer.input = Some(main);
         }
 
         audio_mixer

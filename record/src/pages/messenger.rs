@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, error::Error};
+use std::error::Error;
 
 use crate::{
     components::divider::Divider,
@@ -15,7 +15,7 @@ use iced::{
     Task,
     widget::{Responsive, Text, column, row},
 };
-use messaging_interface::types::{Chan, Identifier, Message as InterfaceMessage};
+use messenger_interface::types::{ID, Identifier, Message as InterfaceMessage, Room};
 use tracing::error;
 
 mod chat;
@@ -37,7 +37,7 @@ pub(crate) enum Message {
     DividerChange(f32),
     UpdateChat {
         handle: MessangerHandle,
-        kv: (Identifier<()>, Vec<Identifier<InterfaceMessage>>),
+        kv: (ID, Vec<Identifier<InterfaceMessage>>),
     },
 }
 
@@ -65,12 +65,12 @@ pub enum Action {
     None,
     UpdateChat {
         handle: MessangerHandle,
-        kv: (Identifier<()>, Vec<Identifier<InterfaceMessage>>),
+        kv: (ID, Vec<Identifier<InterfaceMessage>>),
     },
     Run(Task<Message>),
     Call {
         interface: MessangerInterface,
-        channel: Identifier<Chan>,
+        channel: Identifier<Room>,
     },
     DisconnectFromCall(Call),
 }
@@ -97,7 +97,7 @@ impl Messenger {
             Message::Chat(msg) => {
                 if let Main::Chat(chat) = &mut self.main {
                     return match msg {
-                        ChatAction::Call { interface, channel } => {
+                        ChatAction::Call { interface, room } => {
                             let Some(interface) =
                                 messengers.interface_from_handle(interface.handle)
                             else {
@@ -105,7 +105,7 @@ impl Messenger {
                             };
                             Action::Call {
                                 interface: interface.clone(),
-                                channel,
+                                channel: room,
                             }
                         }
                         ChatAction::Message(message) => Action::Run(
@@ -131,24 +131,11 @@ impl Messenger {
                     };
                     let interface = interface.to_owned();
 
-                    // Otherwise fetch
-                    Action::Run(
-                        Task::future(async move {
-                            let server_channels = {
-                                let pq = interface.param_query().unwrap();
-                                pq.get_server_conversations(&server).await
-                            };
-
-                            (interface, server_channels)
-                        })
-                        .then(|(interface, server_channels)| {
-                            // TODO
-                            Task::done(Message::SetSidebarServer(Some(Server::new(
-                                interface.handle,
-                                server_channels,
-                            ))))
-                        }),
-                    )
+                    let channels = server.rooms.clone();
+                    Action::Run(Task::done(Message::SetSidebarServer(Some(Server::new(
+                        interface.handle,
+                        channels,
+                    )))))
                 }
             },
             Message::Sidebar(action) => match action {
@@ -179,7 +166,7 @@ impl Messenger {
 
                     // Check cache
                     if let Some(messanger) = messengers.data_from_handle(handle)
-                        && messanger.chats.contains_key(conversation.borrow())
+                        && messanger.chats.contains_key(conversation.id())
                     {
                         return Action::Run(Task::done(Message::ChangeMain(Main::Chat(
                             Chat::new(interface.to_owned(), conversation),
@@ -195,36 +182,44 @@ impl Messenger {
                         Task::future({
                             let interface = interface.to_owned();
                             async move {
-                                let msgs_wraped = match interface.param_query() {
-                                    Ok(pq) => pq.get_messages(&conversation, None).await,
-                                    Err(err) => {
-                                        return Err(Box::new(err) as Box<dyn Error + Send + Sync>);
-                                    }
-                                };
-                                let msgs = match msgs_wraped {
-                                    Ok(msgs) => msgs,
-                                    Err(err) => {
-                                        return Err(err);
-                                    }
-                                };
+                                let text = interface
+                                    .api
+                                    .text()
+                                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+                                let msgs = text.get_messages(&conversation, None).await?;
                                 let handle = interface.handle;
 
-                                Ok((handle, conversation, msgs))
+                                Ok::<
+                                    (
+                                        MessangerHandle,
+                                        Identifier<Room>,
+                                        Vec<Identifier<InterfaceMessage>>,
+                                    ),
+                                    Box<dyn Error + Send + Sync>,
+                                >((handle, conversation, msgs))
                             }
                         })
-                        .then(|t| match t {
-                            Ok((handle, conversation, msgs)) => {
-                                let id = conversation.remove_data();
-                                Task::done(Message::UpdateChat {
-                                    handle,
-                                    kv: (id, msgs),
-                                })
-                            }
-                            Err(err) => {
-                                error!("{err}");
-                                Task::none()
-                            }
-                        }),
+                        .then(
+                            |t: Result<
+                                (
+                                    MessangerHandle,
+                                    Identifier<Room>,
+                                    Vec<Identifier<InterfaceMessage>>,
+                                ),
+                                Box<dyn Error + Send + Sync>,
+                            >| match t {
+                                Ok((handle, conversation, msgs)) => {
+                                    Task::done(Message::UpdateChat {
+                                        handle,
+                                        kv: (*conversation.id(), msgs),
+                                    })
+                                }
+                                Err(err) => {
+                                    error!("{err}");
+                                    Task::none()
+                                }
+                            },
+                        ),
                     ]))
                 }
             },

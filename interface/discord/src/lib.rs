@@ -2,17 +2,14 @@ use std::{
     collections::HashMap,
     error::Error,
     hash::{DefaultHasher, Hash, Hasher},
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Weak},
 };
 
 use async_trait::async_trait;
-use audio::AudioMixer;
 use futures::lock::Mutex as AsyncMutex;
 use futures_locks::RwLock as RwLockAwait;
-use messaging_interface::{
-    interface::{
-        MessamgerError, Messanger, MessangerQuery, ParameterizedMessangerQuery, Socket, VC,
-    },
+use messenger_interface::{
+    interface::{MessamgerError, Messanger, Query, Socket, Text, Voice},
     types::{ID, Identifier},
 };
 use secure_string::SecureString;
@@ -58,16 +55,13 @@ impl Discord {
             msg_data: RwLockAwait::new(HashMap::new()),
         }
     }
-    fn discord_id_to_internal_id(id: &str) -> u32 {
+    fn discord_id_to_internal_id(id: &str) -> ID {
         let mut hasher = DefaultHasher::new();
         id.hash(&mut hasher);
-        hasher.finish() as u32
+        hasher.finish()
     }
     fn identifier_generator<D>(id: &str, data: D) -> Identifier<D> {
-        Identifier {
-            id: Discord::discord_id_to_internal_id(id),
-            data,
-        }
+        Identifier::new(Discord::discord_id_to_internal_id(id), data)
     }
 }
 
@@ -83,10 +77,13 @@ impl Messanger for Discord {
         self.token.clone().into_unsecure()
     }
 
-    fn query(&self) -> Result<&dyn MessangerQuery, MessamgerError> {
+    fn query(&self) -> Result<&dyn Query, MessamgerError> {
         Ok(self)
     }
-    fn param_query(&self) -> Result<&dyn ParameterizedMessangerQuery, MessamgerError> {
+    fn text(&self) -> Result<&dyn Text, MessamgerError> {
+        Ok(self)
+    }
+    fn voice(&self) -> Result<&dyn Voice, Box<dyn Error + Sync + Send>> {
         Ok(self)
     }
     async fn socket(
@@ -105,11 +102,6 @@ impl Messanger for Discord {
 
         *socket = Some(gateaway);
 
-        // Ok(self.clone())
         Ok(Arc::<Discord>::downgrade(&self))
-    }
-
-    fn vc(&self) -> Result<&dyn VC, Box<dyn Error + Sync + Send>> {
-        Ok(self)
     }
 }

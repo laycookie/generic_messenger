@@ -508,15 +508,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
-name = "audio"
-version = "0.0.1"
-dependencies = [
- "cpal",
- "ringbuf",
- "tracing",
-]
-
-[[package]]
 name = "audiopus_sys"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1365,7 +1356,6 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "async-tungstenite",
- "audio",
  "facet",
  "facet-format-json",
  "facet-pretty",
@@ -1374,13 +1364,13 @@ dependencies = [
  "futures-locks",
  "futures-timer",
  "libsodium-rs",
- "messaging_interface",
+ "messenger_interface",
  "num_enum",
  "opus",
  "pnet_macros",
  "pnet_macros_support",
- "ringbuf",
  "secure-string",
+ "simple-audio-channels",
  "smol",
  "surf",
  "tracing",
@@ -3221,12 +3211,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "messaging_interface"
-version = "0.1.0"
+name = "messenger_interface"
+version = "0.0.1"
 dependencies = [
  "async-trait",
- "audio",
+ "bitflags 2.10.0",
  "futures",
+ "simple-audio-channels",
  "thiserror 2.0.17",
 ]
 
@@ -4578,14 +4569,13 @@ dependencies = [
 name = "record"
 version = "0.0.1"
 dependencies = [
- "audio",
  "discord",
  "font-kit",
  "futures",
  "iced",
- "messaging_interface",
+ "messenger_interface",
  "nom",
- "ringbuf",
+ "simple-audio-channels",
  "strum",
  "tracing",
  "tracing-subscriber",
@@ -5040,6 +5030,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95890f873bec569a0362c235787f3aca6e1e887302ba4840839bcc6459c42da6"
 dependencies = [
  "quote",
+]
+
+[[package]]
+name = "simple-audio-channels"
+version = "0.0.1"
+dependencies = [
+ "cpal",
+ "ringbuf",
+ "tracing",
 ]
 
 [[package]]

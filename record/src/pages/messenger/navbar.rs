@@ -3,7 +3,7 @@ use std::iter;
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::{Button, Column, Scrollable, image};
 use iced::{ContentFit, Element, Length};
-use messaging_interface::types::{Identifier, Server};
+use messenger_interface::types::{House, Identifier};
 
 use crate::messanger_unifier::{MessangerHandle, Messangers};
 use crate::pages::messenger::PLACEHOLDER_PFP;
@@ -16,7 +16,7 @@ pub enum Action {
     GetDMs,
     GetGuild {
         handle: MessangerHandle,
-        server: Identifier<Server>,
+        server: Identifier<House>,
     },
 }
 
@@ -26,7 +26,8 @@ impl Navbar {
 
         let servers = messengers.data_iter().flat_map(|data| {
             data.guilds.iter().map(|server| {
-                let image = match &server.icon {
+                let icon = &server.icon;
+                let image = match icon {
                     Some(icon) => image(icon),
                     None => image(PLACEHOLDER_PFP),
                 };

@@ -6,11 +6,11 @@ pub mod messenger;
 use crate::messanger_unifier::{Call, MessangerHandle};
 pub use login::Login;
 use login::Message as LoginMessage;
-use messaging_interface::{
-    interface::SocketEvent,
-    types::{Chan, ID, Identifier, Message, Server, Usr},
-};
 use messenger::Message as MessangerMessage;
+use messenger_interface::{
+    interface::SocketEvent,
+    types::{House, ID, Identifier, Message, Place, Room, User},
+};
 use std::fmt::Debug;
 
 use crate::Screen;
@@ -18,12 +18,12 @@ use crate::Screen;
 #[derive(Debug)]
 pub(crate) enum MessangerData {
     Everything {
-        profile: Identifier<Usr>,
-        contacts: Vec<Identifier<Usr>>,
-        conversations: Vec<Identifier<Chan>>,
-        servers: Vec<Identifier<Server>>,
+        profile: Identifier<User>,
+        contacts: Vec<Identifier<User>>,
+        conversations: Vec<Identifier<Room>>,
+        servers: Vec<Identifier<House>>,
     },
-    Chat((Identifier<()>, Vec<Identifier<Message>>)),
+    Chat((ID, Vec<Identifier<Message>>)),
     Call(Call),
 }
 

@@ -1,6 +1,6 @@
 use std::{
     collections::hash_map,
-    pin::{Pin, pin},
+    pin::Pin,
     sync::Arc,
     task::Poll,
     time::Duration,
@@ -15,10 +15,10 @@ use futures::{
     FutureExt as _, Stream, StreamExt, channel::oneshot, future::poll_fn, pending, poll,
 };
 use futures_timer::Delay;
-use messaging_interface::interface::{Socket, SocketEvent};
-use ringbuf::traits::Producer;
+use messenger_interface::interface::{Socket, SocketEvent};
+use simple_audio_channels::Producer;
 use surf::http::convert::json;
-use tracing::{error, info, warn};
+use tracing::warn;
 
 use crate::{Discord, gateaways::general::Opcode};
 
@@ -44,12 +44,33 @@ trait GateawayStream {
 
 impl GateawayStream for WebSocketStream<ConnectStream> {
     async fn next_gateaway_payload<Op: Facet<'static>>(&mut self) -> GatewayPayload<Op> {
-        match self.next().await.unwrap().unwrap() {
-            WebsocketMessage::Text(utf8_bytes) => {
-                facet_format_json::from_str::<GatewayPayload<Op>>(&utf8_bytes).unwrap()
+        // NOTE: this trait can't return a Result, so we "best-effort" skip frames until a valid
+        // text payload arrives.
+        //
+        // TODO(discord-migration): change this API to return `Result<GatewayPayload<_>, _>` so
+        // callers can handle socket closure/errors explicitly.
+        while let Some(next) = self.next().await {
+            match next {
+                Ok(WebsocketMessage::Text(utf8)) => {
+                    return facet_format_json::from_str::<GatewayPayload<Op>>(&utf8).unwrap()
+                }
+                Ok(WebsocketMessage::Ping(_)) | Ok(WebsocketMessage::Pong(_)) => {
+                    // ignore
+                }
+                Ok(WebsocketMessage::Binary(_)) => {
+                    // Discord can optionally send compressed/binary frames.
+                    // TODO(discord-migration): support compressed/binary gateway frames.
+                }
+                Ok(WebsocketMessage::Close(_)) => break,
+                Ok(WebsocketMessage::Frame(_)) => {
+                    // ignore
+                }
+                Err(err) => {
+                    warn!("Gateway websocket error while waiting for payload: {err:#?}");
+                }
             }
-            _ => todo!(),
         }
+        panic!("Gateway websocket closed before receiving a payload");
     }
 }
 
@@ -60,15 +81,18 @@ fn deserialize_event<Op: for<'a> Facet<'a>>(
         WebsocketMessage::Text(text) => {
             facet_format_json::from_str::<GatewayPayload<Op>>(text).unwrap()
         }
-        WebsocketMessage::Binary(_) => todo!(),
+        WebsocketMessage::Binary(_) => {
+            // TODO(discord-migration): support compressed/binary gateway frames.
+            return Err("Binary gateway frames are not supported yet".into());
+        }
         WebsocketMessage::Frame(frame) => {
             return Err(format!("Frame: {frame:?}").into());
         }
         WebsocketMessage::Close(frame) => {
             return Err(format!("Close frame: {frame:?}").into());
         }
-        WebsocketMessage::Ping(_) => todo!(),
-        WebsocketMessage::Pong(_) => todo!(),
+        WebsocketMessage::Ping(_) => return Err("Ping frame".into()),
+        WebsocketMessage::Pong(_) => return Err("Pong frame".into()),
     };
     Ok(json)
 }

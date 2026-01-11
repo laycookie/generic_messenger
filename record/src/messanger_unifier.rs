@@ -2,20 +2,20 @@
 
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
-use messaging_interface::{
+use messenger_interface::{
     interface::Messanger,
-    types::{CallStatus, Chan, ID, Identifier, Message, Server, Usr},
+    types::{CallStatus, House, ID, Identifier, Message, Place, Room, User},
 };
 
 #[derive(Debug, Clone)]
 pub struct Call {
     messanger_handle: MessangerHandle,
-    source: Identifier<Chan>,
+    source: Identifier<Room>,
     status: CallStatus,
 }
 
 impl Call {
-    pub fn new(messanger_handle: MessangerHandle, source: Identifier<Chan>) -> Self {
+    pub fn new(messanger_handle: MessangerHandle, source: Identifier<Room>) -> Self {
         Self {
             messanger_handle,
             source,
@@ -25,11 +25,11 @@ impl Call {
     pub fn handle(&self) -> MessangerHandle {
         self.messanger_handle
     }
-    pub fn source(&self) -> &Identifier<Chan> {
+    pub fn source(&self) -> &Identifier<Room> {
         &self.source
     }
     pub fn id(&self) -> ID {
-        *self.source.get_id()
+        *self.source.id()
     }
     pub fn status_str(&self) -> &str {
         match self.status {
@@ -43,11 +43,11 @@ impl Call {
 pub struct MessangerData {
     handle: MessangerHandle,
 
-    pub profile: Option<Identifier<Usr>>,
-    pub contacts: Vec<Identifier<Usr>>,
-    pub conversations: Vec<Identifier<Chan>>,
-    pub guilds: Vec<Identifier<Server>>,
-    pub chats: HashMap<Identifier<()>, Vec<Identifier<Message>>>,
+    pub profile: Option<Identifier<User>>,
+    pub contacts: Vec<Identifier<User>>,
+    pub conversations: Vec<Identifier<Room>>,
+    pub guilds: Vec<Identifier<House>>,
+    pub chats: HashMap<ID, Vec<Identifier<Message>>>,
     pub calls: Vec<Call>,
 }
 

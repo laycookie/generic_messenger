@@ -1,4 +1,5 @@
 use facet::Facet;
+use messenger_interface::types::RoomCapabilities;
 
 // === Users ===
 #[derive(Facet)]
@@ -86,6 +87,19 @@ pub enum ChannelTypes {
     GuildForum,
     GuildMedia,
 }
+impl From<ChannelTypes> for RoomCapabilities {
+    fn from(val: ChannelTypes) -> Self {
+        match val {
+            ChannelTypes::DM | ChannelTypes::GroupDM => {
+                RoomCapabilities::Text | RoomCapabilities::Voice
+            }
+            ChannelTypes::GuildText | ChannelTypes::GuildAnnouncement => RoomCapabilities::Text,
+            ChannelTypes::GuildVoice | ChannelTypes::GuildStageVoice => RoomCapabilities::Voice,
+            ChannelTypes::GuildCategory => RoomCapabilities::empty(),
+            _ => RoomCapabilities::empty(),
+        }
+    }
+}
 
 #[derive(Facet)]
 pub struct Channel {
@@ -94,6 +108,8 @@ pub struct Channel {
     #[facet(rename = "type")]
     pub(crate) channel_type: ChannelTypes,
     // flags: i32,
+    pub(crate) position: Option<i32>,
+    pub(crate) parent_id: Option<String>,
     pub(crate) icon: Option<String>,
     // pub(crate) last_message_id: Option<String>,
     pub(crate) name: Option<String>,

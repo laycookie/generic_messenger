@@ -6,7 +6,7 @@ use iced::{
         text::{Rich, Span},
     },
 };
-use messaging_interface::types::{Identifier, Message};
+use messenger_interface::types::{Identifier, Message};
 use nom::{
     IResult, Parser,
     branch::alt,
@@ -70,10 +70,12 @@ where
 
 pub fn message_text<'a, M: Clone + 'static>(msg: &'a Identifier<Message>) -> Element<'a, M> {
     // === Author ===
-    let icon = msg.data.author.data.icon.clone();
-    let icon = icon.unwrap_or_else(|| "./public/imgs/placeholder.jpg".into());
+    // TODO(record-migration): `messenger_interface::types::Message` no longer includes an author.
+    // If the UI should display author names/avatars, we should reintroduce it in the interface types
+    // (and have adapters populate it).
+    let icon: std::path::PathBuf = "./public/imgs/placeholder.jpg".into();
     let image_height = Length::Fixed(36.0);
-    let author = Text::from(msg.author.name.as_str());
+    let author = Text::from("Unknown");
 
     // === Create Message text box ===
     let mut spans: std::vec::Vec<Span<'_>> = Vec::new();

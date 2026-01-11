@@ -1,14 +1,10 @@
-use audio::AudioMixer;
 use discord::Discord;
 use iced::{
     Alignment,
     widget::{Button, Column, ComboBox, Container, TextInput, column, combo_box::State},
 };
-use messaging_interface::interface::Messanger as NeoMessanger;
-use std::{
-    fmt::Display,
-    sync::{Arc, Mutex},
-};
+use messenger_interface::interface::Messanger as NeoMessanger;
+use std::{fmt::Display, sync::Arc};
 use strum::EnumString;
 
 // TODO: Make adapters handle the functionality of this enum

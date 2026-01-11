@@ -1,9 +1,12 @@
 [package]
-name = "audio"
+name = "simple-audio-channels"
 version = "0.0.1"
 edition = "2024"
+description = "Simple audio mixer"
+license = "GPL-2.0-only"
+repository = "https://github.com/laycookie/generic_messenger"
 
 [dependencies]
 tracing = { workspace = true }
-ringbuf = { workspace = true }
+ringbuf = "0.4.8"
 cpal = "0.17.0"

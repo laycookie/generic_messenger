@@ -1,13 +1,8 @@
-use std::borrow::Borrow;
-
 use iced::{
-    Element, Length, Padding, Task,
-    widget::{
-        Button, Column, Scrollable, Text, TextInput, column, container, image, row,
-        text::LineHeight,
-    },
+    Element, Length, Task,
+    widget::{Button, Column, Scrollable, Text, TextInput, column, row, text::LineHeight},
 };
-use messaging_interface::types::{Chan, Identifier, MessageContents};
+use messenger_interface::types::{Identifier, Message as InterfaceMessage, Room};
 use tracing::error;
 
 use crate::{
@@ -18,7 +13,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Chat {
     interface: MessangerInterface,
-    channel_data: Identifier<Chan>,
+    room: Identifier<Room>,
     msg_box: String,
 }
 
@@ -26,7 +21,7 @@ pub struct Chat {
 pub enum Action {
     Call {
         interface: MessangerInterface,
-        channel: Identifier<Chan>,
+        room: Identifier<Room>,
     },
     Message(Message),
 }
@@ -38,20 +33,20 @@ pub enum Message {
 }
 
 impl Chat {
-    pub fn new(interface: MessangerInterface, channel_data: Identifier<Chan>) -> Self {
+    pub fn new(interface: MessangerInterface, room: Identifier<Room>) -> Self {
         Self {
             interface,
-            channel_data,
+            room,
             msg_box: String::new(),
         }
     }
 
     pub fn get_element<'a>(&self, messengers: &'a Messangers) -> Element<'a, Action> {
         let channel_info = row![
-            Text::new(self.channel_data.name.clone()),
+            Text::new(self.room.name.clone()),
             Button::new("CALL").on_press(Action::Call {
                 interface: self.interface.clone(),
-                channel: self.channel_data.clone()
+                room: self.room.clone()
             })
         ];
 
@@ -59,7 +54,7 @@ impl Chat {
             .data_from_handle(self.interface.handle)
             .unwrap()
             .chats
-            .get(self.channel_data.borrow());
+            .get(self.room.id());
 
         let chat = Scrollable::new(match messages {
             Some(messages) => messages
@@ -90,13 +85,26 @@ impl Chat {
             }
             Message::MsgSend => {
                 let auth = self.interface.api.to_owned();
-                let meta_data = self.channel_data.clone();
+                let meta_data = self.room.clone();
                 let contents = self.msg_box.clone();
 
                 Task::future(async move {
-                    let param = auth.param_query().unwrap();
-                    if let Err(e) = param
-                        .send_message(&meta_data, MessageContents::simple_text(&contents))
+                    let t = auth.text();
+                    let text = match t {
+                        Ok(t) => t,
+                        Err(e) => {
+                            error!("Text not supported by adapter: {e:?}");
+                            return;
+                        }
+                    };
+                    if let Err(e) = text
+                        .send_message(
+                            &meta_data,
+                            InterfaceMessage {
+                                text: contents,
+                                reactions: Vec::new(),
+                            },
+                        )
                         .await
                     {
                         error!("{e:#?}");

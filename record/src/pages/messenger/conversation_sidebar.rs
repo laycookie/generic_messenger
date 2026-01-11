@@ -2,7 +2,7 @@ use iced::{
     Color, Element, Length, Padding,
     widget::{Button, Column, Scrollable, Text, button, column, container, image, row},
 };
-use messaging_interface::types::{Chan, ChanType, Identifier};
+use messenger_interface::types::{Identifier, Room, RoomCapabilities};
 
 use super::PLACEHOLDER_PFP;
 use crate::messanger_unifier::{Call, MessangerHandle, Messangers};
@@ -10,11 +10,11 @@ use crate::messanger_unifier::{Call, MessangerHandle, Messangers};
 #[derive(Debug, Clone)]
 pub struct Server {
     pub handle: MessangerHandle,
-    pub channels: Vec<Identifier<Chan>>, // TODO: Move this into cache
+    pub channels: Vec<Identifier<Room>>, // TODO(record-migration): server channels not yet supported
 }
 
 impl Server {
-    pub fn new(handle: MessangerHandle, channels: Vec<Identifier<Chan>>) -> Self {
+    pub fn new(handle: MessangerHandle, channels: Vec<Identifier<Room>>) -> Self {
         Self { handle, channels }
     }
 }
@@ -27,12 +27,12 @@ pub struct Sidebar {
 
 #[derive(Debug, Clone)]
 pub enum Action {
-    Call(Identifier<Chan>),
+    Call(Identifier<Room>),
     Disconnect(Call),
     OpenContacts,
     OpenChat {
         handle: crate::messanger_unifier::MessangerHandle,
-        conversation: Identifier<Chan>,
+        conversation: Identifier<Room>,
     },
 }
 
@@ -47,9 +47,18 @@ impl Sidebar {
     pub fn view<'a>(&'a self, messengers: &'a Messangers) -> Element<'a, Action> {
         let elements = match &self.server_selected {
             Some(server) => Column::from_iter(server.channels.iter().map(|chan| {
-                match chan.chan_type {
-                    ChanType::Spacer => Text::new(chan.name.as_str()).into(),
-                    ChanType::Voice => Button::new(chan.name.as_str())
+                // If the backend provides a "category/spacer" row, represent it as a room with
+                // no capabilities (empty flags). Render it as a non-interactive label.
+                if chan.room_capabilities.is_empty() {
+                    return container(Text::new(chan.name.as_str()))
+                        .padding(Padding::new(0.0).left(8.0).top(6.0).bottom(2.0))
+                        .into();
+                }
+
+                if chan.room_capabilities.contains(RoomCapabilities::Voice)
+                    && !chan.room_capabilities.contains(RoomCapabilities::Text)
+                {
+                    return Button::new(chan.name.as_str())
                         .on_press(Action::Call(chan.clone()))
                         .style(|_, _| button::Style {
                             background: Some(iced::Background::Color(Color::from_rgb(
@@ -57,16 +66,15 @@ impl Sidebar {
                             ))),
                             ..Default::default()
                         })
-                        .into(),
-                    ChanType::Text => Button::new(chan.name.as_str())
-                        .on_press(Action::OpenChat {
-                            handle: server.handle,
-                            conversation: chan.to_owned(),
-                        })
-                        .width(Length::Fill)
-                        .into(),
-                    ChanType::TextAndVoice => Text::new(chan.name.as_str()).into(),
+                        .into();
                 }
+                Button::new(chan.name.as_str())
+                    .on_press(Action::OpenChat {
+                        handle: server.handle,
+                        conversation: chan.to_owned(),
+                    })
+                    .width(Length::Fill)
+                    .into()
             })),
             None => Column::from_iter(messengers.data_iter().flat_map(|data| {
                 data.conversations.iter().map(|conversation| {

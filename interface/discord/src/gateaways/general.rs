@@ -14,9 +14,9 @@ use async_tungstenite::{
 use facet::Facet;
 use facet_pretty::FacetPretty;
 use futures::StreamExt;
-use messaging_interface::{
-    interface::{SocketEvent, VC},
-    types::{Chan, Identifier, Message as GlobalMessage, MessageContents, Usr},
+use messenger_interface::{
+    interface::{SocketEvent, Voice},
+    types::{Identifier, Message as GlobalMessage, Room},
 };
 use surf::http::convert::json;
 use tracing::{error, info, warn};
@@ -201,7 +201,12 @@ impl GatewayPayload<Opcode> {
 
         match self.op {
             Opcode::Hello => {
-                todo!()
+                // Discord sends Hello when the connection is established (and sometimes on resume flows).
+                // We already handle heartbeat scheduling elsewhere, so for now we can ignore it safely.
+                //
+                // TODO(discord-migration): correctly handle Hello/resume/reconnect flows and surface
+                // `SocketEvent::Disconnected` when appropriate.
+                return Ok(SocketEvent::Skip);
             }
             Opcode::Dispatch => {
                 let event_name = self.t.as_ref().unwrap();
@@ -256,32 +261,17 @@ impl GatewayPayload<Opcode> {
 
                         let channel_id_hash =
                             Discord::discord_id_to_internal_id(message.channel_id.as_str());
-                        let msg_id_hash =
-                            Discord::discord_id_to_internal_id(message.channel_id.as_str());
-                        let author_id_hash =
-                            Discord::discord_id_to_internal_id(message.author.id.as_str());
+                        let msg_id_hash = Discord::discord_id_to_internal_id(message.id.as_str());
 
                         return Ok(SocketEvent::MessageCreated {
-                            channel: Identifier {
-                                id: channel_id_hash,
-                                data: (),
-                            },
-                            msg: Identifier {
-                                id: msg_id_hash,
-                                data: GlobalMessage {
-                                    author: Identifier {
-                                        id: author_id_hash,
-                                        data: Usr {
-                                            name: message.author.username,
-                                            icon: None, // TODO:
-                                        },
-                                    },
-                                    contents: MessageContents {
-                                        text: message.content,
-                                        reactions: Vec::new(),
-                                    },
+                            room: Identifier::new(channel_id_hash, ()),
+                            message: Identifier::new(
+                                msg_id_hash,
+                                GlobalMessage {
+                                    text: message.content,
+                                    reactions: Vec::new(),
                                 },
-                            },
+                            ),
                         });
                     }
                     "CALL_CREATE" => {
@@ -290,7 +280,7 @@ impl GatewayPayload<Opcode> {
                     "CALL_UPDATE" => {
                         info!("{:#?}", self);
                     }
-                    _ => error!("Unknown event_name received: {event_name:?}",),
+                    _ => warn!("Unknown event_name received: {event_name:?}",),
                 }
             }
             Opcode::HeartbeatAck => {
@@ -305,13 +295,21 @@ impl GatewayPayload<Opcode> {
 }
 
 #[async_trait]
-impl VC for Discord {
-    async fn connect<'a>(&'a self, location: &Identifier<Chan>) {
+impl Voice for Discord {
+    async fn connect<'a>(&'a self, location: &Identifier<Room>) {
         let mut voice_gateaway = self.voice_gateaway.lock().await;
         *voice_gateaway = VoiceGateawayState::AwaitingData;
 
         let channels_map = self.channel_id_mappings.read().await;
-        let channel = channels_map.get(location.get_id()).unwrap();
+        let channel = match channels_map.get(location.id()) {
+            Some(c) => c,
+            None => {
+                // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
+                // and support guild voice channels too.
+                warn!("Tried to connect voice for a Room without a discord channel mapping");
+                return;
+            }
+        };
 
         let payload = json!({
             "op": Opcode::VoiceStateUpdate as u8,
@@ -334,12 +332,20 @@ impl VC for Discord {
             .await
             .unwrap();
     }
-    async fn disconnect<'a>(&'a self, location: &Identifier<Chan>) {
+    async fn disconnect<'a>(&'a self, location: &Identifier<Room>) {
         let mut voice_gateaway = self.voice_gateaway.lock().await;
         *voice_gateaway = VoiceGateawayState::Closed;
 
         let channels_map = self.channel_id_mappings.read().await;
-        let channel = channels_map.get(location.get_id()).unwrap();
+        let channel = match channels_map.get(location.id()) {
+            Some(c) => c,
+            None => {
+                // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
+                // and support guild voice channels too.
+                warn!("Tried to disconnect voice for a Room without a discord channel mapping");
+                return;
+            }
+        };
 
         let payload = json!({
             "op": Opcode::VoiceStateUpdate as u8,

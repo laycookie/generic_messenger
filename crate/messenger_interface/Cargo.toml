@@ -1,0 +1,14 @@
+[package]
+name = "messenger_interface"
+version = "0.0.1"
+edition = "2024"
+description = "Interface for messaging system"
+license = "GPL-2.0-only"
+repository = "https://github.com/laycookie/generic_messenger"
+
+[dependencies]
+simple-audio-channels = { path = "../audio", version = "0.0.1" }
+async-trait = { workspace = true }
+futures = { workspace = true }
+thiserror = "2.0.17"
+bitflags = "2.10.0"

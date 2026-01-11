@@ -11,9 +11,9 @@ use async_tungstenite::{
     async_std::{ConnectStream, connect_async},
     tungstenite::Message,
 };
-use audio::SampleProducer;
 use facet::Facet;
 use futures::{StreamExt as _, channel::oneshot};
+use simple_audio_channels::SampleProducer;
 use smol::net::UdpSocket;
 use surf::http::convert::json;
 use tracing::{info, warn};
