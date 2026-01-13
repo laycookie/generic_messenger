@@ -12,10 +12,14 @@ members = [
 # Logs
 tracing = "0.1.43"
 # Serilization/Deserilization
-facet = "0.35.0"
-facet-value = "0.35.0"
-facet-format-json = "0.35.0"
-facet-pretty = "0.35.0"
+# facet = "0.42.0"
+facet = { git = "https://github.com/facet-rs/facet", branch = "main" }
+# facet-value = "0.42.0"
+facet-value = { git = "https://github.com/facet-rs/facet", branch = "main" }
+# facet-json = "0.42.0"
+facet-json = { git = "https://github.com/facet-rs/facet", branch = "main" }
+# facet-pretty = "0.42.0"
+facet-pretty = { git = "https://github.com/facet-rs/facet", branch = "main" }
 # Async
 futures = "0.3.31"
 async-trait = "0.1.89"

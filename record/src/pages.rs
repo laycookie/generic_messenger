@@ -20,8 +20,8 @@ pub(crate) enum MessangerData {
     Everything {
         profile: Identifier<User>,
         contacts: Vec<Identifier<User>>,
-        conversations: Vec<Identifier<Room>>,
-        servers: Vec<Identifier<House>>,
+        conversations: Vec<Identifier<Place<Room>>>,
+        servers: Vec<Identifier<Place<House>>>,
     },
     Chat((ID, Vec<Identifier<Message>>)),
     Call(Call),

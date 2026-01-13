@@ -15,7 +15,7 @@ use iced::{
     Task,
     widget::{Responsive, Text, column, row},
 };
-use messenger_interface::types::{ID, Identifier, Message as InterfaceMessage, Room};
+use messenger_interface::types::{ID, Identifier, Message as InterfaceMessage, Place, Room};
 use tracing::error;
 
 mod chat;
@@ -70,7 +70,7 @@ pub enum Action {
     Run(Task<Message>),
     Call {
         interface: MessangerInterface,
-        channel: Identifier<Room>,
+        channel: Identifier<Place<Room>>,
     },
     DisconnectFromCall(Call),
 }
@@ -131,11 +131,57 @@ impl Messenger {
                     };
                     let interface = interface.to_owned();
 
-                    let channels = server.rooms.clone();
-                    Action::Run(Task::done(Message::SetSidebarServer(Some(Server::new(
-                        interface.handle,
-                        channels,
-                    )))))
+                    // Check if rooms are already loaded
+                    if server.rooms.is_some() {
+                        // Extract rooms from House data
+                        let channels = server.rooms.clone().unwrap_or_default();
+                        return Action::Run(Task::done(Message::SetSidebarServer(Some(Server::new(
+                            interface.handle,
+                            channels,
+                        )))));
+                    }
+
+                    // Rooms not loaded, fetch them via house_details
+                    Action::Run(Task::future({
+                        let interface = interface.to_owned();
+                        let server = server.clone();
+                        async move {
+                            let query = interface.query();
+                            match query {
+                                Ok(q) => {
+                                    match q.house_details(server).await {
+                                        Ok(house) => {
+                                            // Use the fetched rooms
+                                            let channels = house.rooms.clone().unwrap_or_default();
+                                            Ok((interface.handle, channels))
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to fetch house details: {e:#?}");
+                                            Err(e)
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Query not available: {e:?}");
+                                    Err(Box::new(e) as Box<dyn Error + Send + Sync>)
+                                }
+                            }
+                        }
+                    })
+                    .then(|result| {
+                        match result {
+                            Ok((handle, channels)) => {
+                                Task::done(Message::SetSidebarServer(Some(Server::new(
+                                    handle,
+                                    channels,
+                                ))))
+                            }
+                            Err(e) => {
+                                error!("Error fetching house details: {e:#?}");
+                                Task::none()
+                            }
+                        }
+                    }))
                 }
             },
             Message::Sidebar(action) => match action {
@@ -192,7 +238,7 @@ impl Messenger {
                                 Ok::<
                                     (
                                         MessangerHandle,
-                                        Identifier<Room>,
+                                        Identifier<Place<Room>>,
                                         Vec<Identifier<InterfaceMessage>>,
                                     ),
                                     Box<dyn Error + Send + Sync>,
@@ -203,7 +249,7 @@ impl Messenger {
                             |t: Result<
                                 (
                                     MessangerHandle,
-                                    Identifier<Room>,
+                                    Identifier<Place<Room>>,
                                     Vec<Identifier<InterfaceMessage>>,
                                 ),
                                 Box<dyn Error + Send + Sync>,

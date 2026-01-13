@@ -29,7 +29,7 @@ pub async fn http_request<T: for<'a> Facet<'a>>(
     }
 
     let json_stringified = res.body_string().await?;
-    let json = facet_format_json::from_str(&json_stringified)?;
+    let json = facet_json::from_str(&json_stringified)?;
 
     Ok(json)
 }

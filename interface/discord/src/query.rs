@@ -4,12 +4,10 @@ use crate::{
     downloaders::{cache_download, http_request},
 };
 use async_trait::async_trait;
-use futures::{future::join_all, join};
+use futures::future::join_all;
 use messenger_interface::{
-    interface::{Query, Text},
-    types::{
-        House, Identifier, Message, Place, QueryPlace, Reaction, Room, RoomCapabilities, User,
-    },
+    interface::{MessengerError, Query, Text},
+    types::{House, Identifier, Message, Place, Reaction, Room, RoomCapabilities, User},
 };
 use std::error::Error;
 use tracing::error;
@@ -21,7 +19,9 @@ impl Discord {
 }
 
 impl Discord {
-    async fn fetch_dms(&self) -> Result<Vec<Identifier<Place>>, Box<dyn Error + Sync + Send>> {
+    async fn fetch_dms(
+        &self,
+    ) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
         // DMs / group DMs
         let channels = http_request::<Vec<api_types::Channel>>(
             surf::get("https://discord.com/api/v10/users/@me/channels"),
@@ -30,75 +30,15 @@ impl Discord {
         .await?;
 
         let rooms_producer = channels
-                    .iter()
-                    .map(async move |channel| {
-                        let name = channel.name.to_owned().unwrap_or(
-                            match channel.recipients.as_ref().unwrap_or(&Vec::new()).first() {
-                                Some(user) => user.username.clone(),
-                                None => "Unknown".to_string(),
-                            },
-                        );
-
-                        let mut room = Room {
-                            // NOTE: DMs can have voice calls; treat as both for now.
-                            room_capabilities: RoomCapabilities::Text | RoomCapabilities::Voice,
-                            name,
-                            icon: None,
-                            participants: Vec::new(),
-                        };
-
-                        // If channel has icon, use that
-                        if let Some(hash) = &channel.icon {
-                            let icon = cache_download(
-                                format!(
-                                    "https://cdn.discordapp.com/channel-icons/{}/{}.webp?size=80&quality=lossless",
-                                    channel.id, hash
-                                ),
-                                format!("./cache/imgs/channels/discord/{}", channel.id).into(),
-                                format!("{hash}.webp"),
-                            )
-                            .await;
-                            match icon {
-                                Ok(path) => room.icon = Some(path),
-                                Err(e) => {
-                                    error!(
-                                        "Failed to download icon for channel: {}\n{}",
-                                        room.name, e
-                                    );
-                                }
-                            };
-                        } else if let Some(first) = channel
-                            .recipients
-                            .as_ref()
-                            .unwrap_or(&Vec::new())
-                            .first()
-                        {
-                            // If first recipient has an avatar, use that as room icon
-                            if let Some(hash) = &first.avatar {
-                                let icon = cache_download(
-                                    format!(
-                                        "https://cdn.discordapp.com/avatars/{}/{}.webp?size=80&quality=lossless",
-                                        first.id, hash
-                                    ),
-                                    format!("./cache/imgs/channels/discord/{}", channel.id).into(),
-                                    format!("{hash}.webp"),
-                                )
-                                .await;
-                                match icon {
-                                    Ok(path) => room.icon = Some(path),
-                                    Err(e) => {
-                                        error!(
-                                            "Failed to download icon for channel: {}\n{}",
-                                            room.name, e
-                                        );
-                                    }
-                                };
-                            }
-                        }
-
-                        Discord::identifier_generator(channel.id.as_str(), Place::Room(room))
-                    })
-                    .collect::<Vec<_>>();
+            .iter()
+            .map(async move |channel| {
+                let (name, icon, room_data) = channel.to_room_data().await;
+                Discord::identifier_generator(
+                    channel.id.as_str(),
+                    Place::new(name, icon, room_data),
+                )
+            })
+            .collect::<Vec<_>>();
 
         let places = join_all(rooms_producer).await;
 
@@ -117,7 +57,9 @@ impl Discord {
         Ok(places)
     }
 
-    async fn fetch_guilds(&self) -> Result<Vec<Identifier<Place>>, Box<dyn Error + Sync + Send>> {
+    async fn fetch_guilds(
+        &self,
+    ) -> Result<Vec<Identifier<Place<House>>>, Box<dyn Error + Sync + Send>> {
         // Guilds / servers
         let guilds = http_request::<Vec<api_types::Guild>>(
             surf::get("https://discord.com/api/v10/users/@me/guilds"),
@@ -145,18 +87,18 @@ impl Discord {
                 }
             });
 
-            let rooms = self.fetch_guild_channels(&g.id).await.unwrap_or_default();
+            // let rooms = self.fetch_guild_channels(&g.id).await.unwrap_or_default();
 
             Discord::identifier_generator(
                 g.id.as_str(),
-                Place::House(House {
-                    name: g.name.clone(),
-                    icon: match icon {
+                Place::new(
+                    g.name.clone(),
+                    match icon {
                         Some(icon) => icon.await,
                         None => None,
                     },
-                    rooms,
-                }),
+                    House::new(None),
+                ),
             )
         });
 
@@ -173,7 +115,7 @@ impl Discord {
     async fn fetch_guild_channels(
         &self,
         guild_id: &str,
-    ) -> Result<Vec<Identifier<Room>>, Box<dyn Error + Sync + Send>> {
+    ) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
         let channels = http_request::<Vec<api_types::Channel>>(
             surf::get(format!(
                 "https://discord.com/api/v10/guilds/{}/channels",
@@ -197,14 +139,21 @@ impl Discord {
                     return None;
                 };
 
+                let channel_name = channel
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string());
                 let identifier = Discord::identifier_generator(
                     channel.id.as_str(),
-                    Room {
-                        name: channel.name.clone().unwrap(),
-                        icon: None,
-                        participants: Vec::new(),
-                        room_capabilities: RoomCapabilities::from(channel.channel_type),
-                    },
+                    Place::new(
+                        channel_name,
+                        None,
+                        Room::new(
+                            RoomCapabilities::from(channel.channel_type),
+                            Some(Vec::new()),
+                            None,
+                        ),
+                    ),
                 );
                 channel_data.insert(
                     *identifier.id(),
@@ -221,7 +170,7 @@ impl Discord {
 
 #[async_trait]
 impl Query for Discord {
-    async fn query_client_user(&self) -> Result<Identifier<User>, Box<dyn Error + Sync + Send>> {
+    async fn client_user(&self) -> Result<Identifier<User>, Box<dyn Error + Sync + Send>> {
         let profile = http_request::<api_types::Profile>(
             surf::get("https://discord.com/api/v9/users/@me"),
             self.get_auth_header(),
@@ -242,7 +191,7 @@ impl Query for Discord {
         Ok(prof)
     }
 
-    async fn query_contacts(&self) -> Result<Vec<Identifier<User>>, Box<dyn Error + Sync + Send>> {
+    async fn contacts(&self) -> Result<Vec<Identifier<User>>, Box<dyn Error + Sync + Send>> {
         let friends = http_request::<Vec<api_types::Friend>>(
             surf::get("https://discord.com/api/v9/users/@me/relationships"),
             self.get_auth_header(),
@@ -279,27 +228,31 @@ impl Query for Discord {
         Ok(join_all(contact_producer).await)
     }
 
-    async fn query_place(
+    async fn rooms(&self) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
+        self.fetch_dms().await
+    }
+
+    async fn houses(&self) -> Result<Vec<Identifier<Place<House>>>, Box<dyn Error + Sync + Send>> {
+        self.fetch_guilds().await
+    }
+
+    // TODO: Implement room_details and house_details if needed
+    // These would fetch detailed information about a specific room/house
+
+    async fn house_details(
         &self,
-        query_place: QueryPlace,
-    ) -> Result<Vec<Identifier<Place>>, Box<dyn Error + Sync + Send>> {
-        match query_place {
-            QueryPlace::Room => self.fetch_dms().await,
-            QueryPlace::House => self.fetch_guilds().await,
-            QueryPlace::All => {
-                let (dms, guilds) = join!(self.fetch_dms(), self.fetch_guilds());
-                let Ok(dms) = dms else {
-                    return guilds;
-                };
-                let Ok(guilds) = guilds else {
-                    return Ok(dms);
-                };
-                let mut all = Vec::with_capacity(dms.len() + guilds.len());
-                all.extend(dms);
-                all.extend(guilds);
-                Ok(all)
-            }
-        }
+        house: Identifier<Place<House>>,
+    ) -> Result<House, Box<dyn Error + Sync + Send>> {
+        let rooms = {
+            let mapping = self.guild_id_mappings.read().await;
+            let guild_id = mapping
+                .get(house.id())
+                .ok_or("No discord guild id mapping for this house")?;
+            self.fetch_guild_channels(guild_id.as_str())
+                .await
+                .unwrap_or_default()
+        };
+        Ok(House::new(Some(rooms)))
     }
 }
 
@@ -307,7 +260,7 @@ impl Query for Discord {
 impl Text for Discord {
     async fn get_messages(
         &self,
-        location: &Identifier<Room>,
+        location: &Identifier<Place<Room>>,
         load_messages_before: Option<Identifier<Message>>,
     ) -> Result<Vec<Identifier<Message>>, Box<dyn Error + Sync + Send>> {
         let t = self.channel_id_mappings.read().await;
@@ -371,7 +324,7 @@ impl Text for Discord {
     // Docs: https://discord.com/developers/docs/resources/message#create-message
     async fn send_message(
         &self,
-        location: &Identifier<Room>,
+        location: &Identifier<Place<Room>>,
         contents: Message,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
         let channel_to_id = self.channel_id_mappings.read().await;
@@ -386,7 +339,7 @@ impl Text for Discord {
             tts: Some(false),
             flags: Some(0),
         };
-        let msg_string = facet_format_json::to_vec(&message).unwrap();
+        let msg_string = facet_json::to_vec(&message).unwrap();
 
         let _msg = http_request::<api_types::Message>(
             surf::post(format!(

@@ -3,7 +3,7 @@ use std::iter;
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::{Button, Column, Scrollable, image};
 use iced::{ContentFit, Element, Length};
-use messenger_interface::types::{House, Identifier};
+use messenger_interface::types::{House, Identifier, Place};
 
 use crate::messanger_unifier::{MessangerHandle, Messangers};
 use crate::pages::messenger::PLACEHOLDER_PFP;
@@ -16,7 +16,7 @@ pub enum Action {
     GetDMs,
     GetGuild {
         handle: MessangerHandle,
-        server: Identifier<House>,
+        server: Identifier<Place<House>>,
     },
 }
 

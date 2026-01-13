@@ -1,5 +1,8 @@
 use facet::Facet;
-use messenger_interface::types::RoomCapabilities;
+use messenger_interface::types::{Identifier, Room, RoomCapabilities};
+use tracing::error;
+
+use crate::{Discord, downloaders::cache_download};
 
 // === Users ===
 #[derive(Facet)]
@@ -69,7 +72,7 @@ pub(crate) struct OverwriteObject {
     pub(crate) deny: String,
 }
 
-#[derive(Facet)]
+#[derive(Facet, Clone, Copy)]
 #[facet(is_numeric)]
 #[repr(u8)]
 pub enum ChannelTypes {
@@ -103,18 +106,86 @@ impl From<ChannelTypes> for RoomCapabilities {
 
 #[derive(Facet)]
 pub struct Channel {
-    pub(crate) id: String,
-    pub(crate) guild_id: Option<String>,
+    pub id: String,
+    pub guild_id: Option<String>,
     #[facet(rename = "type")]
-    pub(crate) channel_type: ChannelTypes,
+    pub channel_type: ChannelTypes,
     // flags: i32,
-    pub(crate) position: Option<i32>,
-    pub(crate) parent_id: Option<String>,
-    pub(crate) icon: Option<String>,
+    pub position: Option<i32>,
+    pub parent_id: Option<String>,
+    pub icon: Option<String>,
     // pub(crate) last_message_id: Option<String>,
-    pub(crate) name: Option<String>,
-    pub(crate) recipients: Option<Vec<Recipient>>,
-    pub(crate) permission_overwrites: Option<Vec<OverwriteObject>>,
+    pub name: Option<String>,
+    pub recipients: Option<Vec<Recipient>>,
+    pub permission_overwrites: Option<Vec<OverwriteObject>>,
+}
+impl Channel {
+    // TODO: This method is deprecated - use to_room_data() instead
+    // Kept for backward compatibility during migration
+    pub async fn to_room(&self) -> (String, Option<std::path::PathBuf>, Room) {
+        let (name, icon, room) = self.to_room_data().await;
+        (name, icon, room)
+    }
+
+    /// Extract room data, name, and icon from a channel.
+    /// Returns (name, icon, room_data).
+    pub async fn to_room_data(&self) -> (String, Option<std::path::PathBuf>, Room) {
+        let name = self.name.to_owned().unwrap_or(
+            match self.recipients.as_ref().unwrap_or(&Vec::new()).first() {
+                Some(user) => user.username.clone(),
+                None => "Unknown".to_string(),
+            },
+        );
+
+        let mut icon = None;
+
+        // If channel has icon, use that
+        if let Some(hash) = &self.icon {
+            let downloaded_icon = cache_download(
+                format!(
+                    "https://cdn.discordapp.com/channel-icons/{}/{}.webp?size=80&quality=lossless",
+                    self.id, hash
+                ),
+                format!("./cache/imgs/channels/discord/{}", self.id).into(),
+                format!("{hash}.webp"),
+            )
+            .await;
+            match downloaded_icon {
+                Ok(path) => icon = Some(path),
+                Err(e) => {
+                    error!("Failed to download icon for channel: {}\n{}", name, e);
+                }
+            };
+        } else if let Some(first) = self.recipients.as_ref().unwrap_or(&Vec::new()).first() {
+            // If first recipient has an avatar, use that as room icon
+            if let Some(hash) = &first.avatar {
+                let downloaded_icon = cache_download(
+                    format!(
+                        "https://cdn.discordapp.com/avatars/{}/{}.webp?size=80&quality=lossless",
+                        first.id, hash
+                    ),
+                    format!("./cache/imgs/channels/discord/{}", self.id).into(),
+                    format!("{hash}.webp"),
+                )
+                .await;
+                match downloaded_icon {
+                    Ok(path) => icon = Some(path),
+                    Err(e) => {
+                        error!("Failed to download icon for channel: {}\n{}", name, e);
+                    }
+                };
+            }
+        }
+
+        let room = Room::new(
+            // NOTE: DMs can have voice calls; treat as both for now.
+            RoomCapabilities::from(self.channel_type),
+            Some(Vec::new()),
+            None,
+        );
+
+        (name, icon, room)
+    }
 }
 
 #[derive(Facet)]

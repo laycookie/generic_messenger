@@ -1,6 +1,6 @@
 use std::{
     collections::hash_map,
-    pin::Pin,
+    pin::{Pin, pin},
     sync::Arc,
     task::Poll,
     time::Duration,
@@ -18,9 +18,12 @@ use futures_timer::Delay;
 use messenger_interface::interface::{Socket, SocketEvent};
 use simple_audio_channels::Producer;
 use surf::http::convert::json;
-use tracing::warn;
+use tracing::{error, info, warn};
 
-use crate::{Discord, gateaways::general::Opcode};
+use crate::{
+    Discord,
+    gateaways::general::{GatewayEvent, Opcode},
+};
 
 pub mod general;
 pub mod voice;
@@ -31,7 +34,7 @@ pub struct GatewayPayload<Op> {
     // Opcode
     op: Op,
     // Event type
-    t: Option<String>,
+    t: Option<GatewayEvent>,
     // Sequence numbers
     s: Option<usize>,
     // data
@@ -52,7 +55,7 @@ impl GateawayStream for WebSocketStream<ConnectStream> {
         while let Some(next) = self.next().await {
             match next {
                 Ok(WebsocketMessage::Text(utf8)) => {
-                    return facet_format_json::from_str::<GatewayPayload<Op>>(&utf8).unwrap()
+                    return facet_json::from_str::<GatewayPayload<Op>>(&utf8).unwrap();
                 }
                 Ok(WebsocketMessage::Ping(_)) | Ok(WebsocketMessage::Pong(_)) => {
                     // ignore
@@ -78,9 +81,13 @@ fn deserialize_event<Op: for<'a> Facet<'a>>(
     event: &WebsocketMessage,
 ) -> Result<GatewayPayload<Op>, Box<dyn std::error::Error + Send + Sync>> {
     let json = match event {
-        WebsocketMessage::Text(text) => {
-            facet_format_json::from_str::<GatewayPayload<Op>>(text).unwrap()
-        }
+        WebsocketMessage::Text(text) => match facet_json::from_str::<GatewayPayload<Op>>(text) {
+            Ok(event) => event,
+            Err(err) => {
+                warn!("Failed to parse: {text}");
+                return Err(Box::new(err));
+            }
+        },
         WebsocketMessage::Binary(_) => {
             // TODO(discord-migration): support compressed/binary gateway frames.
             return Err("Binary gateway frames are not supported yet".into());
@@ -151,8 +158,12 @@ impl Socket for Discord {
                     }
 
                     match poll!(poll_fn(|cx| gateaway.fetch_event(cx))) {
-                        Poll::Ready(events) => Some(events),
-                        _ => None,
+                        Poll::Ready(Ok(event)) => Some(event),
+                        Poll::Ready(Err(err)) => {
+                            warn!("Failed to parse event: {err}");
+                            continue;
+                        }
+                        Poll::Pending => None,
                     }
                 }
                 None => None,
@@ -178,8 +189,15 @@ impl Socket for Discord {
                     }
 
                     match poll!(poll_fn(|cx| voice_gateaway.fetch_event(cx))) {
-                        Poll::Ready(events) => Some(events),
-                        _ => None,
+                        Poll::Ready(Ok(voice_event)) => Some(voice_event),
+                        Poll::Ready(Err(err)) => {
+                            warn!("Failed to parse voice_event: {err}");
+                            if event.is_none() {
+                                continue;
+                            }
+                            None
+                        }
+                        Poll::Pending => None,
                     }
                 }
                 None => None,
@@ -195,11 +213,13 @@ impl Socket for Discord {
                 && let Some(description) = connection.description()
                 && description.mode().is_some()
             {
-                if let Some((ssrc, audio_frame)) = connection.recv_audio().await {
+                if let Poll::Ready(Some((ssrc, audio_frame))) = poll!(pin!(connection.recv_audio()))
+                {
                     let mut channel = match voice_gateaway.ssrc_to_audio_channel.entry(ssrc) {
                         hash_map::Entry::Occupied(channel) => channel,
                         hash_map::Entry::Vacant(e) => {
                             let (sender, reciver) = oneshot::channel();
+                            error!("Open channel for: {ssrc}");
                             e.insert(voice::AudioChannel::Initilizing(reciver));
                             return Some(SocketEvent::AddAudioSource(sender));
                         }
@@ -213,6 +233,7 @@ impl Socket for Discord {
                             channel.insert(voice::AudioChannel::Connected(producer));
                         }
                         voice::AudioChannel::Connected(producer) => {
+                            // error!("{ssrc}: Talking: {audio_frame:?}");
                             producer.push_iter(
                                 audio_frame
                                     .iter()
@@ -228,20 +249,20 @@ impl Socket for Discord {
             pending!()
         };
 
-        if let Some(Ok(event)) = voice_event {
+        if let Some(event) = voice_event {
             match event.exec(&self).await {
                 Ok(event) => {}
                 Err(err) => {
-                    warn!("Failed to execute voice_gateway event: {err:#?}");
+                    warn!("Failed to execute voice_gateway event: {err}");
                 }
             };
         };
 
-        if let Some(Ok(event)) = event {
+        if let Some(event) = event {
             match event.exec(&self).await {
                 Ok(event) => return Some(event),
                 Err(err) => {
-                    warn!("Failed to execute gateway event: {err:#?}");
+                    warn!("Failed to execute gateway event: {err}");
                     // return None;
                 }
             };
