@@ -2,7 +2,7 @@ use iced::{
     Element, Length, Task,
     widget::{Button, Column, Scrollable, Text, TextInput, column, row, text::LineHeight},
 };
-use messenger_interface::types::{Identifier, Message as InterfaceMessage, Room};
+use messenger_interface::types::{Identifier, Message as InterfaceMessage, Place, Room};
 use tracing::error;
 
 use crate::{
@@ -13,7 +13,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Chat {
     interface: MessangerInterface,
-    room: Identifier<Room>,
+    room: Identifier<Place<Room>>,
     msg_box: String,
 }
 
@@ -21,7 +21,7 @@ pub struct Chat {
 pub enum Action {
     Call {
         interface: MessangerInterface,
-        room: Identifier<Room>,
+        room: Identifier<Place<Room>>,
     },
     Message(Message),
 }
@@ -33,7 +33,7 @@ pub enum Message {
 }
 
 impl Chat {
-    pub fn new(interface: MessangerInterface, room: Identifier<Room>) -> Self {
+    pub fn new(interface: MessangerInterface, room: Identifier<Place<Room>>) -> Self {
         Self {
             interface,
             room,

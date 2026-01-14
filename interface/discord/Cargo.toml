@@ -19,7 +19,7 @@ surf = "2.3.2"
 # Serialize/Deserialize
 facet = { workspace = true }
 facet-value = { workspace = true }
-facet-format-json = { workspace = true }
+facet-json = { workspace = true }
 facet-pretty = { workspace = true }
 # Networking
 smol = "2.0.2"

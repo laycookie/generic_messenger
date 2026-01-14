@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::lock::Mutex as AsyncMutex;
 use futures_locks::RwLock as RwLockAwait;
 use messenger_interface::{
-    interface::{MessamgerError, Messanger, Query, Socket, Text, Voice},
+    interface::{Messenger, MessengerError, Query, Socket, Text, Voice},
     types::{ID, Identifier},
 };
 use secure_string::SecureString;
@@ -66,7 +66,7 @@ impl Discord {
 }
 
 #[async_trait]
-impl Messanger for Discord {
+impl Messenger for Discord {
     fn id(&self) -> String {
         self.name().to_owned() + self.token.unsecure()
     }
@@ -77,10 +77,10 @@ impl Messanger for Discord {
         self.token.clone().into_unsecure()
     }
 
-    fn query(&self) -> Result<&dyn Query, MessamgerError> {
+    fn query(&self) -> Result<&dyn Query, MessengerError> {
         Ok(self)
     }
-    fn text(&self) -> Result<&dyn Text, MessamgerError> {
+    fn text(&self) -> Result<&dyn Text, MessengerError> {
         Ok(self)
     }
     fn voice(&self) -> Result<&dyn Voice, Box<dyn Error + Sync + Send>> {

@@ -5,7 +5,11 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 pub use cpal::{SampleFormat, SampleRate};
-use ringbuf::{CachingCons, CachingProd, traits::Consumer as _, wrap::caching::Caching};
+use ringbuf::{
+    CachingCons, CachingProd,
+    traits::{Consumer as _, Observer},
+    wrap::caching::Caching,
+};
 use tracing::{error, info};
 
 pub use ringbuf::traits::Producer;
@@ -150,8 +154,9 @@ impl AudioMixer {
 
         self.output_channels.push(channel);
         if let Some(master) = &self.output
-            && master.stream.is_none()
+        // && master.stream.is_none()
         {
+            self.stop_stream_output();
             self.start_stream_output();
         };
 
@@ -179,22 +184,27 @@ impl AudioMixer {
             stream_config.sample_rate = 48_000; // TODO: Determene by device preference in future
 
             info!("Starting output stream with config: {:#?}", stream_config);
-            let mut sample_consumers: Vec<SampleConsumer<5120>> = self
+            let mut sample_consumers = self
                 .output_channels
                 .iter()
                 .map(|channel| CachingCons::new(channel.rb.clone()))
-                .collect();
+                .collect::<Vec<SampleConsumer<5120>>>();
             let stream = output
                 .device
                 .build_output_stream(
                     &stream_config,
                     move |data: &mut [AudioSampleType], _| {
+                        sample_consumers.retain(|consumer| consumer.write_is_held());
+                        info!("{}", sample_consumers.len());
+                        if sample_consumers.is_empty() {
+                            info!("TODO: Close stream");
+                        }
                         // Mix audio from all channels
                         for stream_sample in data {
                             *stream_sample = sample_consumers
                                 .iter_mut()
                                 .map(|consumer| consumer.try_pop().unwrap_or(0.0))
-                                .sum::<AudioSampleType>();
+                                .sum();
                         }
                     },
                     move |err| {

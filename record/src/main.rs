@@ -11,10 +11,7 @@ use font_kit::{family_name::FamilyName, source::SystemSource};
 use futures::{Stream, StreamExt, future::join_all, join};
 use iced::{Element, Task, window};
 use messanger_unifier::Messangers;
-use messenger_interface::{
-    interface::{Socket, SocketEvent},
-    types::{Place, QueryPlace},
-};
+use messenger_interface::interface::{Socket, SocketEvent};
 use pages::{AppMessage, Login, messenger::Messenger};
 use simple_audio_channels::{AudioMixer, SampleFormat};
 
@@ -258,11 +255,8 @@ impl App {
                             //     return None;
                             // };
 
-                            let (profile, contacts, places) = join!(
-                                q.query_client_user(),
-                                q.query_contacts(),
-                                q.query_place(QueryPlace::All),
-                            );
+                            let (profile, contacts, conversations, servers) =
+                                join!(q.client_user(), q.contacts(), q.rooms(), q.houses());
 
                             let profile = match profile {
                                 Ok(profile) => profile,
@@ -271,21 +265,21 @@ impl App {
                                 }
                             };
 
-                            let (conversations, servers) =
-                                places.unwrap_or_default().into_iter().fold(
-                                    (Vec::new(), Vec::new()),
-                                    |(mut conversations, mut servers), place| {
-                                        match &*place {
-                                            Place::Room(room) => {
-                                                conversations.push(place.swap_data(room.to_owned()))
-                                            }
-                                            Place::House(house) => {
-                                                servers.push(place.swap_data(house.to_owned()))
-                                            }
-                                        };
-                                        (conversations, servers)
-                                    },
-                                );
+                            // let (conversations, servers) =
+                            //     places.unwrap_or_default().into_iter().fold(
+                            //         (Vec::new(), Vec::new()),
+                            //         |(mut conversations, mut servers), place| {
+                            //             match &*place {
+                            //                 Place::Room(room) => {
+                            //                     conversations.push(place.swap_data(room.to_owned()))
+                            //                 }
+                            //                 Place::House(house) => {
+                            //                     servers.push(place.swap_data(house.to_owned()))
+                            //                 }
+                            //             };
+                            //             (conversations, servers)
+                            //         },
+                            //     );
 
                             // let conversations: Vec<Identifier<Room>> = room_places
                             //     .unwrap_or_default()
@@ -305,8 +299,8 @@ impl App {
                                 handle,
                                 profile,
                                 contacts.unwrap_or_default(),
-                                conversations,
-                                servers,
+                                conversations.unwrap_or_default(),
+                                servers.unwrap_or_default(),
                                 api.socket().await,
                             ))
                         }),
@@ -381,7 +375,31 @@ impl App {
                             }
                         };
                     }
-                    SocketEvent::ChannelCreated { .. } => {}
+                    SocketEvent::ChannelCreated { r#where, room } => {
+                        let d = self.messangers.mut_data_from_handle(handle).unwrap();
+
+                        match r#where {
+                            None => {
+                                // It's a DM or group DM, add to conversations
+                                // if !d.conversations.iter().any(|r| r.id() == room.id()) {
+                                //     d.conversations.push(room);
+                                // }
+                            }
+                            Some(server_id) => {
+                                info!("Adding: {server_id:?}");
+                                // It's a channel in a server, add to the server's rooms
+                                // if let Some(server_identifier) =
+                                //     d.guilds.iter_mut().find(|g| g.id() == server_id.id())
+                                // {
+                                //     let mut house = (**server_identifier).clone();
+                                //     if !house.rooms.iter().any(|r| r.id() == room.id()) {
+                                //         house.rooms.push(room);
+                                //         *server_identifier = server_identifier.swap_data(house);
+                                //     }
+                                // }
+                            }
+                        }
+                    }
                     SocketEvent::Disconnected => info!("Disconnected"),
                     SocketEvent::AddAudioSource(sender) => {
                         let producer =
@@ -438,7 +456,11 @@ impl App {
                         Task::future(async move {
                             let vc = api.voice();
                             match vc {
-                                Ok(vc) => vc.connect(&channel).await,
+                                Ok(vc) => {
+                                    // Convert Place<Room> to Room for voice API
+                                    let room_id = channel.swap_data((*channel).clone());
+                                    vc.connect(&room_id).await;
+                                }
                                 Err(err) => warn!("Voice not supported by adapter: {err:#?}"),
                             }
                             channel
@@ -463,7 +485,11 @@ impl App {
                         Task::future(async move {
                             let vc = api.voice();
                             match vc {
-                                Ok(vc) => vc.disconnect(call.source()).await,
+                                Ok(vc) => {
+                                    // Convert Place<Room> to Room for voice API
+                                    let room_id = call.source().swap_data((**call.source()).clone());
+                                    vc.disconnect(&room_id).await;
+                                }
                                 Err(err) => warn!("Voice not supported by adapter: {err:#?}"),
                             }
                             call

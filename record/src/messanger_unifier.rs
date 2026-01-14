@@ -3,19 +3,19 @@
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use messenger_interface::{
-    interface::Messanger,
+    interface::Messenger,
     types::{CallStatus, House, ID, Identifier, Message, Place, Room, User},
 };
 
 #[derive(Debug, Clone)]
 pub struct Call {
     messanger_handle: MessangerHandle,
-    source: Identifier<Room>,
+    source: Identifier<Place<Room>>,
     status: CallStatus,
 }
 
 impl Call {
-    pub fn new(messanger_handle: MessangerHandle, source: Identifier<Room>) -> Self {
+    pub fn new(messanger_handle: MessangerHandle, source: Identifier<Place<Room>>) -> Self {
         Self {
             messanger_handle,
             source,
@@ -25,7 +25,7 @@ impl Call {
     pub fn handle(&self) -> MessangerHandle {
         self.messanger_handle
     }
-    pub fn source(&self) -> &Identifier<Room> {
+    pub fn source(&self) -> &Identifier<Place<Room>> {
         &self.source
     }
     pub fn id(&self) -> ID {
@@ -45,8 +45,8 @@ pub struct MessangerData {
 
     pub profile: Option<Identifier<User>>,
     pub contacts: Vec<Identifier<User>>,
-    pub conversations: Vec<Identifier<Room>>,
-    pub guilds: Vec<Identifier<House>>,
+    pub conversations: Vec<Identifier<Place<Room>>>,
+    pub guilds: Vec<Identifier<Place<House>>>,
     pub chats: HashMap<ID, Vec<Identifier<Message>>>,
     pub calls: Vec<Call>,
 }
@@ -82,10 +82,10 @@ impl PartialEq for MessangerHandle {
 #[derive(Clone)]
 pub struct MessangerInterface {
     pub handle: MessangerHandle,
-    pub api: Arc<dyn Messanger>,
+    pub api: Arc<dyn Messenger>,
 }
 impl Deref for MessangerInterface {
-    type Target = Arc<dyn Messanger>;
+    type Target = Arc<dyn Messenger>;
 
     fn deref(&self) -> &Self::Target {
         &self.api
@@ -146,7 +146,7 @@ impl Messangers {
             .iter_mut()
             .find(|data| data.handle == messanger_handle)
     }
-    pub fn add_messanger(&mut self, api: Arc<dyn Messanger>) -> MessangerHandle {
+    pub fn add_messanger(&mut self, api: Arc<dyn Messenger>) -> MessangerHandle {
         let handle = MessangerHandle {
             id: self.id_counter,
             index: self.interface.len(),

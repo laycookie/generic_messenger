@@ -16,14 +16,14 @@ use facet_pretty::FacetPretty;
 use futures::StreamExt;
 use messenger_interface::{
     interface::{SocketEvent, Voice},
-    types::{Identifier, Message as GlobalMessage, Room},
+    types::{Identifier, Message as GlobalMessage, Place, Room},
 };
 use surf::http::convert::json;
 use tracing::{error, info, warn};
 
 use crate::{
     Discord,
-    api_types::Message,
+    api_types::{self, Message},
     gateaways::{
         GatewayPayload, HeartBeatingData, deserialize_event,
         voice::{Endpoint, VoiceGateawayState},
@@ -37,6 +37,7 @@ use crate::{
 /// <https://docs.discord.food/topics/opcodes-and-status-codes#gateway-opcodes>
 #[derive(Debug, Facet)]
 #[facet(is_numeric)]
+#[non_exhaustive]
 #[repr(u8)]
 pub enum Opcode {
     Dispatch = 0,
@@ -47,6 +48,55 @@ pub enum Opcode {
     Hello = 10,
     HeartbeatAck = 11,
     CallConnect = 13,
+}
+
+/// <https://discord.com/developers/docs/events/gateway-events#receive-events>
+#[derive(Debug, Facet)]
+#[facet(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum GatewayEvent {
+    Hello,
+    Ready,
+    Resumed,
+    Reconnect,
+    RateLimited,
+    InvalidSession,
+    SessionsReplace,
+    ApplicationCommandPermissionsUpdate,
+    AutoModerationRuleCreate,
+    AutoModerationRuleUpdate,
+    AutoModerationRuleDelete,
+    AutoModerationActionExecution,
+    ChannelCreate,
+    ChannelUpdate,
+    ChannelDelete,
+    ChannelPinsUpdate,
+    CallCreate,
+    CallUpdate,
+    ThreadCreate,
+    ThreadUpdate,
+    ThreadDelete,
+    ThreadListSync,
+    ThreadMemberUpdate,
+    ThreadMembersUpdate,
+    EntitlementCreate,
+    EntitlementUpdate,
+    EntitlementDelete,
+    GuildCreate,
+    GuildUpdate,
+    GuildDelete,
+    GuildAuditLogEntryCreate,
+    GuildBanAdd,
+    GuildBanRemove,
+    GuildEmojisUpdate,
+    GuildStickersUpdate,
+    GuildIntegrationsUpdate,
+    GuildMemberAdd,
+    GuildMemberRemove,
+    VoiceStateUpdate,
+    VoiceServerUpdate,
+    MessageCreate,
 }
 
 #[derive(Facet)]
@@ -66,7 +116,7 @@ struct HelloPayload {
 }
 
 #[derive(Debug, Facet)]
-pub struct ServerUpdate {
+pub struct ServerUpdatePayload {
     token: String,
     guild_id: Option<String>,
     channel_id: Option<String>,
@@ -75,7 +125,7 @@ pub struct ServerUpdate {
 
 /// <https://docs.discord.food/resources/voice#voice-state-structure>
 #[derive(Facet)]
-struct VoiceState {
+struct VoiceStatePayload {
     guild_id: Option<String>,
     channel_id: String,
     lobby_id: Option<String>,
@@ -96,7 +146,7 @@ struct VoiceState {
 
 ///https://docs.discord.food/resources/presence#session-object
 #[derive(Facet)]
-struct SessionObject {
+struct SessionObjectPayload {
     session_id: String,
     // client_info: ?
     status: String,
@@ -118,7 +168,7 @@ impl GateawayStream<Opcode> for WebSocketStream<ConnectStream> {
     async fn next_gateaway_payload(&mut self) -> GatewayPayload<Opcode> {
         match self.next().await.unwrap().unwrap() {
             WebsocketMessage::Text(utf8_bytes) => {
-                facet_format_json::from_str::<GatewayPayload<Opcode>>(&utf8_bytes).unwrap()
+                facet_json::from_str::<GatewayPayload<Opcode>>(&utf8_bytes).unwrap()
             }
             _ => todo!(),
         }
@@ -189,13 +239,11 @@ impl GatewayPayload<Opcode> {
         self,
         discord: &Discord,
     ) -> Result<SocketEvent, Box<dyn std::error::Error + Send + Sync>> {
-        info!("Exec opcode: {:?}", self.op);
         let mut gateaway = discord.gateaway.lock().await;
         if let Some(gateaway) = gateaway.as_mut()
             && let Some(s) = self.s
         {
             gateaway.last_sequence_number = Some(s);
-            info!("Updating seq: {s}");
         };
         drop(gateaway);
 
@@ -209,26 +257,29 @@ impl GatewayPayload<Opcode> {
                 return Ok(SocketEvent::Skip);
             }
             Opcode::Dispatch => {
-                let event_name = self.t.as_ref().unwrap();
+                let Some(event_name) = self.t.as_ref() else {
+                    warn!("Dispatch opcode received without an event type (t)");
+                    return Ok(SocketEvent::Skip);
+                };
                 info!("Dispatch event: {event_name:?}");
                 // https://discord.com/developers/docs/events/gateway-events#receive-events
-                match event_name.as_str() {
-                    "READY" => {
+                match event_name {
+                    GatewayEvent::Ready => {
                         info!("importing data");
                     }
-                    "SESSIONS_REPLACE" => {
+                    GatewayEvent::SessionsReplace => {
                         info!("Session replace");
-                        let session = facet_value::from_value::<Vec<SessionObject>>(self.d)?;
+                        let session = facet_value::from_value::<Vec<SessionObjectPayload>>(self.d)?;
                         info!("{}", session.pretty());
                     }
-                    "VOICE_STATE_UPDATE" => {
-                        let voice_state = facet_value::from_value::<VoiceState>(self.d)?;
+                    GatewayEvent::VoiceStateUpdate => {
+                        let voice_state = facet_value::from_value::<VoiceStatePayload>(self.d)?;
 
                         let mut voice_gateaway = discord.voice_gateaway.lock().await;
                         voice_gateaway.insert_session_id(voice_state.session_id);
                     }
-                    "VOICE_SERVER_UPDATE" => {
-                        let server_update = facet_value::from_value::<ServerUpdate>(self.d)?;
+                    GatewayEvent::VoiceServerUpdate => {
+                        let server_update = facet_value::from_value::<ServerUpdatePayload>(self.d)?;
 
                         let mut voice_gateaway = discord.voice_gateaway.lock().await;
                         voice_gateaway.insert_endpoint(Endpoint::new(
@@ -256,7 +307,7 @@ impl GatewayPayload<Opcode> {
                             }
                         };
                     }
-                    "MESSAGE_CREATE" => {
+                    GatewayEvent::MessageCreate => {
                         let message = facet_value::from_value::<Message>(self.d)?;
 
                         let channel_id_hash =
@@ -274,11 +325,17 @@ impl GatewayPayload<Opcode> {
                             ),
                         });
                     }
-                    "CALL_CREATE" => {
-                        info!("{:#?}", self);
-                    }
-                    "CALL_UPDATE" => {
-                        info!("{:#?}", self);
+                    GatewayEvent::ChannelCreate => {
+                        let channel = facet_value::from_value::<api_types::Channel>(self.d)?;
+
+                        let (_name, _icon, room_data) = channel.to_room_data().await;
+                        return Ok(SocketEvent::ChannelCreated {
+                            r#where: channel
+                                .guild_id
+                                .as_deref()
+                                .map(|guild_id| Discord::identifier_generator(guild_id, ())),
+                            room: Discord::identifier_generator(&channel.id, room_data),
+                        });
                     }
                     _ => warn!("Unknown event_name received: {event_name:?}",),
                 }
@@ -296,7 +353,7 @@ impl GatewayPayload<Opcode> {
 
 #[async_trait]
 impl Voice for Discord {
-    async fn connect<'a>(&'a self, location: &Identifier<Room>) {
+    async fn connect<'a>(&'a self, location: &Identifier<Place<Room>>) {
         let mut voice_gateaway = self.voice_gateaway.lock().await;
         *voice_gateaway = VoiceGateawayState::AwaitingData;
 
@@ -321,10 +378,8 @@ impl Voice for Discord {
               }
         });
 
-        info!("dead");
         let mut gateaway = self.gateaway.lock().await;
         let gateaway = gateaway.as_mut().unwrap();
-        info!("lock");
 
         gateaway
             .websocket
@@ -332,7 +387,7 @@ impl Voice for Discord {
             .await
             .unwrap();
     }
-    async fn disconnect<'a>(&'a self, location: &Identifier<Room>) {
+    async fn disconnect<'a>(&'a self, location: &Identifier<Place<Room>>) {
         let mut voice_gateaway = self.voice_gateaway.lock().await;
         *voice_gateaway = VoiceGateawayState::Closed;
 

@@ -5,7 +5,7 @@
 //!
 //! Design notes:
 //! - Most trait methods provide a default implementation that returns
-//!   [`MessamgerError::NotImplimented`]. This allows backends to opt into only the
+//!   [`MessengerError::NotImplemented`]. This allows backends to opt into only the
 //!   features they support.
 //! - Errors are intentionally trait-object based (`Box<dyn Error + Send + Sync>`) to
 //!   allow each backend to return its own error types without exposing them here.
@@ -13,16 +13,17 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::sync::{Arc, Weak};
 
-use crate::types::{Identifier, Message, Place, QueryPlace, Room, User};
+// QueryPlace is kept for reference in the commented-out legacy code below
+use crate::types::{House, Identifier, Message, Place, Room, User};
 use async_trait::async_trait;
 use futures::Stream;
 use futures::channel::oneshot;
 use simple_audio_channels::SampleProducer;
 
 #[derive(Debug, thiserror::Error)]
-pub enum MessamgerError {
-    #[error("Feature not implimented on this messanger")]
-    NotImplimented,
+pub enum MessengerError {
+    #[error("Feature not implemented on this messenger")]
+    NotImplemented,
 }
 
 /// A concrete messenger backend.
@@ -31,9 +32,9 @@ pub enum MessamgerError {
 ///
 /// Feature areas are split into smaller traits (`Query`, `Socket`, `VC`, ...). Backends
 /// can expose a sub-API by returning `Ok(&impl Trait)` from the corresponding method,
-/// or return [`MessamgerError::NotImplimented`] if they don't support it.
+/// or return [`MessengerError::NotImplemented`] if they don't support it.
 #[async_trait]
-pub trait Messanger: Send + Sync {
+pub trait Messenger: Send + Sync {
     /// Stable unique id for this backend instance (e.g. includes account/server context).
     fn id(&self) -> String;
     /// Human-readable backend name (e.g. `"discord"`).
@@ -44,31 +45,31 @@ pub trait Messanger: Send + Sync {
     fn auth(&self) -> String;
 
     /// Capability: query (fetch) state from the messenger.
-    fn query(&self) -> Result<&dyn Query, MessamgerError> {
-        Err(MessamgerError::NotImplimented)
+    fn query(&self) -> Result<&dyn Query, MessengerError> {
+        Err(MessengerError::NotImplemented)
     }
 
     /// Capability: text chat integration.
-    fn text(&self) -> Result<&dyn Text, MessamgerError> {
-        Err(MessamgerError::NotImplimented)
+    fn text(&self) -> Result<&dyn Text, MessengerError> {
+        Err(MessengerError::NotImplemented)
     }
 
     /// Capability: voice chat integration.
     fn voice(&self) -> Result<&dyn Voice, Box<dyn Error + Sync + Send>> {
-        Err(Box::new(MessamgerError::NotImplimented))
+        Err(Box::new(MessengerError::NotImplemented))
     }
 
     /// Capability: open a realtime socket/stream for events (messages, channel changes, etc).
     ///
     /// Returns a `Weak` reference because sockets are owned/managed elsewhere and
-    /// can outlive or be droped independent of the caller.
+    /// can outlive or be dropped independent of the caller.
     async fn socket(
         self: Arc<Self>,
     ) -> Result<Weak<dyn Socket + Send + Sync>, Box<dyn Error + Sync + Send>> {
-        Err(Box::new(MessamgerError::NotImplimented))
+        Err(Box::new(MessengerError::NotImplemented))
     }
 }
-impl PartialEq for dyn Messanger {
+impl PartialEq for dyn Messenger {
     fn eq(&self, other: &Self) -> bool {
         self.id() == other.id()
     }
@@ -80,22 +81,49 @@ impl PartialEq for dyn Messanger {
 #[async_trait]
 pub trait Query: Send + Sync {
     /// Fetch the current "client user" (the authenticated account / profile).
-    async fn query_client_user(&self) -> Result<Identifier<User>, Box<dyn Error + Sync + Send>> {
-        Err(Box::new(MessamgerError::NotImplimented))
+    async fn client_user(&self) -> Result<Identifier<User>, Box<dyn Error + Sync + Send>> {
+        Err(Box::new(MessengerError::NotImplemented))
     }
     /// Fetch users that the messenger considers "contacts" (friends, following, etc).
-    async fn query_contacts(&self) -> Result<Vec<Identifier<User>>, Box<dyn Error + Sync + Send>> {
-        Err(Box::new(MessamgerError::NotImplimented))
+    async fn contacts(&self) -> Result<Vec<Identifier<User>>, Box<dyn Error + Sync + Send>> {
+        Err(Box::new(MessengerError::NotImplemented))
     }
 
-    /// Fetch "places" (servers/guilds/spaces/etc) containing rooms/channels.
+    /// Legacy: Fetch "places" (servers/guilds/spaces/etc) containing rooms/channels.
     ///
-    /// `query_place` describes how to filter/locate places for the backend.
-    async fn query_place(
+    /// This method has been replaced by `rooms()` and `houses()` for better type safety.
+    /// The `query_place` parameter described how to filter/locate places for the backend.
+    ///
+    /// Kept for reference during migration.
+    // async fn places(
+    //     &self,
+    //     query_place: QueryPlace,
+    // ) -> Result<Vec<Identifier<PlaceVariant>>, Box<dyn Error + Sync + Send>> {
+    //     Err(Box::new(MessengerError::NotImplemented))
+    // }
+
+    /// Fetch all rooms/channels available to the client.
+    async fn rooms(&self) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
+        Err(Box::new(MessengerError::NotImplemented))
+    }
+
+    /// Fetch all houses/servers/guilds available to the client.
+    async fn houses(&self) -> Result<Vec<Identifier<Place<House>>>, Box<dyn Error + Sync + Send>> {
+        Err(Box::new(MessengerError::NotImplemented))
+    }
+    /// Fetch detailed information about a specific room/channel.
+    async fn room_details(
         &self,
-        query_place: QueryPlace,
-    ) -> Result<Vec<Identifier<Place>>, Box<dyn Error + Sync + Send>> {
-        Err(Box::new(MessamgerError::NotImplimented))
+        room: Identifier<Place<Room>>,
+    ) -> Result<Room, Box<dyn Error + Sync + Send>> {
+        Err(Box::new(MessengerError::NotImplemented))
+    }
+    /// Fetch detailed information about a specific house/server/guild.
+    async fn house_details(
+        &self,
+        house: Identifier<Place<House>>,
+    ) -> Result<House, Box<dyn Error + Sync + Send>> {
+        Err(Box::new(MessengerError::NotImplemented))
     }
 }
 
@@ -106,14 +134,14 @@ pub trait Text: Send + Sync {
     /// `load_messages_before`.
     async fn get_messages(
         &self,
-        location: &Identifier<Room>,
+        location: &Identifier<Place<Room>>,
         load_messages_before: Option<Identifier<Message>>,
     ) -> Result<Vec<Identifier<Message>>, Box<dyn Error + Sync + Send>>;
 
     /// Send a new message into `location`.
     async fn send_message(
         &self,
-        location: &Identifier<Room>,
+        location: &Identifier<Place<Room>>,
         contents: Message,
     ) -> Result<(), Box<dyn Error + Sync + Send>>;
 }
@@ -124,9 +152,9 @@ pub trait Text: Send + Sync {
 #[async_trait]
 pub trait Voice: Send + Sync {
     /// Connect to voice in `location`.
-    async fn connect<'a>(&'a self, location: &Identifier<Room>);
+    async fn connect<'a>(&'a self, location: &Identifier<Place<Room>>);
     /// Disconnect from voice in `location`.
-    async fn disconnect<'a>(&'a self, location: &Identifier<Room>);
+    async fn disconnect<'a>(&'a self, location: &Identifier<Place<Room>>);
 }
 
 /// Realtime events emitted by a [`Socket`].
@@ -139,12 +167,12 @@ pub enum SocketEvent {
     },
     /// A channel/room was created (optionally within a server/place).
     ChannelCreated {
-        place: Option<Identifier<()>>,
+        r#where: Option<Identifier<()>>,
         room: Identifier<Room>,
     },
     /// Request to attach an audio source into the audio graph.
     ///
-    /// The receiver gets a `SampleProducer` used to push samples into the system.
+    /// The receiver receives a `SampleProducer` used to push samples into the system.
     AddAudioSource(oneshot::Sender<SampleProducer<5120>>),
     /// Socket disconnected (cleanly or due to error).
     Disconnected,

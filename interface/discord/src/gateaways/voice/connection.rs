@@ -194,7 +194,7 @@ impl Connection {
         let unkown_const_2 = &potentially[4..5]; // CONST 16
         // let avrage_volume = &potentially[5..6]; // Avrage volume of the frame?
         let unkown_const_3 = &potentially[6..7]; // CONST 144
-        let channels = &potentially[7..]; // Channels?
+        let channels = &potentially[7]; // Channels?
         if unkown_const != [50] {
             warn!("ANOMOLY const1");
         }
@@ -219,7 +219,7 @@ impl Connection {
 
         Some((
             rtp_packet.get_ssrc(),
-            &self.decoded_audio_buf[..n_decoded_samples * 2], // TODO: Replace with num of channels
+            &self.decoded_audio_buf[..n_decoded_samples * *channels as usize],
         ))
     }
 }

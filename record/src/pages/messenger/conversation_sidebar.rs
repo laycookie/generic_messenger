@@ -2,7 +2,7 @@ use iced::{
     Color, Element, Length, Padding,
     widget::{Button, Column, Scrollable, Text, button, column, container, image, row},
 };
-use messenger_interface::types::{Identifier, Room, RoomCapabilities};
+use messenger_interface::types::{Identifier, Place, Room, RoomCapabilities};
 
 use super::PLACEHOLDER_PFP;
 use crate::messanger_unifier::{Call, MessangerHandle, Messangers};
@@ -10,11 +10,11 @@ use crate::messanger_unifier::{Call, MessangerHandle, Messangers};
 #[derive(Debug, Clone)]
 pub struct Server {
     pub handle: MessangerHandle,
-    pub channels: Vec<Identifier<Room>>, // TODO(record-migration): server channels not yet supported
+    pub channels: Vec<Identifier<Place<Room>>>,
 }
 
 impl Server {
-    pub fn new(handle: MessangerHandle, channels: Vec<Identifier<Room>>) -> Self {
+    pub fn new(handle: MessangerHandle, channels: Vec<Identifier<Place<Room>>>) -> Self {
         Self { handle, channels }
     }
 }
@@ -27,12 +27,12 @@ pub struct Sidebar {
 
 #[derive(Debug, Clone)]
 pub enum Action {
-    Call(Identifier<Room>),
+    Call(Identifier<Place<Room>>),
     Disconnect(Call),
     OpenContacts,
     OpenChat {
         handle: crate::messanger_unifier::MessangerHandle,
-        conversation: Identifier<Room>,
+        conversation: Identifier<Place<Room>>,
     },
 }
 

@@ -3,7 +3,7 @@ use iced::{
     Alignment,
     widget::{Button, Column, ComboBox, Container, TextInput, column, combo_box::State},
 };
-use messenger_interface::interface::Messanger as NeoMessanger;
+use messenger_interface::interface::Messenger as NeoMessanger;
 use std::{fmt::Display, sync::Arc};
 use strum::EnumString;
 
