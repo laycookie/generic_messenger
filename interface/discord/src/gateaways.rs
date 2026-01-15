@@ -1,5 +1,6 @@
 use std::{
     collections::hash_map,
+    ops::{Deref, DerefMut},
     pin::{Pin, pin},
     sync::Arc,
     task::Poll,
@@ -15,18 +16,43 @@ use futures::{
     FutureExt as _, Stream, StreamExt, channel::oneshot, future::poll_fn, pending, poll,
 };
 use futures_timer::Delay;
-use messenger_interface::interface::{Socket, SocketEvent};
+use messenger_interface::{
+    interface::{Socket, SocketEvent, Voice},
+    types::{Identifier, Place, Room},
+};
 use simple_audio_channels::Producer;
 use surf::http::convert::json;
-use tracing::{error, info, warn};
+use tracing::warn;
 
 use crate::{
     Discord,
-    gateaways::general::{GatewayEvent, Opcode},
+    gateaways::{
+        general::{GatewayEvent, Opcode},
+        voice::VoiceGateawayState,
+    },
 };
 
 pub mod general;
 pub mod voice;
+
+pub struct Gateaway<T> {
+    websocket: WebSocketStream<ConnectStream>,
+    heart_beating: HeartBeatingData,
+    last_sequence_number: Option<usize>,
+    type_specific_data: T,
+}
+impl<T> Deref for Gateaway<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.type_specific_data
+    }
+}
+impl<T> DerefMut for Gateaway<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.type_specific_data
+    }
+}
 
 /// <https://discord.com/developers/docs/events/gateway-events#payload-structure>
 #[derive(Debug, Facet)]
@@ -209,17 +235,20 @@ impl Socket for Discord {
             };
 
             if let Some(voice_gateaway) = voice_gateaway.mut_gateaway()
-                && let Some(connection) = voice_gateaway.connection.as_mut()
+                && let Some(connection) = voice_gateaway.type_specific_data.connection.as_mut()
                 && let Some(description) = connection.description()
                 && description.mode().is_some()
             {
                 if let Poll::Ready(Some((ssrc, audio_frame))) = poll!(pin!(connection.recv_audio()))
                 {
-                    let mut channel = match voice_gateaway.ssrc_to_audio_channel.entry(ssrc) {
+                    let mut channel = match voice_gateaway
+                        .type_specific_data
+                        .ssrc_to_audio_channel
+                        .entry(ssrc)
+                    {
                         hash_map::Entry::Occupied(channel) => channel,
                         hash_map::Entry::Vacant(e) => {
                             let (sender, reciver) = oneshot::channel();
-                            error!("Open channel for: {ssrc}");
                             e.insert(voice::AudioChannel::Initilizing(reciver));
                             return Some(SocketEvent::AddAudioSource(sender));
                         }
@@ -269,5 +298,77 @@ impl Socket for Discord {
         };
 
         Some(SocketEvent::Skip)
+    }
+}
+
+#[async_trait]
+impl Voice for Discord {
+    async fn connect<'a>(&'a self, location: &Identifier<Place<Room>>) {
+        let mut voice_gateaway = self.voice_gateaway.lock().await;
+        *voice_gateaway = VoiceGateawayState::AwaitingData;
+
+        let channels_map = self.channel_id_mappings.read().await;
+        let channel = match channels_map.get(location.id()) {
+            Some(c) => c,
+            None => {
+                // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
+                // and support guild voice channels too.
+                warn!("Tried to connect voice for a Room without a discord channel mapping");
+                return;
+            }
+        };
+
+        let payload = json!({
+            "op": Opcode::VoiceStateUpdate as u8,
+            "d": {
+                "guild_id": channel.guild_id,
+                "channel_id": channel.id,
+                "self_mute": false,
+                "self_deaf": false
+              }
+        });
+
+        let mut gateaway = self.gateaway.lock().await;
+        let gateaway = gateaway.as_mut().unwrap();
+
+        gateaway
+            .websocket
+            .send(payload.to_string().into())
+            .await
+            .unwrap();
+    }
+    async fn disconnect<'a>(&'a self, location: &Identifier<Place<Room>>) {
+        let mut voice_gateaway = self.voice_gateaway.lock().await;
+        *voice_gateaway = VoiceGateawayState::Closed;
+
+        let channels_map = self.channel_id_mappings.read().await;
+        let channel = match channels_map.get(location.id()) {
+            Some(c) => c,
+            None => {
+                // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
+                // and support guild voice channels too.
+                warn!("Tried to disconnect voice for a Room without a discord channel mapping");
+                return;
+            }
+        };
+
+        let payload = json!({
+            "op": Opcode::VoiceStateUpdate as u8,
+            "d": {
+                "guild_id": channel.guild_id,
+                "channel_id": None::<String>,
+                "self_mute": false,
+                "self_deaf": false
+              }
+        });
+
+        let mut gateaway = self.gateaway.lock().await;
+        let gateaway = gateaway.as_mut().unwrap();
+
+        gateaway
+            .websocket
+            .send(payload.to_string().into())
+            .await
+            .unwrap();
     }
 }

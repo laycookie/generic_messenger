@@ -13,7 +13,7 @@ use async_tungstenite::{
 };
 use facet::Facet;
 use futures::{StreamExt as _, channel::oneshot};
-use simple_audio_channels::SampleProducer;
+use simple_audio_channels::output::Output;
 use smol::net::UdpSocket;
 use surf::http::convert::json;
 use tracing::{info, warn};
@@ -21,7 +21,7 @@ use tracing::{info, warn};
 use crate::{
     Discord,
     gateaways::{
-        GateawayStream, GatewayPayload, HeartBeatingData, deserialize_event,
+        Gateaway, GateawayStream, GatewayPayload, HeartBeatingData, deserialize_event,
         voice::connection::{Connection, EncryptionMode, SessionDescription, Ssrc},
     },
 };
@@ -90,7 +90,7 @@ pub enum VoiceGateawayState {
         session_id: SessionId,
     },
     Open {
-        gateaway: Box<VoiceGateaway>,
+        gateaway: Box<Gateaway<Voice>>,
         endpoint: Endpoint,
         session_id: SessionId,
     },
@@ -99,7 +99,7 @@ impl VoiceGateawayState {
     pub fn as_mut(&mut self) -> &mut VoiceGateawayState {
         self
     }
-    pub fn mut_gateaway(&mut self) -> Option<&mut VoiceGateaway> {
+    pub fn mut_gateaway(&mut self) -> Option<&mut Gateaway<Voice>> {
         match self {
             VoiceGateawayState::Open { gateaway, .. } => Some(gateaway),
             _ => None,
@@ -178,7 +178,7 @@ impl VoiceGateawayState {
             }
         };
 
-        let gateaway = VoiceGateaway::new(&endpoint, &session_id, location_id, user_id).await?;
+        let gateaway = Gateaway::<Voice>::new(&endpoint, &session_id, location_id, user_id).await?;
 
         Ok(Self::Open {
             gateaway: Box::new(gateaway),
@@ -189,19 +189,15 @@ impl VoiceGateawayState {
 }
 
 pub enum AudioChannel {
-    Initilizing(oneshot::Receiver<SampleProducer<5120>>),
-    Connected(SampleProducer<5120>),
+    Initilizing(oneshot::Receiver<Output<5120>>),
+    Connected(Output<5120>),
 }
 
-pub struct VoiceGateaway {
-    pub websocket: WebSocketStream<ConnectStream>,
-    pub heart_beating: HeartBeatingData,
-    pub last_sequence_number: Option<usize>,
+pub struct Voice {
     pub ssrc_to_audio_channel: HashMap<Ssrc, AudioChannel>,
     pub connection: Option<Connection>,
 }
-
-impl VoiceGateaway {
+impl Gateaway<Voice> {
     pub async fn new(
         endpoint: &Endpoint,
         session_id: &SessionId,
@@ -243,8 +239,10 @@ impl VoiceGateaway {
             websocket,
             heart_beating: HeartBeatingData::new(heart_beating_duration),
             last_sequence_number: None,
-            connection: None,
-            ssrc_to_audio_channel: HashMap::new(),
+            type_specific_data: Voice {
+                connection: None,
+                ssrc_to_audio_channel: HashMap::new(),
+            },
         })
     }
     pub fn fetch_event(
