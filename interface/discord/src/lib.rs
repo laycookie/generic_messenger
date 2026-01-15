@@ -14,7 +14,7 @@ use messenger_interface::{
 };
 use secure_string::SecureString;
 
-use crate::gateaways::{general::Gateaway, voice::VoiceGateawayState};
+use crate::gateaways::{Gateaway, general::General, voice::VoiceGateawayState};
 
 mod api_types;
 mod downloaders;
@@ -34,7 +34,7 @@ pub struct Discord {
     token: SecureString,
     intents: u32,
     // gateaways
-    gateaway: AsyncMutex<Option<Gateaway>>,
+    gateaway: AsyncMutex<Option<Gateaway<General>>>,
     voice_gateaway: AsyncMutex<VoiceGateawayState>,
     // Cache (External IDs, to internal)
     profile: RwLockAwait<Option<api_types::Profile>>,
@@ -98,7 +98,7 @@ impl Messenger for Discord {
         };
 
         // Connect to discord gateaway
-        let gateaway = Gateaway::new(&self).await?;
+        let gateaway = Gateaway::<General>::new(&self).await?;
 
         *socket = Some(gateaway);
 

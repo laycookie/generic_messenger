@@ -25,7 +25,7 @@ use crate::{
     Discord,
     api_types::{self, Message},
     gateaways::{
-        GatewayPayload, HeartBeatingData, deserialize_event,
+        Gateaway, GatewayPayload, HeartBeatingData, deserialize_event,
         voice::{Endpoint, VoiceGateawayState},
     },
 };
@@ -159,11 +159,6 @@ trait GateawayStream<Op> {
     async fn next_gateaway_payload(&mut self) -> GatewayPayload<Op>;
 }
 
-pub struct Gateaway {
-    pub websocket: WebSocketStream<ConnectStream>,
-    pub heart_beating: HeartBeatingData,
-    pub last_sequence_number: Option<usize>,
-}
 impl GateawayStream<Opcode> for WebSocketStream<ConnectStream> {
     async fn next_gateaway_payload(&mut self) -> GatewayPayload<Opcode> {
         match self.next().await.unwrap().unwrap() {
@@ -175,7 +170,8 @@ impl GateawayStream<Opcode> for WebSocketStream<ConnectStream> {
     }
 }
 
-impl Gateaway {
+pub struct General;
+impl Gateaway<General> {
     const GATEWAY_URL: &str = "wss://gateway.discord.gg/?encoding=json&v=9";
     pub async fn new(discord: &Discord) -> Result<Self, Box<dyn Error + Sync + Send>> {
         let (mut gateway_websocket, _) = connect_async(Self::GATEWAY_URL).await?;
@@ -219,6 +215,7 @@ impl Gateaway {
             websocket: gateway_websocket,
             heart_beating: HeartBeatingData::new(heart_beating_duration),
             last_sequence_number: None,
+            type_specific_data: General,
         })
     }
 
@@ -348,77 +345,5 @@ impl GatewayPayload<Opcode> {
             }
         };
         Ok(SocketEvent::Skip)
-    }
-}
-
-#[async_trait]
-impl Voice for Discord {
-    async fn connect<'a>(&'a self, location: &Identifier<Place<Room>>) {
-        let mut voice_gateaway = self.voice_gateaway.lock().await;
-        *voice_gateaway = VoiceGateawayState::AwaitingData;
-
-        let channels_map = self.channel_id_mappings.read().await;
-        let channel = match channels_map.get(location.id()) {
-            Some(c) => c,
-            None => {
-                // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
-                // and support guild voice channels too.
-                warn!("Tried to connect voice for a Room without a discord channel mapping");
-                return;
-            }
-        };
-
-        let payload = json!({
-            "op": Opcode::VoiceStateUpdate as u8,
-            "d": {
-                "guild_id": channel.guild_id,
-                "channel_id": channel.id,
-                "self_mute": false,
-                "self_deaf": false
-              }
-        });
-
-        let mut gateaway = self.gateaway.lock().await;
-        let gateaway = gateaway.as_mut().unwrap();
-
-        gateaway
-            .websocket
-            .send(payload.to_string().into())
-            .await
-            .unwrap();
-    }
-    async fn disconnect<'a>(&'a self, location: &Identifier<Place<Room>>) {
-        let mut voice_gateaway = self.voice_gateaway.lock().await;
-        *voice_gateaway = VoiceGateawayState::Closed;
-
-        let channels_map = self.channel_id_mappings.read().await;
-        let channel = match channels_map.get(location.id()) {
-            Some(c) => c,
-            None => {
-                // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
-                // and support guild voice channels too.
-                warn!("Tried to disconnect voice for a Room without a discord channel mapping");
-                return;
-            }
-        };
-
-        let payload = json!({
-            "op": Opcode::VoiceStateUpdate as u8,
-            "d": {
-                "guild_id": channel.guild_id,
-                "channel_id": None::<String>,
-                "self_mute": false,
-                "self_deaf": false
-              }
-        });
-
-        let mut gateaway = self.gateaway.lock().await;
-        let gateaway = gateaway.as_mut().unwrap();
-
-        gateaway
-            .websocket
-            .send(payload.to_string().into())
-            .await
-            .unwrap();
     }
 }
