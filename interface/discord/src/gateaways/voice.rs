@@ -270,7 +270,6 @@ impl Gateaway<Voice> {
                 ssrc_to_audio_channel: HashMap::new(),
                 input_channel: Default::default(),
                 input_buffer: VecDeque::new(),
-                frames_to_send: Vec::new(),
                 is_speaking: false,
             },
         })
