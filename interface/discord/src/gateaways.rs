@@ -12,28 +12,29 @@ use async_tungstenite::{
     WebSocketStream, async_std::ConnectStream, tungstenite::Message as WebsocketMessage,
 };
 use facet::Facet;
-use futures::{
-    FutureExt as _, Stream, StreamExt, channel::oneshot, future::poll_fn, pending, poll,
-};
+use futures::{FutureExt as _, Stream, StreamExt, channel::oneshot, pending, poll};
 use futures_timer::Delay;
 use messenger_interface::{
     interface::{Socket, SocketEvent, Voice},
     types::{Identifier, Place, Room},
 };
-use simple_audio_channels::Producer;
+use simple_audio_channels::{Consumer, Producer};
 use surf::http::convert::json;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     Discord,
     gateaways::{
         general::{GatewayEvent, Opcode},
-        voice::VoiceGateawayState,
+        voice::{InputChannel, Voice as VoiceGateawayData, VoiceGateawayState},
     },
 };
 
 pub mod general;
 pub mod voice;
+
+const VOICE_CHANNELS: usize = 2;
+const VOICE_FRAME_SAMPLES: usize = 960 * VOICE_CHANNELS;
 
 pub struct Gateaway<T> {
     websocket: WebSocketStream<ConnectStream>,
@@ -183,8 +184,13 @@ impl Socket for Discord {
                             .unwrap();
                     }
 
-                    match poll!(poll_fn(|cx| gateaway.fetch_event(cx))) {
-                        Poll::Ready(Ok(event)) => Some(event),
+                    match poll!(pin!(gateaway.fetch_event())) {
+                        Poll::Ready(Ok(Some(event))) => Some(event),
+
+                        Poll::Ready(Ok(None)) => {
+                            info!("Stream closed");
+                            None
+                        }
                         Poll::Ready(Err(err)) => {
                             warn!("Failed to parse event: {err}");
                             continue;
@@ -196,37 +202,42 @@ impl Socket for Discord {
             };
             drop(gateaway);
 
-            let mut voice_gateaway = self.voice_gateaway.lock().await;
-            let voice_event = match voice_gateaway.mut_gateaway() {
-                Some(voice_gateaway) => {
-                    if voice_gateaway.heart_beating.is_beat_time().await {
-                        voice_gateaway
-                            .websocket
-                            .send(
-                                json!({
-                                        "op": Opcode::Heartbeat as u8,
-                                        "d": voice_gateaway.last_sequence_number,
-                                })
-                                .to_string()
-                                .into(),
-                            )
-                            .await
-                            .unwrap();
-                    }
-
-                    match poll!(poll_fn(|cx| voice_gateaway.fetch_event(cx))) {
-                        Poll::Ready(Ok(voice_event)) => Some(voice_event),
-                        Poll::Ready(Err(err)) => {
-                            warn!("Failed to parse voice_event: {err}");
-                            if event.is_none() {
-                                continue;
-                            }
-                            None
-                        }
-                        Poll::Pending => None,
-                    }
+            let mut voice_gateaway_state = self.voice_gateaway.lock().await;
+            let voice_event = if let Some(voice_gateaway) = voice_gateaway_state.mut_gateaway() {
+                // Heartbeat
+                if voice_gateaway.heart_beating.is_beat_time().await {
+                    voice_gateaway
+                        .websocket
+                        .send(
+                            json!({
+                                    "op": Opcode::Heartbeat as u8,
+                                    "d": voice_gateaway.last_sequence_number,
+                            })
+                            .to_string()
+                            .into(),
+                        )
+                        .await
+                        .unwrap();
                 }
-                None => None,
+                // Poll event
+                match { poll!(pin!(voice_gateaway.fetch_event())) } {
+                    Poll::Ready(Ok(Some(voice_event))) => Some(voice_event),
+                    Poll::Ready(Ok(None)) => {
+                        info!("Stream closed");
+                        voice_gateaway_state.close_gateway();
+                        None
+                    }
+                    Poll::Ready(Err(err)) => {
+                        warn!("Failed to parse voice_event: {err}");
+                        if event.is_none() {
+                            continue;
+                        }
+                        None
+                    }
+                    Poll::Pending => None,
+                }
+            } else {
+                None
             };
 
             match (event, voice_event) {
@@ -234,47 +245,144 @@ impl Socket for Discord {
                 (event, voice_event) => break (event, voice_event),
             };
 
-            if let Some(voice_gateaway) = voice_gateaway.mut_gateaway()
-                && let Some(connection) = voice_gateaway.type_specific_data.connection.as_mut()
-                && let Some(description) = connection.description()
-                && description.mode().is_some()
-            {
-                if let Poll::Ready(Some((ssrc, audio_frame))) = poll!(pin!(connection.recv_audio()))
+            if let Some(voice_gateaway) = voice_gateaway_state.mut_gateaway() {
+                let voice_gateaway_data = &mut voice_gateaway.type_specific_data;
+                if let Some(connection) = voice_gateaway_data.connection.as_mut()
+                    && let Some(description) = connection.description()
                 {
-                    let mut channel = match voice_gateaway
-                        .type_specific_data
-                        .ssrc_to_audio_channel
-                        .entry(ssrc)
+                    // === Send audio, from the mic. ===
+                    let VoiceGateawayData {
+                        input_buffer,
+                        input_channel,
+                        ..
+                    } = voice_gateaway_data;
+
+                    match input_channel {
+                        InputChannel::None => {
+                            // Handle setting up a voice input channel if one doesn't exist.
+                            let (sender, receiver) = oneshot::channel();
+                            voice_gateaway.input_channel = InputChannel::Initilizing(receiver);
+                            return Some(SocketEvent::AddAudioInput(sender));
+                        }
+                        InputChannel::Initilizing(receiver) => {
+                            if let Some(input) = receiver.try_recv().unwrap() {
+                                *input_channel = InputChannel::Connected(input);
+                            }
+                        }
+                        InputChannel::Connected(input) => {
+                            while let Some(sample) = input.try_pop() {
+                                input_buffer.push_back(sample);
+                            }
+                        }
+                    };
+
+                    let mut frame = [0.0; VOICE_FRAME_SAMPLES];
+                    while input_buffer.len() >= VOICE_FRAME_SAMPLES {
+                        let mut frame_iter = input_buffer.drain(..VOICE_FRAME_SAMPLES);
+
+                        let mut has_audio = false;
+
+                        let mut i = 0;
+                        for sample in frame_iter.by_ref() {
+                            if sample != 0.0 {
+                                has_audio = true;
+                                // break;
+                            }
+                            frame[i] = sample;
+                            i += 1;
+                        }
+
+                        if has_audio {
+                            for sample in frame_iter.by_ref() {
+                                frame[i] = sample;
+                                i += 1;
+                            }
+
+                            if !voice_gateaway_data.is_speaking {
+                                let speaking_payload = json!({
+                                    "op": voice::VoiceOpcode::Speaking as u8,
+                                    "d": {
+                                        "speaking": 1,
+                                        "delay": 0,
+                                        "ssrc": connection.ssrc(),
+                                    }
+                                })
+                                .to_string();
+                                if let Err(err) =
+                                    voice_gateaway.websocket.send(speaking_payload.into()).await
+                                {
+                                    warn!("Failed to send speaking update: {err}");
+                                } else {
+                                    info!("Successfuly sent a start speak event");
+                                    voice_gateaway_data.is_speaking = true;
+                                }
+                            }
+
+                            info!("frame: {:?}", frame);
+                            if let Err(err) = connection.send_audio_frame(&frame).await {
+                                warn!("Failed to send voice audio frame: {err}");
+                            }
+                        }
+                    }
+
+                    // TODO
+                    // if voice_gateaway_data.is_speaking {
+                    //     voice_gateaway_data.is_speaking = false;
+                    //     let speaking_payload = json!({
+                    //         "op": voice::VoiceOpcode::Speaking as u8,
+                    //         "d": {
+                    //             "speaking": 0,
+                    //             "delay": 0,
+                    //             "ssrc": connection.ssrc(),
+                    //         }
+                    //     })
+                    //     .to_string();
+                    //     if let Err(err) =
+                    //         voice_gateaway.websocket.send(speaking_payload.into()).await
+                    //     {
+                    //         warn!("Failed to send speaking update: {err}");
+                    //     } else {
+                    //         info!("Successfuly sent a stop speak event");
+                    //     }
+                    // }
+
+                    // === Recive, and play audio ===
+                    if let Poll::Ready(Some((ssrc, audio_frame))) =
+                        poll!(pin!(connection.recv_audio()))
                     {
-                        hash_map::Entry::Occupied(channel) => channel,
-                        hash_map::Entry::Vacant(e) => {
-                            let (sender, reciver) = oneshot::channel();
-                            e.insert(voice::AudioChannel::Initilizing(reciver));
-                            return Some(SocketEvent::AddAudioSource(sender));
-                        }
-                    };
-                    match channel.get_mut() {
-                        voice::AudioChannel::Initilizing(receiver) => {
-                            let producer = match receiver.try_recv().unwrap() {
-                                Some(producer) => producer,
-                                None => continue,
+                        let mut channel =
+                            match voice_gateaway_data.ssrc_to_audio_channel.entry(ssrc) {
+                                hash_map::Entry::Occupied(channel) => channel,
+                                hash_map::Entry::Vacant(e) => {
+                                    let (sender, reciver) = oneshot::channel();
+                                    e.insert(voice::AudioChannel::Initilizing(reciver));
+                                    return Some(SocketEvent::AddAudioSource(sender));
+                                }
                             };
-                            channel.insert(voice::AudioChannel::Connected(producer));
-                        }
-                        voice::AudioChannel::Connected(producer) => {
-                            // error!("{ssrc}: Talking: {audio_frame:?}");
-                            producer.push_iter(
-                                audio_frame
-                                    .iter()
-                                    .map(|sample| *sample as f32 / i16::MAX as f32),
-                            );
-                        }
-                    };
-                }
+                        match channel.get_mut() {
+                            voice::AudioChannel::Initilizing(receiver) => {
+                                let producer = match receiver.try_recv().unwrap() {
+                                    Some(producer) => producer,
+                                    None => continue,
+                                };
+                                channel.insert(voice::AudioChannel::Connected(producer));
+                            }
+                            voice::AudioChannel::Connected(producer) => {
+                                // error!("{ssrc}: Talking: {audio_frame:?}");
+                                producer.push_iter(
+                                    audio_frame
+                                        .iter()
+                                        .map(|sample| *sample as f32 / i16::MAX as f32),
+                                );
+                            }
+                        };
+                    }
+                };
+
                 continue;
             };
 
-            drop(voice_gateaway);
+            drop(voice_gateaway_state);
             pending!()
         };
 

@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    future::poll_fn,
     pin::Pin,
     sync::Weak,
     task::{Context, Poll},
@@ -9,7 +10,7 @@ use crate::messanger_unifier::Call;
 use auth::MessangersGenerator;
 use font_kit::{family_name::FamilyName, source::SystemSource};
 use futures::{Stream, StreamExt, future::join_all, join};
-use iced::{Element, Task, window};
+use iced::{Element, Subscription, Task, window};
 use messanger_unifier::Messangers;
 use messenger_interface::interface::{Socket, SocketEvent};
 use pages::{AppMessage, Login, messenger::Messenger};
@@ -54,6 +55,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             fonts: vec![Cow::Borrowed(sytem_font)],
             ..Default::default()
         })
+        .subscription(App::subscription)
         .run()
         .inspect_err(|err| error!("{err}"))?;
     Ok(())
@@ -402,14 +404,68 @@ impl App {
                     }
                     SocketEvent::Disconnected => info!("Disconnected"),
                     SocketEvent::AddAudioSource(sender) => {
-                        let producer =
-                            self.audio
-                                .create_output_channel(2, SampleFormat::I16, 48_000);
+                        let producer = self
+                            .audio
+                            .create_output_channel(2, SampleFormat::I16, 48_000)
+                            .unwrap();
+
                         if sender.send(producer).is_err() {
                             warn!("Couldn't send audio channel to the adapter");
                         };
+
+                        if !self.audio.is_streaming_output() {
+                            return Task::done(AppMessage::StartOutputStream);
+                        }
+                    }
+                    SocketEvent::AddAudioInput(sender) => {
+                        let input = self
+                            .audio
+                            .create_input_channel(2, SampleFormat::I16, 48_000)
+                            .unwrap();
+
+                        if sender.send(input).is_err() {
+                            warn!("Couldn't send audio input channel to the adapter");
+                        };
+
+                        if !self.audio.is_streaming_input() {
+                            return Task::done(AppMessage::StartInputStream);
+                        }
                     }
                 };
+                Task::none()
+            }
+            AppMessage::StartOutputStream => {
+                if let Some(notify) = self.audio.start_stream_output() {
+                    return Task::future(async {
+                        notify.await;
+                    })
+                    .then(|_| Task::done(AppMessage::StopOutputStream));
+                } else {
+                    // TODO: Remove this after making control flow simpler
+                    error!("Stream is already running?");
+                };
+
+                Task::none()
+            }
+            AppMessage::StopOutputStream => {
+                self.audio.stop_stream_output();
+                Task::none()
+            }
+            AppMessage::StartInputStream => {
+                if let Some(notify) = self.audio.start_stream_input() {
+                    return Task::future(async {
+                        notify.await;
+                    })
+                    .then(|_| Task::done(AppMessage::StopInputStream));
+                } else {
+                    // TODO: Remove this after making control flow simpler
+                    error!("Input stream is already running?");
+                };
+
+                Task::none()
+            }
+            AppMessage::StopInputStream => {
+                self.audio.stop_stream_input();
                 Task::none()
             }
             // ====== Pages ======
@@ -487,7 +543,8 @@ impl App {
                             match vc {
                                 Ok(vc) => {
                                     // Convert Place<Room> to Room for voice API
-                                    let room_id = call.source().swap_data((**call.source()).clone());
+                                    let room_id =
+                                        call.source().swap_data((**call.source()).clone());
                                     vc.disconnect(&room_id).await;
                                 }
                                 Err(err) => warn!("Voice not supported by adapter: {err:#?}"),
@@ -513,5 +570,9 @@ impl App {
             Screen::Chat(chat) => chat.view(&self.messangers).map(AppMessage::Chat),
             Screen::Loading => iced::widget::text("Loading").into(),
         }
+    }
+
+    fn subscription(&self) -> Subscription<AppMessage> {
+        Subscription::none()
     }
 }

@@ -1,17 +1,23 @@
-use std::ops::{Deref, DerefMut};
+use std::{
+    error::Error,
+    fmt::Debug,
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
 
 use cpal::{
     ChannelCount, SampleFormat, SampleRate,
     traits::{DeviceTrait as _, StreamTrait},
 };
 use ringbuf::{
-    CachingCons, CachingProd,
-    traits::{Consumer as _, Observer as _},
+    CachingCons, CachingProd, StaticRb,
+    traits::{Consumer as _, Observer as _, Producer, Split},
 };
 use tracing::{error, info};
 
 use crate::{
-    AudioMixer, AudioSampleType, Channel, ChannelType, SampleConsumer, SampleProducer, SampleRb,
+    AudioMixer, AudioSampleType, Channel, ChannelType, Notify, SampleConsumer, SampleProducer,
+    SampleRb,
 };
 
 #[repr(transparent)]
@@ -34,57 +40,77 @@ impl<const N: usize> DerefMut for Output<N> {
     }
 }
 
+pub enum OutputRxEvent {
+    AddOutputChannel(SampleConsumer<5120>),
+}
+impl Debug for OutputRxEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AddOutputChannel(_) => f.debug_tuple("AddOutputChannel").finish(),
+        }
+    }
+}
+pub enum TxEvent {
+    Close,
+}
+
 impl AudioMixer {
-    /// Creates a new output channel and returns a producer for writing audio data.
-    ///
-    /// Note: Channels must be created before the audio stream starts. Once the stream
-    /// is running, newly created channels will not be included in the output mix.
-    /// The stream starts automatically when the first channel is created.
     pub fn create_output_channel(
         &mut self,
         channel_mode: ChannelCount,
         sample_format: SampleFormat,
         sample_rate: SampleRate,
-    ) -> Output<5120> {
+    ) -> Result<Output<5120>, Box<dyn Error>> {
         let (channel, producer) =
             Channel::<_, Output<5120>>::new(channel_mode, sample_format, sample_rate);
 
-        self.output_channels.push(channel);
-        if let Some(master) = &self.output
-        // && master.stream.is_none()
+        if let Some(master) = &mut self.output
+            && let Some(stream) = &mut master.stream
         {
-            self.stop_stream_output();
-            self.start_stream_output();
-        };
+            let sample_consumer = CachingCons::new(channel.rb.clone());
+            stream
+                .to_audio_thread
+                .try_push(OutputRxEvent::AddOutputChannel(sample_consumer))
+                .map_err(|err| format!("Could not exec: {:?}", err))?;
+        }
+        self.output_channels.push(channel);
 
-        producer
+        Ok(producer)
     }
 
-    fn start_stream_output(&mut self) {
-        if let Some(output) = &self.output
-            && output.stream.is_none()
-            && !self.output_channels.is_empty()
-        {
+    pub fn start_stream_output(&mut self) -> Option<Notify> {
+        if let Some(output) = &mut self.output {
             let config = output.device.default_output_config().unwrap();
             let mut stream_config = config.config();
 
             stream_config.sample_rate = 48_000; // TODO: Determene by device preference in future
 
             info!("Starting output stream with config: {:#?}", stream_config);
+
             let mut sample_consumers = self
                 .output_channels
                 .iter()
                 .map(|channel| CachingCons::new(channel.rb.clone()))
                 .collect::<Vec<SampleConsumer<5120>>>();
+
+            let (prod, mut cons) = StaticRb::default().split();
+            let stream_close_notification = Notify::new();
+            let send_stream_close_notification = stream_close_notification.clone();
             let stream = output
                 .device
                 .build_output_stream(
                     &stream_config,
                     move |data: &mut [AudioSampleType], _| {
+                        for event in cons.pop_iter() {
+                            match event {
+                                OutputRxEvent::AddOutputChannel(cons) => {
+                                    sample_consumers.push(cons);
+                                }
+                            };
+                        }
                         sample_consumers.retain(|consumer| consumer.write_is_held());
-                        info!("{}", sample_consumers.len());
                         if sample_consumers.is_empty() {
-                            info!("TODO: Close stream");
+                            send_stream_close_notification.notify();
                         }
                         // Mix audio from all channels
                         for stream_sample in data {
@@ -102,13 +128,16 @@ impl AudioMixer {
                 .unwrap();
 
             stream.play().unwrap();
-            if let Some(output) = self.output.as_mut() {
-                output.stream = Some(stream);
-            }
+            output.stream = Some(crate::OutputStream {
+                stream,
+                to_audio_thread: prod,
+            });
+            return Some(stream_close_notification);
         }
+        None
     }
 
-    fn stop_stream_output(&mut self) {
+    pub fn stop_stream_output(&mut self) {
         if let Some(output) = &mut self.output {
             output.stream = None;
         }

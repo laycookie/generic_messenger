@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     error::Error,
     io, mem,
     task::{Context, Poll},
@@ -13,10 +13,10 @@ use async_tungstenite::{
 };
 use facet::Facet;
 use futures::{StreamExt as _, channel::oneshot};
-use simple_audio_channels::output::Output;
+use simple_audio_channels::{input::Input, output::Output};
 use smol::net::UdpSocket;
 use surf::http::convert::json;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     Discord,
@@ -157,7 +157,6 @@ impl VoiceGateawayState {
             },
         }
     }
-    // TODO: Make it Result
     pub async fn connect(
         self,
         user_id: &str,
@@ -186,6 +185,22 @@ impl VoiceGateawayState {
             session_id,
         })
     }
+    pub fn close_gateway(&mut self) {
+        *self = match mem::take(self) {
+            VoiceGateawayState::Open {
+                endpoint,
+                session_id,
+                ..
+            } => Self::Ready {
+                endpoint,
+                session_id,
+            },
+            prev_state => {
+                error!("Gateway already closed");
+                prev_state
+            }
+        }
+    }
 }
 
 pub enum AudioChannel {
@@ -193,9 +208,20 @@ pub enum AudioChannel {
     Connected(Output<5120>),
 }
 
+#[derive(Default)]
+pub enum InputChannel {
+    #[default]
+    None,
+    Initilizing(oneshot::Receiver<Input<5120>>),
+    Connected(Input<5120>),
+}
+
 pub struct Voice {
     pub ssrc_to_audio_channel: HashMap<Ssrc, AudioChannel>,
     pub connection: Option<Connection>,
+    pub input_channel: InputChannel,
+    pub input_buffer: VecDeque<f32>,
+    pub is_speaking: bool,
 }
 impl Gateaway<Voice> {
     pub async fn new(
@@ -242,17 +268,18 @@ impl Gateaway<Voice> {
             type_specific_data: Voice {
                 connection: None,
                 ssrc_to_audio_channel: HashMap::new(),
+                input_channel: Default::default(),
+                input_buffer: VecDeque::new(),
+                is_speaking: false,
             },
         })
     }
-    pub fn fetch_event(
+    pub async fn fetch_event(
         &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<GatewayPayload<VoiceOpcode>, Box<dyn std::error::Error + Send + Sync>>> {
-        match self.websocket.poll_next_unpin(cx)? {
-            Poll::Ready(Some(event)) => Poll::Ready(deserialize_event::<VoiceOpcode>(&event)),
-            Poll::Ready(None) => Poll::Ready(Err("Stream ended".into())),
-            Poll::Pending => Poll::Pending,
+    ) -> Result<Option<GatewayPayload<VoiceOpcode>>, Box<dyn std::error::Error + Send + Sync>> {
+        match self.websocket.next().await {
+            Some(event) => Ok(Some(deserialize_event::<VoiceOpcode>(&event?)?)),
+            None => Ok(None),
         }
     }
 }

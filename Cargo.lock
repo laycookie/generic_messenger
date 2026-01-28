@@ -5161,6 +5161,7 @@ name = "simple-audio-channels"
 version = "0.0.1"
 dependencies = [
  "cpal",
+ "futures",
  "ringbuf",
  "tracing",
 ]

@@ -7,8 +7,11 @@ use pnet_macros_support::{
     packet::PrimitiveValues,
     types::{u1, u2, u4, u7, u16be, u32be},
 };
+use simple_audio_channels::AudioSampleType;
 use smol::net::UdpSocket;
 use std::{
+    collections::vec_deque::Iter,
+    error::Error,
     num::Wrapping,
     ops::{Add, AddAssign, Sub, SubAssign},
 };
@@ -106,8 +109,13 @@ pub struct Connection {
     ssrc: Ssrc,
     description: Option<SessionDescription>,
     decoder: opus::Decoder,
+    encoder: opus::Encoder,
+    sequence: Wrap16,
+    timestamp: Wrap32,
+    nonce: u32,
     rtp_packet_buf: [u8; 1024],
     decoded_audio_buf: [i16; 8048],
+    encoded_audio_buf: [u8; 1276],
 }
 impl Connection {
     pub fn new(udp: UdpSocket, ssrc: u32) -> Self {
@@ -116,9 +124,18 @@ impl Connection {
             description: None,
             ssrc,
             decoder: opus::Decoder::new(48000, opus::Channels::Stereo).unwrap(),
+            encoder: opus::Encoder::new(48000, opus::Channels::Stereo, opus::Application::Voip)
+                .unwrap(),
+            sequence: Wrap16::from(0),
+            timestamp: Wrap32::from(0),
+            nonce: 0,
             rtp_packet_buf: [0; 1024],
             decoded_audio_buf: [0; 8048],
+            encoded_audio_buf: [0; 1276],
         }
+    }
+    pub fn ssrc(&self) -> Ssrc {
+        self.ssrc
     }
     pub fn description(&self) -> Option<&SessionDescription> {
         self.description.as_ref()
@@ -221,6 +238,78 @@ impl Connection {
             rtp_packet.get_ssrc(),
             &self.decoded_audio_buf[..n_decoded_samples * *channels as usize],
         ))
+    }
+
+    pub async fn send_audio_frame(
+        &mut self,
+        samples: &[AudioSampleType],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if samples.is_empty() {
+            warn!("Noting to send");
+            return Ok(());
+        }
+        if !samples.len().is_multiple_of(2) {
+            return Err("Expected interleaved stereo samples".into());
+        }
+
+        let description = self
+            .description
+            .as_ref()
+            .ok_or("Missing session description")?;
+        let mode = description.mode().ok_or("Missing encryption mode")?;
+        let secret_key = description.secret_key().ok_or("Missing secret key")?;
+
+        let encoded_len = self
+            .encoder
+            .encode_float(samples, &mut self.encoded_audio_buf)
+            .map_err(|err| format!("Opus encode failed: {err:?}"))?;
+        let opus_payload = &self.encoded_audio_buf[..encoded_len];
+
+        let sequence = self.sequence;
+        let timestamp = self.timestamp;
+        let samples_per_channel = (samples.len() / 2) as u32;
+        self.sequence += 1;
+        self.timestamp += samples_per_channel;
+
+        let mut rtp_header = [0u8; 12];
+        rtp_header[0] = 0x80;
+        rtp_header[1] = DiscordPacketType::Voice as u8;
+        rtp_header[2..4].copy_from_slice(&u16::from(sequence).to_be_bytes());
+        rtp_header[4..8].copy_from_slice(&u32::from(timestamp).to_be_bytes());
+        rtp_header[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
+
+        match mode {
+            EncryptionMode::aead_xchacha20_poly1305_rtpsize => {
+                let nonce_u32 = self.nonce.to_be_bytes();
+                self.nonce = self.nonce.wrapping_add(1);
+
+                let mut nonce = [0u8; 24];
+                nonce[..mode.nonce_size()].copy_from_slice(&nonce_u32);
+                let nonce = crypto_aead::xchacha20poly1305::Nonce::from_bytes(nonce);
+                let key = crypto_aead::xchacha20poly1305::Key::from_bytes(&secret_key[..])
+                    .expect("Invalid key length");
+
+                let encrypted = crypto_aead::xchacha20poly1305::encrypt(
+                    opus_payload,
+                    Some(&rtp_header),
+                    &nonce,
+                    &key,
+                )?;
+
+                let mut packet =
+                    Vec::with_capacity(rtp_header.len() + encrypted.len() + nonce_u32.len());
+                packet.extend_from_slice(&rtp_header);
+                packet.extend_from_slice(&encrypted);
+                packet.extend_from_slice(&nonce_u32);
+
+                self.udp.send(&packet).await?;
+            }
+            _ => {
+                return Err(format!("Unsupported encryption mode: {:?}", mode).into());
+            }
+        }
+
+        Ok(())
     }
 }
 

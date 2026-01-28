@@ -11,7 +11,7 @@ use messenger_interface::{
     interface::SocketEvent,
     types::{House, ID, Identifier, Message, Place, Room, User},
 };
-use std::fmt::Debug;
+use std::{fmt::Debug, task::Waker};
 
 use crate::Screen;
 
@@ -49,6 +49,11 @@ pub(crate) enum AppMessage {
     // === State Managers ===
     StartUp,
     SaveMessengersCredentialToDisk,
+    // === Audio ===
+    StartOutputStream,
+    StopOutputStream,
+    StartInputStream,
+    StopInputStream,
     // === Pages ===
     Login(LoginMessage),
     Chat(MessangerMessage),

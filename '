@@ -1,0 +1,83 @@
+use std::ops::{Deref, DerefMut};
+
+use cpal::{
+    ChannelCount, SampleFormat, SampleRate,
+    traits::{DeviceTrait, StreamTrait as _},
+};
+use ringbuf::{CachingProd, traits::Producer};
+use tracing::error;
+
+use crate::{AudioMixer, AudioSampleType, Channel, ChannelType, Notify, SampleProducer, SampleRb};
+
+#[repr(transparent)]
+pub struct Input<const N: usize>(SampleProducer<N>);
+impl<const N: usize> ChannelType<N> for Input<N> {
+    fn from(rb: SampleRb<N>) -> Self {
+        Self(CachingProd::new(rb.clone()))
+    }
+}
+impl<const N: usize> Deref for Input<N> {
+    type Target = SampleProducer<N>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl<const N: usize> DerefMut for Input<N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl AudioMixer {
+    pub fn create_input_channel(
+        &mut self,
+        channel_mode: ChannelCount,
+        sample_format: SampleFormat,
+        sample_rate: SampleRate,
+    ) -> Input<5120> {
+        let (channel, producer) =
+            Channel::<_, Input<5120>>::new(channel_mode, sample_format, sample_rate);
+
+        self.input_channels.push(channel);
+
+        producer
+    }
+
+    pub fn start_stream_input(&mut self) -> Option<Notify> {
+        if let Some(input) = &mut self.input {
+            let config = input.device.default_input_config().unwrap();
+            let stream_config = config.config();
+
+            let mut sample_producers = self
+                .input_channels
+                .iter()
+                .map(|channel| CachingProd::new(channel.rb.clone()))
+                .collect::<Vec<SampleProducer<5120>>>();
+
+            let stream = input
+                .device
+                .build_input_stream(
+                    &stream_config,
+                    move |data: &[AudioSampleType], &_| {
+                        for sample_producer in sample_producers.iter_mut() {
+                            sample_producer.push_iter(data.iter().copied());
+                        }
+                    },
+                    move |err| {
+                        error!("Audio stream error: {err:?}");
+                    },
+                    None,
+                )
+                .unwrap();
+
+            stream.play().unwrap();
+            input.stream = Some(crate::AudioStream {
+                stream,
+                to_audio_thread: prod,
+            });
+        }
+
+        None
+    }
+}
