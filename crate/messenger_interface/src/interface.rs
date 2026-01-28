@@ -18,7 +18,7 @@ use crate::types::{House, Identifier, Message, Place, Room, User};
 use async_trait::async_trait;
 use futures::Stream;
 use futures::channel::oneshot;
-use simple_audio_channels::output::Output;
+use simple_audio_channels::{input::Input, output::Output};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MessengerError {
@@ -174,6 +174,10 @@ pub enum SocketEvent {
     ///
     /// The receiver receives a `SampleProducer` used to push samples into the system.
     AddAudioSource(oneshot::Sender<Output<5120>>),
+    /// Request to attach a local audio input (microphone) for sending to voice.
+    ///
+    /// The receiver receives a `SampleConsumer` used to pull samples from the input stream.
+    AddAudioInput(oneshot::Sender<Input<5120>>),
     /// Socket disconnected (cleanly or due to error).
     Disconnected,
     /// No-op / placeholder event (used by some backends to "tick" the stream).

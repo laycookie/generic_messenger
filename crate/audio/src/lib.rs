@@ -1,19 +1,31 @@
-use std::{marker::PhantomData, ops::DerefMut, sync::Arc};
+use std::{
+    marker::PhantomData,
+    ops::DerefMut,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Poll, Waker},
+};
 
 use cpal::{ChannelCount, traits::HostTrait};
 pub use cpal::{SampleFormat, SampleRate};
-use ringbuf::wrap::caching::Caching;
+use ringbuf::{StaticRb, wrap::caching::Caching};
 
-pub use ringbuf::traits::Producer;
+pub use ringbuf::traits::{Consumer, Producer};
+use tracing::{error, warn};
 
-use crate::{effects::Afx, input::Input, output::Output};
+use crate::{
+    effects::Afx,
+    input::{Input, InputRxEvent},
+    output::{Output, OutputRxEvent},
+};
 
 pub mod effects;
 pub mod input;
 pub mod output;
 
-type SampleRb<const N: usize> =
-    Arc<ringbuf::SharedRb<ringbuf::storage::Owning<[std::mem::MaybeUninit<AudioSampleType>; N]>>>;
+type SampleRb<const N: usize> = Arc<StaticRb<AudioSampleType, N>>;
 type SampleProducer<const N: usize> = Caching<SampleRb<N>, true, false>;
 type SampleConsumer<const N: usize> = Caching<SampleRb<N>, false, true>;
 
@@ -38,7 +50,7 @@ impl<const N: usize, C: ChannelType<N>> Channel<N, C> {
         sample_format: SampleFormat,
         sample_rate: SampleRate,
     ) -> (Channel<N, C>, C) {
-        let rb: SampleRb<N> = ringbuf::SharedRb::default().into();
+        let rb: SampleRb<N> = StaticRb::default().into();
         let c = C::from(rb.clone());
 
         let channel = Channel {
@@ -53,14 +65,69 @@ impl<const N: usize, C: ChannelType<N>> Channel<N, C> {
     }
 }
 
-struct Master {
+#[derive(Clone)]
+pub struct Notify(Arc<InnerNotify>);
+struct InnerNotify {
+    waker: OnceLock<Waker>,
+    notified: AtomicBool,
+}
+impl Future for Notify {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.0.notified.load(Ordering::Relaxed) {
+            true => Poll::Ready(()),
+            false => {
+                self.0.waker.set(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+impl Notify {
+    fn new() -> Self {
+        Self(Arc::new(InnerNotify {
+            waker: OnceLock::new(),
+            notified: AtomicBool::new(false),
+        }))
+    }
+
+    fn notify(&self) {
+        self.0.notified.store(true, Ordering::Relaxed);
+        if let Some(waker) = &self.0.waker.get() {
+            waker.wake_by_ref();
+        }
+    }
+}
+
+pub(crate) struct OutputStream {
+    stream: cpal::Stream,
+    to_audio_thread: Caching<Arc<StaticRb<OutputRxEvent, 8>>, true, false>,
+    // reciver: oneshot::Receiver<TxEvent>,
+}
+
+pub(crate) struct InputStream {
+    stream: cpal::Stream,
+    to_audio_thread: Caching<Arc<StaticRb<InputRxEvent, 8>>, true, false>,
+    // reciver: oneshot::Receiver<TxEvent>,
+}
+
+struct OutputMaster {
     device: cpal::Device,
-    stream: Option<cpal::Stream>,
+    stream: Option<OutputStream>,
+}
+
+struct InputMaster {
+    device: cpal::Device,
+    stream: Option<InputStream>,
 }
 
 pub struct AudioMixer {
-    output: Option<Master>,
-    input: Option<Master>,
+    output: Option<OutputMaster>,
+    input: Option<InputMaster>,
     output_channels: Vec<Channel<5120, Output<5120>>>,
     input_channels: Vec<Channel<5120, Input<5120>>>,
 }
@@ -76,14 +143,14 @@ impl Default for AudioMixer {
         let host = cpal::default_host();
 
         if let Some(output) = host.default_output_device() {
-            let main = Master {
+            let main = OutputMaster {
                 device: output,
                 stream: None,
             };
             audio_mixer.output = Some(main);
         }
         if let Some(input) = host.default_input_device() {
-            let main = Master {
+            let main = InputMaster {
                 device: input,
                 stream: None,
             };
@@ -91,5 +158,26 @@ impl Default for AudioMixer {
         }
 
         audio_mixer
+    }
+}
+impl AudioMixer {
+    pub fn is_streaming_output(&self) -> bool {
+        if let Some(output) = &self.output
+            && output.stream.is_some()
+        {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_streaming_input(&self) -> bool {
+        if let Some(input) = &self.input
+            && input.stream.is_some()
+        {
+            true
+        } else {
+            false
+        }
     }
 }

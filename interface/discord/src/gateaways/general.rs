@@ -219,14 +219,12 @@ impl Gateaway<General> {
         })
     }
 
-    pub fn fetch_event(
+    pub async fn fetch_event(
         &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<GatewayPayload<Opcode>, Box<dyn std::error::Error + Send + Sync>>> {
-        match self.websocket.poll_next_unpin(cx)? {
-            Poll::Ready(Some(event)) => Poll::Ready(deserialize_event::<Opcode>(&event)),
-            Poll::Ready(None) => Poll::Ready(Err("Stream ended".into())),
-            Poll::Pending => Poll::Pending,
+    ) -> Result<Option<GatewayPayload<Opcode>>, Box<dyn std::error::Error + Send + Sync>> {
+        match self.websocket.next().await {
+            Some(event) => Ok(Some(deserialize_event::<Opcode>(&event?)?)),
+            None => Ok(None),
         }
     }
 }

@@ -8,5 +8,6 @@ repository = "https://github.com/laycookie/generic_messenger"
 
 [dependencies]
 tracing = { workspace = true }
+futures = { workspace = true }
 ringbuf = "0.4.8"
 cpal = "0.17.0"
