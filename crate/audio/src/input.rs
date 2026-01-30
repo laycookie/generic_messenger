@@ -124,9 +124,7 @@ impl AudioMixer {
                                 }
                             };
 
-                            // Only push if frame RMS exceeds NOISE_FLOOR
                             if frame_rms > NOISE_FLOOR {
-                                info!("Playing");
                                 sample_producer.push_iter(data.iter().copied());
                             }
                         }

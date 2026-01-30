@@ -2,15 +2,10 @@ use std::{
     collections::{HashMap, VecDeque},
     error::Error,
     io, mem,
-    task::{Context, Poll},
     time::Duration,
 };
 
-use async_tungstenite::{
-    WebSocketStream,
-    async_std::{ConnectStream, connect_async},
-    tungstenite::Message,
-};
+use async_tungstenite::{async_std::connect_async, tungstenite::Message};
 use facet::Facet;
 use futures::{StreamExt as _, channel::oneshot};
 use simple_audio_channels::{input::Input, output::Output};
@@ -26,7 +21,7 @@ use crate::{
     },
 };
 
-mod connection;
+pub(super) mod connection;
 
 /// <https://discord.com/developers/docs/topics/opcodes-and-status-codes#voice>
 /// <https://docs.discord.food/topics/opcodes-and-status-codes#voice-opcodes>
