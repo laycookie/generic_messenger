@@ -26,15 +26,15 @@ use crate::{
     Discord,
     gateaways::{
         general::{GatewayEvent, Opcode},
-        voice::{InputChannel, Voice as VoiceGateawayData, VoiceGateawayState},
+        voice::{
+            InputChannel, Voice as VoiceGateawayData, VoiceGateawayState,
+            connection::VOICE_FRAME_SAMPLES,
+        },
     },
 };
 
 pub mod general;
 pub mod voice;
-
-const VOICE_CHANNELS: usize = 2;
-const VOICE_FRAME_SAMPLES: usize = 960 * VOICE_CHANNELS;
 
 pub struct Gateaway<T> {
     websocket: WebSocketStream<ConnectStream>,
@@ -278,24 +278,16 @@ impl Socket for Discord {
 
                     let mut frame = [0.0; VOICE_FRAME_SAMPLES];
                     while input_buffer.len() >= VOICE_FRAME_SAMPLES {
-                        let mut frame_iter = input_buffer.drain(..VOICE_FRAME_SAMPLES);
+                        let mut frame_iter = input_buffer.drain(..VOICE_FRAME_SAMPLES).enumerate();
 
-                        let mut has_audio = false;
-
-                        let mut i = 0;
-                        for sample in frame_iter.by_ref() {
-                            if sample != 0.0 {
-                                has_audio = true;
-                                // break;
-                            }
+                        let has_audio = frame_iter.any(|(i, sample)| {
                             frame[i] = sample;
-                            i += 1;
-                        }
+                            sample != 0.0
+                        });
 
                         if has_audio {
-                            for sample in frame_iter.by_ref() {
+                            for (i, sample) in frame_iter {
                                 frame[i] = sample;
-                                i += 1;
                             }
 
                             if !voice_gateaway_data.is_speaking {
@@ -318,7 +310,6 @@ impl Socket for Discord {
                                 }
                             }
 
-                            info!("frame: {:?}", frame);
                             if let Err(err) = connection.send_audio_frame(&frame).await {
                                 warn!("Failed to send voice audio frame: {err}");
                             }

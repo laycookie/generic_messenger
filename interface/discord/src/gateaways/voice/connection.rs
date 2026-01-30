@@ -10,12 +10,16 @@ use pnet_macros_support::{
 use simple_audio_channels::AudioSampleType;
 use smol::net::UdpSocket;
 use std::{
-    collections::vec_deque::Iter,
     error::Error,
     num::Wrapping,
     ops::{Add, AddAssign, Sub, SubAssign},
+    time::Instant,
 };
 use tracing::{error, info, warn};
+
+pub const VOICE_FREQUANCY: usize = 48_000;
+pub const VOICE_CHANNELS: usize = 2; // Stereo
+pub const VOICE_FRAME_SAMPLES: usize = 960 * VOICE_CHANNELS;
 
 // <https://docs.discord.food/topics/voice-connections#encryption-mode>
 #[allow(non_camel_case_types)]
@@ -112,6 +116,7 @@ pub struct Connection {
     encoder: opus::Encoder,
     sequence: Wrap16,
     timestamp: Wrap32,
+    last_send_time: Option<Instant>,
     nonce: u32,
     rtp_packet_buf: [u8; 1024],
     decoded_audio_buf: [i16; 8048],
@@ -123,11 +128,16 @@ impl Connection {
             udp,
             description: None,
             ssrc,
-            decoder: opus::Decoder::new(48000, opus::Channels::Stereo).unwrap(),
-            encoder: opus::Encoder::new(48000, opus::Channels::Stereo, opus::Application::Voip)
-                .unwrap(),
+            decoder: opus::Decoder::new(VOICE_FREQUANCY as u32, opus::Channels::Stereo).unwrap(),
+            encoder: opus::Encoder::new(
+                VOICE_FREQUANCY as u32,
+                opus::Channels::Stereo,
+                opus::Application::Voip,
+            )
+            .unwrap(),
             sequence: Wrap16::from(0),
             timestamp: Wrap32::from(0),
+            last_send_time: None,
             nonce: 0,
             rtp_packet_buf: [0; 1024],
             decoded_audio_buf: [0; 8048],
@@ -265,11 +275,33 @@ impl Connection {
             .map_err(|err| format!("Opus encode failed: {err:?}"))?;
         let opus_payload = &self.encoded_audio_buf[..encoded_len];
 
-        let sequence = self.sequence;
+        let samples_per_channel = (samples.len() / VOICE_CHANNELS) as u32;
+        let now = Instant::now();
+
+        // Hybrid timestamp approach: sample-based during active speech,
+        // but account for silence gaps based on elapsed time
+        if let Some(last_time) = self.last_send_time {
+            let elapsed = now.duration_since(last_time);
+            let expected_frame_duration = std::time::Duration::from_micros(
+                (samples_per_channel * 1_000_000 / VOICE_FREQUANCY as u32) as u64,
+            );
+
+            // If gap is significantly longer than expected frame time, we had silence
+            // Advance timestamp to account for the silence gap
+            if elapsed > expected_frame_duration * 2 {
+                let silence_samples =
+                    ((elapsed.as_secs_f64() * 48000.0) as u32) - samples_per_channel;
+                self.timestamp += silence_samples;
+            }
+        }
+
         let timestamp = self.timestamp;
-        let samples_per_channel = (samples.len() / 2) as u32;
-        self.sequence += 1;
+        let sequence = self.sequence;
+
+        // Advance timestamp by the samples in this frame
         self.timestamp += samples_per_channel;
+        self.sequence += 1;
+        self.last_send_time = Some(now);
 
         let mut rtp_header = [0u8; 12];
         rtp_header[0] = 0x80;
