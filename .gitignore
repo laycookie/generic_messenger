@@ -3,6 +3,7 @@
 LoginInfo
 
 /.idea
+/.cursor
 
 cargo.lock
 
