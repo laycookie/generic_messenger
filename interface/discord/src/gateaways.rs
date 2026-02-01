@@ -20,7 +20,7 @@ use messenger_interface::{
 };
 use simple_audio_channels::{Consumer, Producer};
 use surf::http::convert::json;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     Discord,
@@ -28,7 +28,7 @@ use crate::{
         general::{GatewayEvent, Opcode},
         voice::{
             InputChannel, Voice as VoiceGateawayData, VoiceGateawayState,
-            connection::VOICE_FRAME_SAMPLES,
+            connection::{VOICE_CHANNELS, VOICE_FRAME_SAMPLES, VOICE_FREQUANCY},
         },
     },
 };
@@ -111,7 +111,7 @@ fn deserialize_event<Op: for<'a> Facet<'a>>(
         WebsocketMessage::Text(text) => match facet_json::from_str::<GatewayPayload<Op>>(text) {
             Ok(event) => event,
             Err(err) => {
-                warn!("Failed to parse: {text}");
+                error!("Failed to parse: {text}");
                 return Err(Box::new(err));
             }
         },
@@ -192,7 +192,7 @@ impl Socket for Discord {
                             None
                         }
                         Poll::Ready(Err(err)) => {
-                            warn!("Failed to parse event: {err}");
+                            error!("{err}");
                             continue;
                         }
                         Poll::Pending => None,
@@ -228,7 +228,7 @@ impl Socket for Discord {
                         None
                     }
                     Poll::Ready(Err(err)) => {
-                        warn!("Failed to parse voice_event: {err}");
+                        error!("{err}");
                         if event.is_none() {
                             continue;
                         }
@@ -277,24 +277,20 @@ impl Socket for Discord {
                     };
 
                     let mut frame = [0.0; VOICE_FRAME_SAMPLES];
-                    while input_buffer.len() >= VOICE_FRAME_SAMPLES {
-                        let mut frame_iter = input_buffer.drain(..VOICE_FRAME_SAMPLES).enumerate();
+                    // Check if we should send stop speaking event
+                    // Only stop if buffer is low AND we haven't sent audio for 200ms
+                    if input_buffer.len() < VOICE_FRAME_SAMPLES {
+                        if voice_gateaway_data.is_speaking {
+                            let should_stop = connection
+                                .last_send_time()
+                                .map(|last_time| last_time.elapsed() > Duration::from_millis(200))
+                                .unwrap_or(false);
 
-                        let has_audio = frame_iter.any(|(i, sample)| {
-                            frame[i] = sample;
-                            sample != 0.0
-                        });
-
-                        if has_audio {
-                            for (i, sample) in frame_iter {
-                                frame[i] = sample;
-                            }
-
-                            if !voice_gateaway_data.is_speaking {
+                            if should_stop {
                                 let speaking_payload = json!({
                                     "op": voice::VoiceOpcode::Speaking as u8,
                                     "d": {
-                                        "speaking": 1,
+                                        "speaking": 0,
                                         "delay": 0,
                                         "ssrc": connection.ssrc(),
                                     }
@@ -303,42 +299,58 @@ impl Socket for Discord {
                                 if let Err(err) =
                                     voice_gateaway.websocket.send(speaking_payload.into()).await
                                 {
-                                    warn!("Failed to send speaking update: {err}");
+                                    error!("Failed to send speaking update: {err}");
                                 } else {
-                                    info!("Successfuly sent a start speak event");
-                                    voice_gateaway_data.is_speaking = true;
+                                    voice_gateaway_data.is_speaking = false;
                                 }
                             }
+                        }
+                    } else {
+                        while input_buffer.len() >= VOICE_FRAME_SAMPLES {
+                            let mut frame_iter =
+                                input_buffer.drain(..VOICE_FRAME_SAMPLES).enumerate();
 
-                            if let Err(err) = connection.send_audio_frame(&frame).await {
-                                warn!("Failed to send voice audio frame: {err}");
+                            let has_audio = frame_iter.any(|(i, sample)| {
+                                frame[i] = sample;
+                                sample != 0.0
+                            });
+
+                            if has_audio {
+                                for (i, sample) in frame_iter {
+                                    frame[i] = sample;
+                                }
+
+                                // TODO: Temporary disable speaking
+                                if !voice_gateaway_data.is_speaking {
+                                    let speaking_payload = json!({
+                                        "op": voice::VoiceOpcode::Speaking as u8,
+                                        "d": {
+                                            "speaking": 1,
+                                            "delay": 0,
+                                            "ssrc": connection.ssrc(),
+                                        }
+                                    })
+                                    .to_string();
+                                    if let Err(err) =
+                                        voice_gateaway.websocket.send(speaking_payload.into()).await
+                                    {
+                                        error!("Failed to send speaking update: {err}");
+                                    } else {
+                                        voice_gateaway_data.is_speaking = true;
+                                    }
+                                }
+
+                                if let Err(err) = connection.send_audio_frame(&frame).await {
+                                    warn!("Failed to send voice audio frame: {err}");
+                                }
                             }
                         }
                     }
 
-                    // TODO
-                    // if voice_gateaway_data.is_speaking {
-                    //     voice_gateaway_data.is_speaking = false;
-                    //     let speaking_payload = json!({
-                    //         "op": voice::VoiceOpcode::Speaking as u8,
-                    //         "d": {
-                    //             "speaking": 0,
-                    //             "delay": 0,
-                    //             "ssrc": connection.ssrc(),
-                    //         }
-                    //     })
-                    //     .to_string();
-                    //     if let Err(err) =
-                    //         voice_gateaway.websocket.send(speaking_payload.into()).await
-                    //     {
-                    //         warn!("Failed to send speaking update: {err}");
-                    //     } else {
-                    //         info!("Successfuly sent a stop speak event");
-                    //     }
-                    // }
-
-                    // === Recive, and play audio ===
-                    if let Poll::Ready(Some((ssrc, audio_frame))) =
+                    // === Receive and play audio ===
+                    // DEBUG: Generate sine wave instead of using received audio
+                    // TODO: Remove this and restore original recv_audio logic
+                    while let Poll::Ready(Some((ssrc, audio_frame))) =
                         poll!(pin!(connection.recv_audio()))
                     {
                         let mut channel =
@@ -359,12 +371,16 @@ impl Socket for Discord {
                                 channel.insert(voice::AudioChannel::Connected(producer));
                             }
                             voice::AudioChannel::Connected(producer) => {
-                                // error!("{ssrc}: Talking: {audio_frame:?}");
-                                producer.push_iter(
+                                let samples_to_push = audio_frame.len();
+                                let samples_pushed = producer.push_iter(
                                     audio_frame
                                         .iter()
                                         .map(|sample| *sample as f32 / i16::MAX as f32),
                                 );
+
+                                if samples_to_push != samples_pushed {
+                                    error!("Audio buffer overflow");
+                                }
                             }
                         };
                     }

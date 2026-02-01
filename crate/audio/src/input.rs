@@ -15,12 +15,12 @@ use ringbuf::{
 use tracing::{error, info};
 
 use crate::{
-    AudioMixer, AudioSampleType, Channel, ChannelType, Notify, SampleConsumer, SampleProducer,
-    SampleRb,
+    AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, Channel, ChannelType, Notify, SampleConsumer,
+    SampleProducer, SampleRb,
 };
 
 pub enum InputRxEvent {
-    AddInputChannel(SampleProducer<5120>),
+    AddInputChannel(SampleProducer<CHANNEL_BUFFER_SIZE>),
 }
 impl Debug for InputRxEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -59,9 +59,9 @@ impl AudioMixer {
         channel_mode: ChannelCount,
         sample_format: SampleFormat,
         sample_rate: SampleRate,
-    ) -> Result<Input<5120>, Box<dyn Error>> {
+    ) -> Result<Input<CHANNEL_BUFFER_SIZE>, Box<dyn Error>> {
         let (channel, consumer) =
-            Channel::<_, Input<5120>>::new(channel_mode, sample_format, sample_rate);
+            Channel::<_, Input<CHANNEL_BUFFER_SIZE>>::new(channel_mode, sample_format, sample_rate);
 
         if let Some(master) = &mut self.input
             && let Some(stream) = &mut master.stream
@@ -93,7 +93,7 @@ impl AudioMixer {
                 .input_channels
                 .iter()
                 .map(|channel| CachingProd::new(channel.rb.clone()))
-                .collect::<Vec<SampleProducer<5120>>>();
+                .collect::<Vec<SampleProducer<CHANNEL_BUFFER_SIZE>>>();
             let stream = input
                 .device
                 .build_input_stream(

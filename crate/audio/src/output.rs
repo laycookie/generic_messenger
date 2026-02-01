@@ -16,8 +16,8 @@ use ringbuf::{
 use tracing::{error, info};
 
 use crate::{
-    AudioMixer, AudioSampleType, Channel, ChannelType, Notify, SampleConsumer, SampleProducer,
-    SampleRb,
+    AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, Channel, ChannelType, Notify, SampleConsumer,
+    SampleProducer, SampleRb,
 };
 
 #[repr(transparent)]
@@ -41,7 +41,7 @@ impl<const N: usize> DerefMut for Output<N> {
 }
 
 pub enum OutputRxEvent {
-    AddOutputChannel(SampleConsumer<5120>),
+    AddOutputChannel(SampleConsumer<CHANNEL_BUFFER_SIZE>),
 }
 impl Debug for OutputRxEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,9 +60,12 @@ impl AudioMixer {
         channel_mode: ChannelCount,
         sample_format: SampleFormat,
         sample_rate: SampleRate,
-    ) -> Result<Output<5120>, Box<dyn Error>> {
-        let (channel, producer) =
-            Channel::<_, Output<5120>>::new(channel_mode, sample_format, sample_rate);
+    ) -> Result<Output<CHANNEL_BUFFER_SIZE>, Box<dyn Error>> {
+        let (channel, producer) = Channel::<_, Output<CHANNEL_BUFFER_SIZE>>::new(
+            channel_mode,
+            sample_format,
+            sample_rate,
+        );
 
         if let Some(master) = &mut self.output
             && let Some(stream) = &mut master.stream
@@ -91,7 +94,7 @@ impl AudioMixer {
                 .output_channels
                 .iter()
                 .map(|channel| CachingCons::new(channel.rb.clone()))
-                .collect::<Vec<SampleConsumer<5120>>>();
+                .collect::<Vec<SampleConsumer<CHANNEL_BUFFER_SIZE>>>();
 
             let (prod, mut cons) = StaticRb::default().split();
             let stream_close_notification = Notify::new();
@@ -113,12 +116,13 @@ impl AudioMixer {
                             send_stream_close_notification.notify();
                         }
                         // Mix audio from all channels
-                        for stream_sample in data {
+                        for stream_sample in data.iter_mut() {
                             *stream_sample = sample_consumers
                                 .iter_mut()
                                 .map(|consumer| consumer.try_pop().unwrap_or(0.0))
                                 .sum();
                         }
+                        println!("{:?}", data);
                     },
                     move |err| {
                         error!("Audio stream error: {err:?}");

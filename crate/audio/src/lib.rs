@@ -31,6 +31,9 @@ type SampleConsumer<const N: usize> = Caching<SampleRb<N>, false, true>;
 
 pub type AudioSampleType = f32;
 
+/// Number of samples in audio channel ring buffers (~129ms at 48kHz stereo).
+pub const CHANNEL_BUFFER_SIZE: usize = 12400;
+
 struct Channel<const N: usize, C: ChannelType<N>> {
     channel_count: ChannelCount, // Mono(1), Setro(2), etc.
     sample_format: SampleFormat,
@@ -128,8 +131,8 @@ struct InputMaster {
 pub struct AudioMixer {
     output: Option<OutputMaster>,
     input: Option<InputMaster>,
-    output_channels: Vec<Channel<5120, Output<5120>>>,
-    input_channels: Vec<Channel<5120, Input<5120>>>,
+    output_channels: Vec<Channel<CHANNEL_BUFFER_SIZE, Output<CHANNEL_BUFFER_SIZE>>>,
+    input_channels: Vec<Channel<CHANNEL_BUFFER_SIZE, Input<CHANNEL_BUFFER_SIZE>>>,
 }
 impl Default for AudioMixer {
     fn default() -> Self {
