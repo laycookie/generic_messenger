@@ -15,7 +15,7 @@ use std::{
     ops::{Add, AddAssign, Sub, SubAssign},
     time::Instant,
 };
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 pub const VOICE_FREQUANCY: usize = 48_000;
 pub const VOICE_CHANNELS: usize = 2; // Stereo
@@ -153,6 +153,9 @@ impl Connection {
     pub fn set_description(&mut self, description: SessionDescription) {
         self.description = Some(description);
     }
+    pub fn last_send_time(&self) -> Option<Instant> {
+        self.last_send_time
+    }
 
     /// Poll next UDP voice packet.
     ///
@@ -165,10 +168,19 @@ impl Connection {
 
         let packet_type = DiscordPacketType::try_from(rtp_packet_buf[1]);
 
-        if packet_type.is_err() || packet_type != Ok(DiscordPacketType::Voice) {
-            warn!("Unkown packet type on udp: {:?}", rtp_packet_buf[1]);
-            return None;
-        };
+        match packet_type {
+            Ok(DiscordPacketType::Voice) => {
+                // Continue processing voice packet below
+            }
+            Ok(DiscordPacketType::RtcpSenderReport | DiscordPacketType::RtcpReceiverReport) => {
+                // RTCP control packets - ignore silently
+                return None;
+            }
+            _ => {
+                trace!("Unknown packet type on UDP: {:?}", rtp_packet_buf[1]);
+                return None;
+            }
+        }
 
         let rtp_packet = RtpPacket::new(rtp_packet_buf).unwrap();
 
@@ -223,13 +235,13 @@ impl Connection {
         let unkown_const_3 = &potentially[6..7]; // CONST 144
         let channels = &potentially[7]; // Channels?
         if unkown_const != [50] {
-            warn!("ANOMOLY const1");
+            trace!("RTP extension byte 0 unexpected: {:?}", unkown_const);
         }
         if unkown_const_2 != [16] {
-            warn!("ANOMOLY const2");
+            trace!("RTP extension byte 4 unexpected: {:?}", unkown_const_2);
         }
         if unkown_const_3 != [144] {
-            warn!("ANOMOLY const2");
+            trace!("RTP extension byte 6 unexpected: {:?}", unkown_const_3);
         }
 
         let n_decoded_samples =
@@ -244,9 +256,10 @@ impl Connection {
                 }
             };
 
+        // Opus decode() returns samples per channel, multiply by channel count for total samples
         Some((
             rtp_packet.get_ssrc(),
-            &self.decoded_audio_buf[..n_decoded_samples * *channels as usize],
+            &self.decoded_audio_buf[..n_decoded_samples * VOICE_CHANNELS],
         ))
     }
 
@@ -349,7 +362,10 @@ impl Connection {
 #[repr(u8)]
 enum DiscordPacketType {
     Voice = 0x78,
-    Unkown1 = 0xc9,
+    /// RTCP Sender Report
+    RtcpSenderReport = 200,
+    /// RTCP Receiver Report
+    RtcpReceiverReport = 201,
 }
 
 // === RTP defenitions ===

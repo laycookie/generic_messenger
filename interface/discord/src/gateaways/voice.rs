@@ -8,7 +8,7 @@ use std::{
 use async_tungstenite::{async_std::connect_async, tungstenite::Message};
 use facet::Facet;
 use futures::{StreamExt as _, channel::oneshot};
-use simple_audio_channels::{input::Input, output::Output};
+use simple_audio_channels::{CHANNEL_BUFFER_SIZE, input::Input, output::Output};
 use smol::net::UdpSocket;
 use surf::http::convert::json;
 use tracing::{error, info, warn};
@@ -199,16 +199,16 @@ impl VoiceGateawayState {
 }
 
 pub enum AudioChannel {
-    Initilizing(oneshot::Receiver<Output<5120>>),
-    Connected(Output<5120>),
+    Initilizing(oneshot::Receiver<Output<CHANNEL_BUFFER_SIZE>>),
+    Connected(Output<CHANNEL_BUFFER_SIZE>),
 }
 
 #[derive(Default)]
 pub enum InputChannel {
     #[default]
     None,
-    Initilizing(oneshot::Receiver<Input<5120>>),
-    Connected(Input<5120>),
+    Initilizing(oneshot::Receiver<Input<CHANNEL_BUFFER_SIZE>>),
+    Connected(Input<CHANNEL_BUFFER_SIZE>),
 }
 
 pub struct Voice {
