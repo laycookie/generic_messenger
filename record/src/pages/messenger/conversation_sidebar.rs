@@ -1,7 +1,8 @@
 use iced::{
     Color, Element, Length, Padding,
-    widget::{Button, Column, Scrollable, Text, button, column, container, image, row},
+    widget::{Button, Column, Scrollable, Text, button, column, container, image, row, text::Wrapping},
 };
+use iced_palace::widget::ellipsized_text;
 use messenger_interface::types::{Identifier, Place, Room, RoomCapabilities};
 
 use super::PLACEHOLDER_PFP;
@@ -86,7 +87,7 @@ impl Sidebar {
                         row![
                             container(image.height(Length::Fixed(28.0)))
                                 .padding(Padding::new(0.0).right(10.0)),
-                            conversation.name.as_str()
+                            ellipsized_text(conversation.name.as_str()).wrapping(Wrapping::None)
                         ]
                     })
                     .width(Length::Fill)

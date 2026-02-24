@@ -10,7 +10,7 @@ use messenger_interface::{
     types::{House, Identifier, Message, Place, Reaction, Room, RoomCapabilities, User},
 };
 use std::error::Error;
-use tracing::error;
+use tracing::{error, info};
 
 impl Discord {
     fn get_auth_header(&self) -> Vec<(&str, String)> {
@@ -32,6 +32,7 @@ impl Discord {
         let rooms_producer = channels
             .iter()
             .map(async move |channel| {
+                
                 let (name, icon, room_data) = channel.to_room_data().await;
                 Discord::identifier_generator(
                     channel.id.as_str(),
@@ -208,6 +209,7 @@ impl Query for Discord {
                             friend.id, hash
                         );
                         let dir = format!("./cache/imgs/users/discord/{}", friend.id);
+
                         let filename = format!("{hash}.webp");
 
                         cache_download(url, dir.into(), filename).await.ok()
