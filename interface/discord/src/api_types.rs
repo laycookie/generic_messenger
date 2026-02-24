@@ -130,12 +130,18 @@ impl Channel {
     /// Extract room data, name, and icon from a channel.
     /// Returns (name, icon, room_data).
     pub async fn to_room_data(&self) -> (String, Option<std::path::PathBuf>, Room) {
-        let name = self.name.to_owned().unwrap_or(
-            match self.recipients.as_ref().unwrap_or(&Vec::new()).first() {
-                Some(user) => user.username.clone(),
-                None => "Unknown".to_string(),
-            },
-        );
+        let name = self.name.to_owned().unwrap_or_else(|| {
+            self.recipients
+                .as_ref()
+                .map(|recipients| {
+                    recipients
+                        .iter()
+                        .map(|recipient| recipient.username.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| "Unknown channel".to_string())
+        });
 
         let mut icon = None;
 
@@ -156,24 +162,29 @@ impl Channel {
                     error!("Failed to download icon for channel: {}\n{}", name, e);
                 }
             };
-        } else if let Some(first) = self.recipients.as_ref().unwrap_or(&Vec::new()).first() {
-            // If first recipient has an avatar, use that as room icon
-            if let Some(hash) = &first.avatar {
-                let downloaded_icon = cache_download(
-                    format!(
-                        "https://cdn.discordapp.com/avatars/{}/{}.webp?size=80&quality=lossless",
-                        first.id, hash
-                    ),
-                    format!("./cache/imgs/channels/discord/{}", self.id).into(),
-                    format!("{hash}.webp"),
-                )
-                .await;
-                match downloaded_icon {
-                    Ok(path) => icon = Some(path),
-                    Err(e) => {
-                        error!("Failed to download icon for channel: {}\n{}", name, e);
-                    }
-                };
+        } else if let Some(recipients) = self.recipients.as_ref() {
+            // If any recipient has an avatar, use that as room icon
+            for recipient in recipients {
+                if let Some(hash) = &recipient.avatar {
+                    let downloaded_icon = cache_download(
+                        format!(
+                            "https://cdn.discordapp.com/avatars/{}/{}.webp?size=80&quality=lossless",
+                            recipient.id, hash
+                        ),
+                        format!("./cache/imgs/users/discord/{}", recipient.id).into(),
+                        format!("{hash}.webp"),
+                    )
+                    .await;
+                    match downloaded_icon {
+                        Ok(path) => {
+                            icon = Some(path);
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Failed to download icon for channel: {}\n{}", name, e);
+                        }
+                    };
+                }
             }
         }
 
