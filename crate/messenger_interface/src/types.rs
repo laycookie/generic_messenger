@@ -201,14 +201,3 @@ impl<PD> Deref for Place<PD> {
         &self.place_data
     }
 }
-
-/// Status of a voice call connection.
-#[derive(Debug, Clone)]
-pub enum CallStatus {
-    /// Successfully connected to the voice channel.
-    Connected,
-    /// Currently attempting to connect to the voice channel.
-    Connecting,
-    /// Not connected to the voice channel.
-    Disconnected,
-}

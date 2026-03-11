@@ -97,7 +97,6 @@ impl Notify {
             notified: AtomicBool::new(false),
         }))
     }
-
     fn notify(&self) {
         self.0.notified.store(true, Ordering::Relaxed);
         if let Some(waker) = &self.0.waker.get() {

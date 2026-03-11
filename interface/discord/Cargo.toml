@@ -14,6 +14,11 @@ async-tungstenite =  { version = "0.32.0", features = ["async-std-runtime", "asy
 futures = { workspace = true }
 futures-locks = "0.7.1"
 futures-timer = "3.0.3"
+pin-project = "1.1.10"
+# Data structs
+arc-swap = "1.8.2"
+dashmap = "6.1.0"
+crossbeam = "0.8.4"
 # Fetch
 surf = "2.3.2"
 # Serialize/Deserialize
@@ -31,6 +36,7 @@ opus = "0.3.0"
 # Security
 secure-string = "0.3.0"
 libsodium-rs = "0.2.1"
+davey = "0.1.2"
 # Interface
 messenger_interface = { path = "../../crate/messenger_interface" }
 # enums

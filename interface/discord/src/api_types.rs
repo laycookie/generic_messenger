@@ -4,6 +4,8 @@ use tracing::error;
 
 use crate::{Discord, downloaders::cache_download};
 
+pub type SNOWFLAKE = u64;
+
 // === Users ===
 #[derive(Facet)]
 pub struct Profile {
@@ -19,7 +21,7 @@ pub struct Profile {
     // email: String,
     // flags: i32,
     // global_name: String,
-    pub id: String,
+    pub id: SNOWFLAKE,
     // linked_users: Vec<String>,
     // locale: String,
     // mfa_enabled: bool,
@@ -37,13 +39,13 @@ pub struct User {
     // avatar_decoration_data: Option<String>,
     // clan: Option<String>,
     // discriminator: String,
-    pub id: String,
+    pub id: SNOWFLAKE,
     pub username: String,
 }
 
 #[derive(Facet)]
 pub struct Friend {
-    pub id: String,
+    pub id: SNOWFLAKE,
     // is_spam_request: bool,
     // nickname: Option<String>,
     // since: String,
@@ -58,7 +60,7 @@ pub struct Recipient {
     // clan: Option<String>,
     // discriminator: String,
     // global_name: Option<String>,
-    pub(crate) id: String,
+    pub(crate) id: SNOWFLAKE,
     // public_flags: i32,
     pub(crate) username: String,
 }
@@ -106,8 +108,8 @@ impl From<ChannelTypes> for RoomCapabilities {
 
 #[derive(Facet)]
 pub struct Channel {
-    pub id: String,
-    pub guild_id: Option<String>,
+    pub id: SNOWFLAKE,
+    pub guild_id: Option<SNOWFLAKE>,
     #[facet(rename = "type")]
     pub channel_type: ChannelTypes,
     // flags: i32,
@@ -207,7 +209,7 @@ pub struct CountDetails {
 
 #[derive(Facet)]
 pub struct Emoji {
-    pub id: Option<String>,
+    pub id: Option<SNOWFLAKE>,
     pub name: String,
 }
 
@@ -227,13 +229,13 @@ pub struct Reaction {
 pub struct Message {
     // attachments: Vec<String>,
     pub author: User,
-    pub channel_id: String,
+    pub channel_id: SNOWFLAKE,
     // components: Vec<String>,
     pub content: String,
     // edited_timestamp: Option<String>,
     // embeds: Vec<u32>,
     // flags: u32,
-    pub id: String,
+    pub id: SNOWFLAKE,
     // mention_everyone: bool,
     // mention_roles: Vec<String>,
     // mentions: Vec<String>,
@@ -268,7 +270,7 @@ pub struct CreateMessage {
 // https://discord.com/developers/docs/resources/guild#guild-object
 #[derive(Facet)]
 pub struct Guild {
-    pub id: String,
+    pub id: SNOWFLAKE,
     pub name: String,
     pub icon: Option<String>,
     // pub icon_hash: Option<String>,

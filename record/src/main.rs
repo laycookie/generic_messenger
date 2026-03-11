@@ -1,10 +1,4 @@
-use std::{
-    borrow::Cow,
-    future::poll_fn,
-    pin::Pin,
-    sync::Weak,
-    task::{Context, Poll},
-};
+use std::borrow::Cow;
 
 use crate::messanger_unifier::Call;
 use auth::MessangersGenerator;
@@ -12,7 +6,7 @@ use font_kit::{family_name::FamilyName, source::SystemSource};
 use futures::{Stream, StreamExt, future::join_all, join};
 use iced::{Element, Subscription, Task, window};
 use messanger_unifier::Messangers;
-use messenger_interface::interface::{Socket, SocketEvent};
+use messenger_interface::interface::{SocketEvent, WeakSocketStream};
 use pages::{AppMessage, Login, messenger::Messenger};
 use simple_audio_channels::{AudioMixer, SampleFormat};
 
@@ -59,69 +53,6 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         .run()
         .inspect_err(|err| error!("{err}"))?;
     Ok(())
-}
-
-/// A stream adapter that wraps a Weak<dyn Socket> and automatically stops
-/// when the underlying Arc is dropped.
-struct WeakSocketStream {
-    socket: Weak<dyn Socket + Send + Sync>,
-    handle: MessangerHandle,
-    next_future: Option<Pin<Box<dyn std::future::Future<Output = Option<SocketEvent>> + Send>>>,
-}
-
-impl WeakSocketStream {
-    fn new(socket: Weak<dyn Socket + Send + Sync>, handle: MessangerHandle) -> Self {
-        Self {
-            socket,
-            handle,
-            next_future: None,
-        }
-    }
-}
-
-impl Stream for WeakSocketStream {
-    type Item = (MessangerHandle, SocketEvent);
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Try to upgrade the Weak to Arc
-        let socket_arc = match self.socket.upgrade() {
-            Some(arc) => arc,
-            None => {
-                info!("Killed");
-                // Arc was dropped, stream is finished
-                return Poll::Ready(None);
-            }
-        };
-
-        // Get or create the next future
-        if self.next_future.is_none() {
-            let socket_clone = socket_arc.clone();
-            self.next_future = Some(Box::pin(async move { Socket::next(socket_clone).await }));
-        }
-
-        // Poll the future
-        if let Some(ref mut fut) = self.next_future {
-            match fut.as_mut().poll(cx) {
-                Poll::Ready(Some(event)) => {
-                    self.next_future = None;
-
-                    // Skip SocketEvent::Skip events by immediately requesting the next one
-                    if matches!(event, SocketEvent::Skip) {
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(Some((self.handle, event)))
-                }
-                Poll::Ready(None) => {
-                    // Underlying stream ended
-                    Poll::Ready(None)
-                }
-                Poll::Pending => Poll::Pending,
-            }
-        } else {
-            Poll::Pending
-        }
-    }
 }
 
 struct App {
@@ -247,15 +178,11 @@ impl App {
                         .interface_iter()
                         .map(|interface| (interface.handle, interface.api.to_owned()))
                         .map(async |(handle, api)| {
+                            // Query
                             let Ok(q) = api.query() else {
                                 error!("Query not impl");
                                 return None;
                             };
-
-                            // let Ok(socket) = api.socket().await else {
-                            //     error!("Problem with socket starting");
-                            //     return None;
-                            // };
 
                             let (profile, contacts, conversations, servers) =
                                 join!(q.client_user(), q.contacts(), q.rooms(), q.houses());
@@ -265,6 +192,21 @@ impl App {
                                 Err(err) => {
                                     panic!("TODO: {err:#?}");
                                 }
+                            };
+
+                            // let Ok(query_socket) = q.listen().await else {
+                            //     error!("Problem with socket starting");
+                            //     return None;
+                            // };
+
+                            // Text
+                            let Ok(t) = api.text() else {
+                                error!("Text not impl");
+                                return None;
+                            };
+                            let Ok(v) = api.voice() else {
+                                error!("Text not impl");
+                                return None;
                             };
 
                             // let (conversations, servers) =
@@ -303,7 +245,9 @@ impl App {
                                 contacts.unwrap_or_default(),
                                 conversations.unwrap_or_default(),
                                 servers.unwrap_or_default(),
-                                api.socket().await,
+                                q.listen().await,
+                                t.listen().await,
+                                v.listen().await,
                             ))
                         }),
                 ))
@@ -325,10 +269,18 @@ impl App {
                         //         return Task::done(AppMessage::RemoveMessanger(handle));
                         //     }
                         // };
-                        let (handle, profile, contacts, conversations, servers, socket) =
-                            m.unwrap();
+                        let (
+                            handle,
+                            profile,
+                            contacts,
+                            conversations,
+                            servers,
+                            query_socket,
+                            text_socket,
+                            voice_socket,
+                        ) = m.unwrap();
 
-                        let mut task = Task::done(AppMessage::SetMessangerData {
+                        let task = Task::done(AppMessage::SetMessangerData {
                             messanger_handle: handle,
                             new_data: pages::MessangerData::Everything {
                                 profile,
@@ -338,12 +290,25 @@ impl App {
                             },
                         });
 
-                        if let Ok(socket) = socket {
-                            let stream = WeakSocketStream::new(socket, handle);
-                            task = task.chain(Task::stream(stream.map(AppMessage::SocketEvent)));
+                        let mut streams = Vec::new();
+
+                        if let Ok(socket) = query_socket {
+                            streams.push(Task::stream(socket.map(move |event| {
+                                AppMessage::SocketEvent((handle, event.into()))
+                            })));
+                        };
+                        if let Ok(socket) = text_socket {
+                            streams.push(Task::stream(socket.map(move |event| {
+                                AppMessage::SocketEvent((handle, event.into()))
+                            })));
+                        };
+                        if let Ok(socket) = voice_socket {
+                            streams.push(Task::stream(socket.map(move |event| {
+                                AppMessage::SocketEvent((handle, event.into()))
+                            })));
                         };
 
-                        task
+                        task.chain(Task::batch(streams))
                     });
 
                     Task::done(AppMessage::OpenPage(Screen::Chat(Messenger::new())))
@@ -402,6 +367,19 @@ impl App {
                             }
                         }
                     }
+                    SocketEvent::CallStatusUpdate(call_status) => match call_status {
+                        messenger_interface::interface::CallStatus::Connected(
+                            weak_socket_stream,
+                        ) => {
+                            return Task::stream(weak_socket_stream.map(move |event| {
+                                AppMessage::SocketEvent((handle, event.into()))
+                            }));
+                        }
+                        messenger_interface::interface::CallStatus::Connecting(msg) => {
+                            info!("{msg}")
+                        }
+                        messenger_interface::interface::CallStatus::Failed => error!("TODO"),
+                    },
                     SocketEvent::Disconnected => info!("Disconnected"),
                     SocketEvent::AddAudioSource(sender) => {
                         let producer = self
@@ -508,20 +486,31 @@ impl App {
                     }
                     pages::messenger::Action::Call { interface, channel } => {
                         let api = interface.api.to_owned();
+                        let handle = interface.handle;
 
                         Task::future(async move {
                             let vc = api.voice();
-                            match vc {
-                                Ok(vc) => {
-                                    // Convert Place<Room> to Room for voice API
-                                    let room_id = channel.swap_data((*channel).clone());
-                                    vc.connect(&room_id).await;
+                            let vc = match vc {
+                                Ok(vc) => vc,
+                                Err(err) => {
+                                    warn!("{err:?}");
+                                    return Task::none();
                                 }
-                                Err(err) => warn!("Voice not supported by adapter: {err:#?}"),
-                            }
-                            channel
-                        })
-                        .then(move |channel| {
+                            };
+                            // Convert Place<Room> to Room for voice API
+                            let room_id = channel.swap_data((*channel).clone());
+                            vc.connect(&room_id).await;
+
+                            // let vc_stream = match vc.listen().await {
+                            //     Ok(stream) => Task::stream(stream.map(move |event| {
+                            //         AppMessage::SocketEvent((handle, event.into()))
+                            //     })),
+                            //     Err(err) => {
+                            //         error!("{err:?}");
+                            //         Task::none()
+                            //     }
+                            // };
+
                             Task::done(AppMessage::SetMessangerData {
                                 messanger_handle: interface.handle,
                                 new_data: pages::MessangerData::Call(Call::new(
@@ -529,7 +518,9 @@ impl App {
                                     channel,
                                 )),
                             })
+                            // .chain(vc_stream)
                         })
+                        .then(|task| task)
                     }
                     pages::messenger::Action::DisconnectFromCall(call) => {
                         let interface = self

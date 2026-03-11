@@ -1,3 +1,5 @@
+use dashmap::DashMap;
+use davey::{Codec, DaveSession, MediaType};
 use facet::Facet;
 use libsodium_rs::crypto_aead;
 use num_enum::TryFromPrimitive;
@@ -10,12 +12,15 @@ use pnet_macros_support::{
 use simple_audio_channels::AudioSampleType;
 use smol::net::UdpSocket;
 use std::{
+    cell::OnceCell,
     error::Error,
     num::Wrapping,
     ops::{Add, AddAssign, Sub, SubAssign},
     time::Instant,
 };
 use tracing::{error, info, trace, warn};
+
+use crate::api_types::SNOWFLAKE;
 
 pub const VOICE_FREQUANCY: usize = 48_000;
 pub const VOICE_CHANNELS: usize = 2; // Stereo
@@ -89,7 +94,7 @@ impl From<&str> for EncryptionMode {
 }
 
 /// <https://docs.discord.food/topics/voice-connections#session-description-structure>
-#[derive(Facet)]
+#[derive(Debug, Facet)]
 pub struct SessionDescription {
     audio_codec: String,
     video_codec: String,
@@ -97,6 +102,7 @@ pub struct SessionDescription {
     mode: Option<EncryptionMode>,
     secret_key: Option<Vec<u8>>,
     keyframe_interval: Option<u32>,
+    dave_protocol_version: u16,
 }
 impl SessionDescription {
     pub fn mode(&self) -> Option<&EncryptionMode> {
@@ -105,28 +111,31 @@ impl SessionDescription {
     pub fn secret_key(&self) -> Option<&Vec<u8>> {
         self.secret_key.as_ref()
     }
+    pub fn dave_protocol_version(&self) -> u16 {
+        self.dave_protocol_version
+    }
 }
 
 pub type Ssrc = u32;
 pub struct Connection {
-    udp: UdpSocket,
-    ssrc: Ssrc,
-    description: Option<SessionDescription>,
     decoder: opus::Decoder,
     encoder: opus::Encoder,
-    sequence: Wrap16,
+    ssrc: Ssrc,
+    udp: UdpSocket,
+    description: OnceCell<SessionDescription>,
     timestamp: Wrap32,
     last_send_time: Option<Instant>,
+    sequence: Wrap16,
     nonce: u32,
     rtp_packet_buf: [u8; 1024],
     decoded_audio_buf: [i16; 8048],
     encoded_audio_buf: [u8; 1276],
 }
 impl Connection {
-    pub fn new(udp: UdpSocket, ssrc: u32) -> Self {
+    pub fn new(udp: UdpSocket, ssrc: Ssrc) -> Self {
         Self {
             udp,
-            description: None,
+            description: OnceCell::new(),
             ssrc,
             decoder: opus::Decoder::new(VOICE_FREQUANCY as u32, opus::Channels::Stereo).unwrap(),
             encoder: opus::Encoder::new(
@@ -148,10 +157,13 @@ impl Connection {
         self.ssrc
     }
     pub fn description(&self) -> Option<&SessionDescription> {
-        self.description.as_ref()
+        self.description.get()
     }
-    pub fn set_description(&mut self, description: SessionDescription) {
-        self.description = Some(description);
+    pub fn set_description(
+        &mut self,
+        description: SessionDescription,
+    ) -> Result<(), SessionDescription> {
+        self.description.set(description)
     }
     pub fn last_send_time(&self) -> Option<Instant> {
         self.last_send_time
@@ -162,8 +174,14 @@ impl Connection {
     /// When a new inbound SSRC is discovered, this emits `SocketEvent::AddAudioSource(sender)`.
     /// The UI answers by calling `sender.send(audio_source_id)`. We keep the receiver internally
     /// and store the mapping once it resolves.
-    pub async fn recv_audio(&mut self) -> Option<(Ssrc, &[i16])> {
-        let n_bytes_recived = self.udp.recv(&mut self.rtp_packet_buf).await.ok()?;
+    // TODO: Pass down description from above, that way we get it for free, and we dont need to
+    // unwrap
+    pub async fn recv_audio(
+        &mut self,
+        dave_session: Option<&mut DaveSession>,
+        ssrc_to_user_id: &DashMap<Ssrc, SNOWFLAKE>,
+    ) -> Result<(Ssrc, &[i16]), Box<dyn Error + Send + Sync>> {
+        let n_bytes_recived = self.udp.recv(&mut self.rtp_packet_buf).await?;
         let rtp_packet_buf = &self.rtp_packet_buf[..n_bytes_recived];
 
         let packet_type = DiscordPacketType::try_from(rtp_packet_buf[1]);
@@ -174,11 +192,11 @@ impl Connection {
             }
             Ok(DiscordPacketType::RtcpSenderReport | DiscordPacketType::RtcpReceiverReport) => {
                 // RTCP control packets - ignore silently
-                return None;
+                return Err("Expected voice packet".into());
             }
             _ => {
                 trace!("Unknown packet type on UDP: {:?}", rtp_packet_buf[1]);
-                return None;
+                return Err("Expected voice packet".into());
             }
         }
 
@@ -194,7 +212,7 @@ impl Connection {
         };
         let (rtp_header, rtp_body) = rtp_packet.packet().split_at(rtp_header_len);
 
-        let description = self.description.as_ref().unwrap();
+        let description = self.description.get().unwrap();
         let mode = description.mode().unwrap();
         let decrypted_payload = match mode {
             EncryptionMode::aead_aes256_gcm_rtpsize => todo!(),
@@ -244,20 +262,28 @@ impl Connection {
             trace!("RTP extension byte 6 unexpected: {:?}", unkown_const_3);
         }
 
+        // Decrypt Dave
+        let decrypted;
+        let voice_data = if let Some(dave_session) = dave_session {
+            decrypted = dave_session.decrypt(
+                *ssrc_to_user_id
+                    .get(&rtp_packet.get_ssrc())
+                    .ok_or("No mapping of ssrc to user_id TODO: Make this better")?,
+                MediaType::AUDIO,
+                voice_data,
+            )?;
+            decrypted.as_slice()
+        } else {
+            voice_data
+        };
+
+        // Decode opus
         let n_decoded_samples =
-            match self
-                .decoder
-                .decode(voice_data, &mut self.decoded_audio_buf, false)
-            {
-                Ok(n_samples) => n_samples,
-                Err(err) => {
-                    error!("{:?}", err);
-                    return None;
-                }
-            };
+            self.decoder
+                .decode(voice_data, &mut self.decoded_audio_buf, false)?;
 
         // Opus decode() returns samples per channel, multiply by channel count for total samples
-        Some((
+        Ok((
             rtp_packet.get_ssrc(),
             &self.decoded_audio_buf[..n_decoded_samples * VOICE_CHANNELS],
         ))
@@ -266,6 +292,7 @@ impl Connection {
     pub async fn send_audio_frame(
         &mut self,
         samples: &[AudioSampleType],
+        dave_session: Option<&mut DaveSession>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         if samples.is_empty() {
             warn!("Noting to send");
@@ -277,7 +304,7 @@ impl Connection {
 
         let description = self
             .description
-            .as_ref()
+            .get()
             .ok_or("Missing session description")?;
         let mode = description.mode().ok_or("Missing encryption mode")?;
         let secret_key = description.secret_key().ok_or("Missing secret key")?;
@@ -334,8 +361,17 @@ impl Connection {
                 let key = crypto_aead::xchacha20poly1305::Key::from_bytes(&secret_key[..])
                     .expect("Invalid key length");
 
+                let dave_encrypted;
+                let audio_payload = if let Some(dave_session) = dave_session {
+                    dave_encrypted =
+                        dave_session.encrypt(MediaType::AUDIO, Codec::AV1, opus_payload)?;
+                    dave_encrypted.iter().as_slice()
+                } else {
+                    opus_payload
+                };
+
                 let encrypted = crypto_aead::xchacha20poly1305::encrypt(
-                    opus_payload,
+                    audio_payload,
                     Some(&rtp_header),
                     &nonce,
                     &key,

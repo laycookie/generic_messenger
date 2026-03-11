@@ -3,15 +3,14 @@
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use messenger_interface::{
-    interface::Messenger,
-    types::{CallStatus, House, ID, Identifier, Message, Place, Room, User},
+    interface::{CallStatus, Messenger},
+    types::{House, ID, Identifier, Message, Place, Room, User},
 };
 
 #[derive(Debug, Clone)]
 pub struct Call {
     messanger_handle: MessangerHandle,
     source: Identifier<Place<Room>>,
-    status: CallStatus,
 }
 
 impl Call {
@@ -19,7 +18,6 @@ impl Call {
         Self {
             messanger_handle,
             source,
-            status: CallStatus::Connecting,
         }
     }
     pub fn handle(&self) -> MessangerHandle {
@@ -32,11 +30,7 @@ impl Call {
         *self.source.id()
     }
     pub fn status_str(&self) -> &str {
-        match self.status {
-            CallStatus::Connected => "Connected",
-            CallStatus::Connecting => "Connecting",
-            CallStatus::Disconnected => "Disconnected",
-        }
+        "Sample"
     }
 }
 #[derive(Debug)]

@@ -1,22 +1,37 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     error::Error,
     io, mem,
+    num::NonZeroU16,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
+use arc_swap::ArcSwapOption;
 use async_tungstenite::{async_std::connect_async, tungstenite::Message};
+use dashmap::DashMap;
+use davey::{DAVE_PROTOCOL_VERSION, DaveSession};
 use facet::Facet;
-use futures::{StreamExt as _, channel::oneshot};
+use futures::channel::oneshot;
+use futures::lock::Mutex as AsyncMutex;
+use messenger_interface::{
+    interface::{CallStatus, VoiceEvent},
+    stream::WeakSocketStream,
+};
+use num_enum::TryFromPrimitive;
 use simple_audio_channels::{CHANNEL_BUFFER_SIZE, input::Input, output::Output};
 use smol::net::UdpSocket;
 use surf::http::convert::json;
 use tracing::{error, info, warn};
 
 use crate::{
-    Discord,
+    ChannelID, InnerDiscord,
+    api_types::SNOWFLAKE,
     gateaways::{
-        Gateaway, GateawayStream, GatewayPayload, HeartBeatingData, deserialize_event,
+        Gateaway, GateawayStream, GatewayPayload, HeartBeatingData, Websocket,
         voice::connection::{Connection, EncryptionMode, SessionDescription, Ssrc},
     },
 };
@@ -27,7 +42,7 @@ pub(super) mod connection;
 /// <https://docs.discord.food/topics/opcodes-and-status-codes#voice-opcodes>
 #[repr(u8)]
 #[non_exhaustive]
-#[derive(Debug, Facet)]
+#[derive(Debug, Facet, TryFromPrimitive)]
 #[facet(is_numeric)]
 pub enum VoiceOpcode {
     Identify = 0,
@@ -42,6 +57,17 @@ pub enum VoiceOpcode {
     ClientDisconnect = 13,
     ClientFlags = 18,
     ClientPlatform = 20,
+    DAVEProtocolPrepareTransition = 21,
+    DAVEProtocolExecuteTransition = 22,
+    DAVEProtocolTransitionReady = 23,
+    DAVEProtocolPrepareEpoch = 24,
+    MLSExternalSenderPackage = 25,
+    MLSKeyPackage = 26,
+    MLSProposals = 27,
+    MLSCommitWelcome = 28,
+    MLSAnnounceCommitTransition = 29,
+    MLSWelcome = 30,
+    MLSInvalidCommitWelcome = 31,
 }
 
 /// <https://docs.discord.food/topics/voice-connections#hello-structure>
@@ -62,6 +88,22 @@ struct ReadyPayload {
     // streams:	Vec<stream object>
 }
 
+/// <https://docs.discord.food/topics/voice-connections#speaking-structure>
+#[derive(Facet)]
+struct SpeakingPayload {
+    speaking: bool, // Should be u8
+    ssrc: Ssrc,
+    user_id: SNOWFLAKE, // Only sent by the voice server.
+    delay: Option<u32>, // Not sent by the voice server.
+}
+
+#[derive(Facet)]
+struct DAVEPrepareEpoch {
+    transition_id: u16,
+    epoch: u64,
+    protocol_version: u16,
+}
+
 type SessionId = String;
 pub struct Endpoint {
     wss: String,
@@ -74,127 +116,148 @@ impl Endpoint {
 }
 
 #[derive(Default)]
-pub enum VoiceGateawayState {
+pub enum VoiceGateawayStatus {
     #[default]
     Closed,
-    AwaitingData,
-    AwaitingEndpoint(SessionId),
-    AwaitingSession(Endpoint),
-    Ready {
-        endpoint: Endpoint,
+    AwaitingData {
+        channel_id: ChannelID,
+    },
+    AwaitingEndpoint {
+        channel_id: ChannelID,
         session_id: SessionId,
     },
-    Open {
-        gateaway: Box<Gateaway<Voice>>,
+    AwaitingSession {
+        channel_id: ChannelID,
+        endpoint: Endpoint,
+    },
+    Ready {
+        channel_id: ChannelID,
         endpoint: Endpoint,
         session_id: SessionId,
     },
 }
-impl VoiceGateawayState {
-    pub fn as_mut(&mut self) -> &mut VoiceGateawayState {
-        self
-    }
-    pub fn mut_gateaway(&mut self) -> Option<&mut Gateaway<Voice>> {
-        match self {
-            VoiceGateawayState::Open { gateaway, .. } => Some(gateaway),
-            _ => None,
-        }
-    }
+impl VoiceGateawayStatus {
     pub fn insert_endpoint(&mut self, endpoint: Endpoint) {
         *self = match mem::take(self) {
-            VoiceGateawayState::Closed => VoiceGateawayState::Closed,
-            VoiceGateawayState::AwaitingData => Self::AwaitingSession(endpoint),
-            VoiceGateawayState::AwaitingEndpoint(session_id) => Self::Ready {
+            Self::Closed => Self::Closed,
+            Self::AwaitingData { channel_id } => Self::AwaitingSession {
                 endpoint,
-                session_id,
+                channel_id,
             },
-            VoiceGateawayState::AwaitingSession(_) => Self::AwaitingSession(endpoint),
-            VoiceGateawayState::Ready {
-                endpoint,
+            Self::AwaitingEndpoint {
+                channel_id,
                 session_id,
             } => Self::Ready {
                 endpoint,
                 session_id,
+                channel_id,
             },
-            VoiceGateawayState::Open {
-                gateaway,
-                session_id,
-                ..
-            } => Self::Open {
-                gateaway,
+            Self::AwaitingSession { channel_id, .. } => Self::AwaitingSession {
+                endpoint,
+                channel_id,
+            },
+            Self::Ready {
                 endpoint,
                 session_id,
+                channel_id,
+            } => Self::Ready {
+                endpoint,
+                session_id,
+                channel_id,
             },
-        };
+        }
     }
     pub fn insert_session_id(&mut self, session_id: SessionId) {
         *self = match mem::take(self) {
-            VoiceGateawayState::Closed => VoiceGateawayState::Closed,
-            VoiceGateawayState::AwaitingData => Self::AwaitingEndpoint(session_id),
-            VoiceGateawayState::AwaitingEndpoint(_) => Self::AwaitingEndpoint(session_id),
-            VoiceGateawayState::AwaitingSession(endpoint) => Self::Ready {
-                endpoint,
+            Self::Closed => Self::Closed,
+            Self::AwaitingData { channel_id } => Self::AwaitingEndpoint {
+                session_id,
+                channel_id,
+            },
+            Self::AwaitingEndpoint {
+                channel_id,
+                session_id,
+            } => Self::AwaitingEndpoint {
+                channel_id,
                 session_id,
             },
-            VoiceGateawayState::Ready {
+            Self::AwaitingSession {
+                channel_id,
                 endpoint,
-                session_id,
             } => Self::Ready {
                 endpoint,
                 session_id,
+                channel_id,
             },
-            VoiceGateawayState::Open {
-                gateaway, endpoint, ..
-            } => Self::Open {
-                gateaway,
+            Self::Ready {
                 endpoint,
                 session_id,
+                channel_id,
+            } => Self::Ready {
+                endpoint,
+                session_id,
+                channel_id,
             },
         }
     }
-    pub async fn connect(
-        self,
-        user_id: &str,
-        location_id: &str,
-    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let (endpoint, session_id) = match self {
-            VoiceGateawayState::Ready {
+}
+
+#[derive(Default)]
+pub struct VoiceGateaway {
+    status: AsyncMutex<VoiceGateawayStatus>,
+    voice_gateaway: ArcSwapOption<Gateaway<Voice>>,
+}
+impl VoiceGateaway {
+    pub async fn initiate_connection(&self, channel_id: ChannelID) {
+        let mut status = self.status.lock().await;
+        *status = VoiceGateawayStatus::AwaitingData { channel_id };
+    }
+    pub async fn replace_status(&self, new_status: VoiceGateawayStatus) {
+        let mut status = self.status.lock().await;
+        *status = new_status;
+    }
+    pub async fn insert_endpoint(&self, endpoint: Endpoint) {
+        let mut status = self.status.lock().await;
+        status.insert_endpoint(endpoint);
+    }
+    pub async fn insert_session_id(&self, session_id: SessionId) {
+        let mut status = self.status.lock().await;
+        status.insert_session_id(session_id);
+    }
+    pub fn full_load_gateaway(&self) -> Option<Arc<Gateaway<Voice>>> {
+        self.voice_gateaway.load_full()
+    }
+    pub async fn connect(&self, user_id: SNOWFLAKE) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let status = self.status.lock().await;
+
+        let (endpoint, session_id, channel_id) = match &*status {
+            VoiceGateawayStatus::Ready {
                 endpoint,
                 session_id,
-            }
-            | VoiceGateawayState::Open {
-                endpoint,
-                session_id,
-                ..
-            } => (endpoint, session_id),
+                channel_id,
+            } => (endpoint, session_id, channel_id),
             _ => {
                 return Err("Does not have enough info about the peer to connect".into());
             }
         };
 
-        let gateaway = Gateaway::<Voice>::new(&endpoint, &session_id, location_id, user_id).await?;
-
-        Ok(Self::Open {
-            gateaway: Box::new(gateaway),
+        let gateaway = Gateaway::<Voice>::new(
             endpoint,
             session_id,
-        })
+            channel_id.guild_id,
+            channel_id.id,
+            user_id,
+        )
+        .await?;
+        self.voice_gateaway.store(Some(Arc::new(gateaway)));
+
+        Ok(())
     }
-    pub fn close_gateway(&mut self) {
-        *self = match mem::take(self) {
-            VoiceGateawayState::Open {
-                endpoint,
-                session_id,
-                ..
-            } => Self::Ready {
-                endpoint,
-                session_id,
-            },
-            prev_state => {
-                error!("Gateway already closed");
-                prev_state
-            }
-        }
+
+    pub async fn disconnect(&self) {
+        let mut status = self.status.lock().await;
+        *status = VoiceGateawayStatus::default();
+        self.voice_gateaway.store(None);
     }
 }
 
@@ -212,70 +275,76 @@ pub enum InputChannel {
 }
 
 pub struct Voice {
-    pub ssrc_to_audio_channel: HashMap<Ssrc, AudioChannel>,
-    pub connection: Option<Connection>,
-    pub input_channel: InputChannel,
-    pub input_buffer: VecDeque<f32>,
-    pub is_speaking: bool,
+    pub channel_id: SNOWFLAKE,
+    pub guild_id: Option<SNOWFLAKE>,
+    pub dave_pending_transitions: DashMap<u16, NonZeroU16>, // transition_id, dave_protocol_version
+    pub dave_session: AsyncMutex<Option<DaveSession>>,
+    pub connection: AsyncMutex<Option<Connection>>,
+    pub ssrc_to_audio_channel: DashMap<Ssrc, AsyncMutex<AudioChannel>>,
+    pub ssrc_to_user_id: DashMap<Ssrc, SNOWFLAKE>,
+    pub input_channel: AsyncMutex<InputChannel>,
+    pub input_buffer: AsyncMutex<VecDeque<f32>>,
+    pub is_speaking: AtomicBool,
 }
 impl Gateaway<Voice> {
     pub async fn new(
         endpoint: &Endpoint,
         session_id: &SessionId,
-        location_id: &str,
-        user_id: &str,
+        guild_id: Option<SNOWFLAKE>,
+        channel_id: SNOWFLAKE,
+        user_id: u64,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let (mut websocket, _) = connect_async("wss://".to_string() + &endpoint.wss).await?;
+        let (mut voice_websocket, _) = connect_async("wss://".to_string() + &endpoint.wss).await?;
 
         // <https://discord.com/developers/docs/topics/voice-connections#establishing-a-voice-websocket-connection>
-        // TODO: I believe this payload should change with gateway v9
         let identify_payload = json!({
           "op": VoiceOpcode::Identify as u8,
           "d": {
             // The ID of the guild, private channel, stream, or lobby being connected to
-            "server_id": location_id, // TODO
+            "server_id": guild_id, // TODO
+            "channel_id": channel_id, // TODO
             "user_id": user_id,
             "session_id": session_id,
             "token": endpoint.token,
+            "max_dave_protocol_version": DAVE_PROTOCOL_VERSION,
           }
         });
-        websocket
+        info!("{identify_payload:#?}");
+        voice_websocket
             .send(identify_payload.to_string().into())
             .await
             .unwrap();
 
-        let hello_event = websocket.next_gateaway_payload().await;
+        let hello_event = voice_websocket.next_gateaway_payload().await;
 
         let VoiceOpcode::Hello = hello_event.op else {
-            return Err(Box::new(io::Error::new(
+            return Err(io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Expected to recive hello event as the first event",
-            )));
+            )
+            .into());
         };
 
         let hello_d = facet_value::from_value::<HelloPayload>(hello_event.d).unwrap();
         let heart_beating_duration = Duration::from_millis(hello_d.heartbeat_interval);
 
         Ok(Self {
-            websocket,
-            heart_beating: HeartBeatingData::new(heart_beating_duration),
-            last_sequence_number: None,
+            websocket: crate::gateaways::Websocket::new(voice_websocket),
+            heart_beating: HeartBeatingData::new(heart_beating_duration).into(),
+            last_sequence_number: OnceLock::new(),
             type_specific_data: Voice {
-                connection: None,
-                ssrc_to_audio_channel: HashMap::new(),
+                channel_id,
+                guild_id,
+                dave_pending_transitions: DashMap::new(),
+                dave_session: AsyncMutex::new(None),
+                connection: AsyncMutex::new(None),
+                ssrc_to_audio_channel: DashMap::new(),
+                ssrc_to_user_id: Default::default(),
                 input_channel: Default::default(),
-                input_buffer: VecDeque::new(),
-                is_speaking: false,
+                input_buffer: Default::default(),
+                is_speaking: false.into(),
             },
         })
-    }
-    pub async fn fetch_event(
-        &mut self,
-    ) -> Result<Option<GatewayPayload<VoiceOpcode>>, Box<dyn std::error::Error + Send + Sync>> {
-        match self.websocket.next().await {
-            Some(event) => Ok(Some(deserialize_event::<VoiceOpcode>(&event?)?)),
-            None => Ok(None),
-        }
     }
 }
 
@@ -320,24 +389,57 @@ struct IpDiscovery {
 }
 
 impl GatewayPayload<VoiceOpcode> {
-    pub async fn exec(self, discord: &Discord) -> Result<(), Box<dyn Error>> {
-        let mut voice_gateaway = discord.voice_gateaway.lock().await;
-        if let Some(gateaway) = voice_gateaway.mut_gateaway()
-            && let Some(s) = self.s
-        {
-            gateaway.last_sequence_number = Some(s);
+    pub async fn exec<T>(self, discord: &Arc<InnerDiscord<T>>) -> Result<(), Box<dyn Error>> {
+        let gateaway = discord.gateaway.load();
+        let Some(gateaway) = gateaway.as_ref() else {
+            return Err("TODO".into());
         };
-        drop(voice_gateaway);
+        let Some(voice_gateaway) = gateaway.voice.full_load_gateaway() else {
+            return Err("TODO".into());
+        };
 
-        info!("{:?}", self.op);
+        if let Some(s) = self.s {
+            voice_gateaway
+                .last_sequence_number
+                .get_or_init(|| s.into())
+                .store(s, Ordering::Relaxed);
+        };
+
+        info!("VoiceOpcode: {:?}", self.op);
         match self.op {
             VoiceOpcode::SessionDescription => {
                 let session_description = facet_value::from_value::<SessionDescription>(self.d)?;
-                if let Some(voice_gateaway) = discord.voice_gateaway.lock().await.mut_gateaway()
-                    && let Some(connection) = &mut voice_gateaway.connection
-                {
-                    connection.set_description(session_description);
+
+                // Init DAVE
+                let mut dave_session = voice_gateaway.dave_session.lock().await;
+                let profile = discord.profile.read().await;
+                let profile = profile.as_ref().unwrap();
+                reinit_dave_session(
+                    &voice_gateaway.websocket,
+                    &mut dave_session,
+                    session_description.dave_protocol_version(),
+                    voice_gateaway.channel_id,
+                    profile.id,
+                )
+                .await;
+
+                // Commit description to connection
+                if let Some(connection) = voice_gateaway.connection.lock().await.as_mut() {
+                    connection.set_description(session_description).unwrap();
                 };
+
+                discord
+                    .voice_events
+                    .push(VoiceEvent::CallStatusUpdate(CallStatus::Connected(
+                        WeakSocketStream::new(discord.clone().audio().await),
+                    )));
+            }
+            VoiceOpcode::Speaking => {
+                let speaking = facet_value::from_value::<SpeakingPayload>(self.d).unwrap();
+
+                voice_gateaway
+                    .ssrc_to_user_id
+                    .insert(speaking.ssrc, speaking.user_id);
             }
             VoiceOpcode::Ready => {
                 let ready = facet_value::from_value::<ReadyPayload>(self.d).unwrap();
@@ -380,15 +482,10 @@ impl GatewayPayload<VoiceOpcode> {
                 {
                     ip_address = &ip_address[..null_position]
                 };
-
-                let mut voice_gateaway = discord.voice_gateaway.lock().await;
-                let voice_gateaway = match voice_gateaway.mut_gateaway() {
-                    Some(gateaway) => gateaway,
-                    None => return Err("Gateaway has closed".into()),
-                };
-
-                voice_gateaway.connection =
-                    Some(Connection::new(udp, recv_ip_discovery.ssrc.get()));
+                {
+                    let mut connection = voice_gateaway.connection.lock().await;
+                    *connection = Some(Connection::new(udp, recv_ip_discovery.ssrc.get()));
+                }
                 let protocol_select = json!({
                     "op": VoiceOpcode::SelectProtocol as u8,
                     "d": {
@@ -414,6 +511,224 @@ impl GatewayPayload<VoiceOpcode> {
                     .send(Message::Text(protocol_select.to_string().into()))
                     .await?;
             }
+            VoiceOpcode::DAVEProtocolPrepareTransition => {
+                let mut dave_session = voice_gateaway.dave_session.lock().await;
+                let dave_session = match dave_session.as_mut() {
+                    Some(dave_session) => dave_session,
+                    None => unreachable!(),
+                };
+
+                let packet = facet_value::from_value::<DAVEPrepareEpoch>(self.d).unwrap();
+
+                let transition_id = packet.transition_id;
+
+                voice_gateaway
+                    .dave_pending_transitions
+                    .insert(transition_id, dave_session.protocol_version());
+
+                if transition_id == 0 {
+                    execute_pending_transition(
+                        dave_session,
+                        &voice_gateaway.dave_pending_transitions,
+                        transition_id,
+                    );
+                } else {
+                    // TODO
+                    // Upon receiving this message, clients enable passthrough mode on their receive-side
+                    // https://daveprotocol.com/#downgrade-to-transport-only-encryption
+                }
+            }
+            VoiceOpcode::DAVEProtocolExecuteTransition => {
+                let mut dave_session = voice_gateaway.dave_session.lock().await;
+                let dave_session = match dave_session.as_mut() {
+                    Some(dave_session) => dave_session,
+                    None => unreachable!(),
+                };
+
+                let packet = facet_value::from_value::<DAVEPrepareEpoch>(self.d).unwrap();
+                let transition_id = packet.transition_id;
+                execute_pending_transition(
+                    dave_session,
+                    &voice_gateaway.dave_pending_transitions,
+                    transition_id,
+                );
+            }
+            VoiceOpcode::DAVEProtocolPrepareEpoch => {
+                let packet = facet_value::from_value::<DAVEPrepareEpoch>(self.d).unwrap();
+
+                if packet.epoch == 1 {
+                    let mut dave_session = voice_gateaway.dave_session.lock().await;
+                    // TODO: Investigate if this should be properly added
+                    // this.daveProtocolVersion = packet.protocol_version;
+                    let profile = discord.profile.read().await;
+                    let profile = profile.as_ref().unwrap();
+                    reinit_dave_session(
+                        &voice_gateaway.websocket,
+                        &mut dave_session,
+                        packet.protocol_version,
+                        voice_gateaway.channel_id,
+                        profile.id,
+                    )
+                    .await;
+                }
+            }
+            VoiceOpcode::MLSExternalSenderPackage => {
+                let mut dave_session = voice_gateaway.dave_session.lock().await;
+                let dave_session = match dave_session.as_mut() {
+                    Some(dave_session) => dave_session,
+                    None => unreachable!(),
+                };
+
+                let bytes = facet_value::from_value::<Vec<u8>>(self.d)?;
+                if let Err(err) = dave_session.set_external_sender(&bytes[1..]) {
+                    error!("{err}");
+                    return Err(err.into());
+                };
+            }
+            VoiceOpcode::MLSProposals => {
+                let mut dave_session = voice_gateaway.dave_session.lock().await;
+                let dave_session = match dave_session.as_mut() {
+                    Some(dave_session) => dave_session,
+                    None => unreachable!(),
+                };
+                let bytes = facet_value::from_value::<Vec<u8>>(self.d)?;
+
+                let optype = if bytes[1] == 0 {
+                    davey::ProposalsOperationType::APPEND
+                } else {
+                    davey::ProposalsOperationType::REVOKE
+                };
+                let commit_welcome = match dave_session.process_proposals(
+                    optype,
+                    &bytes[2..],
+                    // TODO: Add this for security purposes, should be recived from CLIENTS_CONNECT
+                    None,
+                ) {
+                    Ok(welcome_message) => welcome_message,
+                    Err(err) => {
+                        error!("{err:?}");
+                        return Err(err.into());
+                    }
+                };
+
+                if let Some(commit_welcome) = commit_welcome {
+                    match commit_welcome.welcome {
+                        Some(welcome) => {
+                            voice_gateaway
+                                .websocket
+                                .send_binary(
+                                    VoiceOpcode::MLSCommitWelcome as u8,
+                                    welcome.into_iter().chain(commit_welcome.commit.into_iter()),
+                                )
+                                .await?
+                        }
+                        None => {
+                            voice_gateaway
+                                .websocket
+                                .send_binary(
+                                    VoiceOpcode::MLSCommitWelcome as u8,
+                                    commit_welcome.commit.into_iter(),
+                                )
+                                .await?
+                        }
+                    }
+                } else {
+                    error!("Potentially a problem?");
+                }
+            }
+            VoiceOpcode::MLSAnnounceCommitTransition => {
+                let mut dave_session = voice_gateaway.dave_session.lock().await;
+                let dave_session = match dave_session.as_mut() {
+                    Some(dave_session) => dave_session,
+                    None => unreachable!(),
+                };
+                let bytes = facet_value::from_value::<Vec<u8>>(self.d)?;
+
+                let transition_id = u16::from_be_bytes(bytes[1..3].try_into().unwrap());
+                if let Err(err) = dave_session.process_commit(&bytes[3..]) {
+                    error!("{err:?}");
+                    voice_gateaway
+                        .websocket
+                        .send(Message::Text(
+                            json!({
+                                "op": VoiceOpcode::MLSInvalidCommitWelcome as u8,
+                                "d": {
+                                  "transition_id": transition_id
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await?
+                } else {
+                    if transition_id != 0 {
+                        voice_gateaway
+                            .dave_pending_transitions
+                            .insert(transition_id, dave_session.protocol_version());
+                        //TODO
+                        voice_gateaway
+                            .websocket
+                            .send(Message::Text(
+                                json!({
+                                    "op": VoiceOpcode::DAVEProtocolTransitionReady as u8,
+                                    "d": {
+                                      "transition_id": transition_id
+                                    }
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await?
+                    }
+                }
+            }
+            VoiceOpcode::MLSWelcome => {
+                let mut dave_session = voice_gateaway.dave_session.lock().await;
+                let dave_session = match dave_session.as_mut() {
+                    Some(dave_session) => dave_session,
+                    None => unreachable!(),
+                };
+                let bytes = facet_value::from_value::<Vec<u8>>(self.d)?;
+
+                let transition_id = u16::from_be_bytes(bytes[1..3].try_into().unwrap());
+                if let Err(err) = dave_session.process_welcome(&bytes[3..]) {
+                    error!("{err:?}");
+                    voice_gateaway
+                        .websocket
+                        .send(Message::Text(
+                            json!({
+                                "op": VoiceOpcode::MLSInvalidCommitWelcome as u8,
+                                "d": {
+                                  "transition_id": transition_id
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await?
+                } else {
+                    info!("{:?}", dave_session.get_user_ids());
+                    if transition_id != 0 {
+                        voice_gateaway
+                            .dave_pending_transitions
+                            .insert(transition_id, dave_session.protocol_version());
+                        //TODO
+                        voice_gateaway
+                            .websocket
+                            .send(Message::Text(
+                                json!({
+                                    "op": VoiceOpcode::DAVEProtocolTransitionReady as u8,
+                                    "d": {
+                                      "transition_id": transition_id
+                                    }
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await?
+                    }
+                }
+            }
             _ => {
                 warn!("Unkown voice-opcode recived: {:?}", self.op);
             }
@@ -421,4 +736,57 @@ impl GatewayPayload<VoiceOpcode> {
 
         Ok(())
     }
+}
+
+// TODO: Impl for Gateaway<Voice>
+// TODO Move with teh DAVE RELATED stuff
+fn execute_pending_transition(
+    dave_session: &mut DaveSession,
+    dave_pending_transitions: &DashMap<u16, NonZeroU16>,
+    transition_id: u16,
+) {
+    let Some((_, new_version)) = dave_pending_transitions.remove(&transition_id) else {
+        warn!(
+            "Received execute transition, but we don't have a pending transition for {transition_id}"
+        );
+        return;
+    };
+
+    let old_version = dave_session.protocol_version();
+    if old_version != new_version {
+        error!("Downgrade or upgrade");
+    }
+}
+
+async fn reinit_dave_session(
+    voice_websocket: &Websocket,
+    dave_session: &mut Option<DaveSession>,
+    dave_protocol_version: u16,
+    channel_id: SNOWFLAKE,
+    user_id: SNOWFLAKE,
+) {
+    if let Some(dave_ver) = NonZeroU16::new(dave_protocol_version) {
+        let key_package = if let Some(dave_session) = dave_session {
+            dave_session
+                .reinit(dave_ver, user_id, channel_id, None)
+                .unwrap();
+            dave_session.create_key_package()
+        } else {
+            let mut new_dave_session =
+                DaveSession::new(dave_ver, user_id, channel_id, None).unwrap();
+            let key_package = new_dave_session.create_key_package();
+            *dave_session = Some(new_dave_session);
+            key_package
+        };
+
+        voice_websocket
+            .send_binary(
+                VoiceOpcode::MLSKeyPackage as u8,
+                key_package.unwrap().into_iter(),
+            )
+            .await
+            .unwrap();
+    } else {
+        error!("AAAAAAAAAAaa problem for a future me, just became a problem for a current me.");
+    };
 }

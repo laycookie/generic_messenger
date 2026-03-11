@@ -11,19 +11,61 @@
 //!   allow each backend to return its own error types without exposing them here.
 use std::error::Error;
 use std::fmt::Debug;
-use std::sync::{Arc, Weak};
 
 // QueryPlace is kept for reference in the commented-out legacy code below
 use crate::types::{House, Identifier, Message, Place, Room, User};
+
+pub use crate::stream::{ArcStream, WeakSocketStream};
+
 use async_trait::async_trait;
-use futures::Stream;
+use facet::Facet;
 use futures::channel::oneshot;
 use simple_audio_channels::{CHANNEL_BUFFER_SIZE, input::Input, output::Output};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Facet)]
+#[facet(derive(Error))]
+#[repr(u8)]
 pub enum MessengerError {
-    #[error("Feature not implemented on this messenger")]
+    // #[facet(diagnostic::help = "Feature not implemented on this messenger")]
     NotImplemented,
+    // #[facet(diagnostic::help = "Has some prerequest that wasnt fullfiled")]
+    Requires,
+}
+
+pub trait MessengerCasterQuery {
+    /// Capability: query (fetch) state from the messenger.
+    fn query(&self) -> Result<&dyn Query, MessengerError> {
+        Err(MessengerError::NotImplemented)
+    }
+}
+impl<T: Query> MessengerCasterQuery for T {
+    fn query(&self) -> Result<&dyn Query, MessengerError> {
+        Ok(self)
+    }
+}
+
+pub trait MessengerCasterText {
+    /// Capability: text chat integration.
+    fn text(&self) -> Result<&dyn Text, MessengerError> {
+        Err(MessengerError::NotImplemented)
+    }
+}
+impl<T: Text> MessengerCasterText for T {
+    fn text(&self) -> Result<&dyn Text, MessengerError> {
+        Ok(self)
+    }
+}
+
+pub trait MessengerCasterVoice {
+    /// Capability: voice chat integration.
+    fn voice(&self) -> Result<&dyn Voice, MessengerError> {
+        Err(MessengerError::NotImplemented)
+    }
+}
+impl<T: Voice> MessengerCasterVoice for T {
+    fn voice(&self) -> Result<&dyn Voice, MessengerError> {
+        Ok(self)
+    }
 }
 
 /// A concrete messenger backend.
@@ -33,8 +75,10 @@ pub enum MessengerError {
 /// Feature areas are split into smaller traits (`Query`, `Socket`, `VC`, ...). Backends
 /// can expose a sub-API by returning `Ok(&impl Trait)` from the corresponding method,
 /// or return [`MessengerError::NotImplemented`] if they don't support it.
-#[async_trait]
-pub trait Messenger: Send + Sync {
+pub trait Messenger: Send + Sync
+where
+    Self: MessengerCasterQuery + MessengerCasterText + MessengerCasterVoice,
+{
     /// Stable unique id for this backend instance (e.g. includes account/server context).
     fn id(&self) -> String;
     /// Human-readable backend name (e.g. `"discord"`).
@@ -43,32 +87,8 @@ pub trait Messenger: Send + Sync {
     ///
     /// Note: the exact format is backend-defined.
     fn auth(&self) -> String;
-
-    /// Capability: query (fetch) state from the messenger.
-    fn query(&self) -> Result<&dyn Query, MessengerError> {
-        Err(MessengerError::NotImplemented)
-    }
-
-    /// Capability: text chat integration.
-    fn text(&self) -> Result<&dyn Text, MessengerError> {
-        Err(MessengerError::NotImplemented)
-    }
-
-    /// Capability: voice chat integration.
-    fn voice(&self) -> Result<&dyn Voice, Box<dyn Error + Sync + Send>> {
-        Err(Box::new(MessengerError::NotImplemented))
-    }
-
-    /// Capability: open a realtime socket/stream for events (messages, channel changes, etc).
-    ///
-    /// Returns a `Weak` reference because sockets are owned/managed elsewhere and
-    /// can outlive or be dropped independent of the caller.
-    async fn socket(
-        self: Arc<Self>,
-    ) -> Result<Weak<dyn Socket + Send + Sync>, Box<dyn Error + Sync + Send>> {
-        Err(Box::new(MessengerError::NotImplemented))
-    }
 }
+
 impl PartialEq for dyn Messenger {
     fn eq(&self, other: &Self) -> bool {
         self.id() == other.id()
@@ -88,19 +108,6 @@ pub trait Query: Send + Sync {
     async fn contacts(&self) -> Result<Vec<Identifier<User>>, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
     }
-
-    /// Legacy: Fetch "places" (servers/guilds/spaces/etc) containing rooms/channels.
-    ///
-    /// This method has been replaced by `rooms()` and `houses()` for better type safety.
-    /// The `query_place` parameter described how to filter/locate places for the backend.
-    ///
-    /// Kept for reference during migration.
-    // async fn places(
-    //     &self,
-    //     query_place: QueryPlace,
-    // ) -> Result<Vec<Identifier<PlaceVariant>>, Box<dyn Error + Sync + Send>> {
-    //     Err(Box::new(MessengerError::NotImplemented))
-    // }
 
     /// Fetch all rooms/channels available to the client.
     async fn rooms(&self) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
@@ -125,6 +132,9 @@ pub trait Query: Send + Sync {
     ) -> Result<House, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
     }
+    async fn listen(&self) -> Result<WeakSocketStream<QueryEvent>, Box<dyn Error + Sync + Send>> {
+        Err(Box::new(MessengerError::NotImplemented))
+    }
 }
 
 /// Text chat API for reading/sending messages in a room/channel.
@@ -144,6 +154,31 @@ pub trait Text: Send + Sync {
         location: &Identifier<Place<Room>>,
         contents: Message,
     ) -> Result<(), Box<dyn Error + Sync + Send>>;
+    async fn listen(&self) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
+        Err(Box::new(MessengerError::NotImplemented))
+    }
+}
+
+/// Status of a voice call connection.
+pub enum CallStatus {
+    /// Successfully connected to the voice channel.
+    Connected(WeakSocketStream<AudioEvent>),
+    /// Currently attempting to connect to the voice channel.
+    Connecting(&'static str), // String contains info of what stage in the "Connecting" pipeline we are at.
+    Failed,
+}
+impl Debug for CallStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connected(_) => f.debug_tuple("Connected").finish(),
+            Self::Connecting(arg0) => f.debug_tuple("Connecting").field(arg0).finish(),
+            Self::Failed => write!(f, "Failed"),
+        }
+    }
+}
+
+pub enum VoiceEvent {
+    CallStatusUpdate(CallStatus),
 }
 
 /// Minimal voice lifecycle API.
@@ -152,9 +187,16 @@ pub trait Text: Send + Sync {
 #[async_trait]
 pub trait Voice: Send + Sync {
     /// Connect to voice in `location`.
-    async fn connect<'a>(&'a self, location: &Identifier<Place<Room>>);
+    async fn connect<'a>(
+        &'a self,
+        location: &Identifier<Place<Room>>,
+    ) -> Result<CallStatus, Box<dyn Error + Sync + Send>>;
     /// Disconnect from voice in `location`.
     async fn disconnect<'a>(&'a self, location: &Identifier<Place<Room>>);
+
+    async fn listen(&self) -> Result<WeakSocketStream<VoiceEvent>, Box<dyn Error + Sync + Send>> {
+        Err(Box::new(MessengerError::NotImplemented))
+    }
 }
 
 /// Realtime events emitted by a [`Socket`].
@@ -170,6 +212,7 @@ pub enum SocketEvent {
         r#where: Option<Identifier<()>>,
         room: Identifier<Room>,
     },
+    CallStatusUpdate(CallStatus),
     /// Request to attach an audio source into the audio graph.
     ///
     /// The receiver receives a `SampleProducer` used to push samples into the system.
@@ -184,12 +227,64 @@ pub enum SocketEvent {
     Skip,
 }
 
-/// Realtime socket/stream of messenger events.
-///
-/// This is both a `Stream` (for poll-based consumers) and provides an async `next`
-/// helper for backends that prefer an explicit method.
-#[async_trait]
-pub trait Socket: Stream<Item = SocketEvent> {
-    /// Await the next socket event.
-    async fn next(self: Arc<Self>) -> Option<SocketEvent>;
+impl From<QueryEvent> for SocketEvent {
+    fn from(value: QueryEvent) -> Self {
+        match value {
+            QueryEvent::ChannelCreated { r#where, room } => {
+                SocketEvent::ChannelCreated { r#where, room }
+            }
+        }
+    }
+}
+impl From<TextEvent> for SocketEvent {
+    fn from(value: TextEvent) -> Self {
+        match value {
+            TextEvent::MessageCreated { room, message } => {
+                SocketEvent::MessageCreated { room, message }
+            }
+        }
+    }
+}
+impl From<VoiceEvent> for SocketEvent {
+    fn from(value: VoiceEvent) -> Self {
+        match value {
+            VoiceEvent::CallStatusUpdate(call_status) => SocketEvent::CallStatusUpdate(call_status),
+        }
+    }
+}
+impl From<AudioEvent> for SocketEvent {
+    fn from(value: AudioEvent) -> Self {
+        match value {
+            AudioEvent::AddAudioSource(sender) => SocketEvent::AddAudioSource(sender),
+            AudioEvent::AddAudioInput(sender) => SocketEvent::AddAudioInput(sender),
+        }
+    }
+}
+
+pub enum QueryEvent {
+    /// A channel/room was created (optionally within a server/place).
+    ChannelCreated {
+        r#where: Option<Identifier<()>>,
+        // r#where: Option<Identifier<Place<House>>>,
+        room: Identifier<Room>,
+    },
+}
+pub enum TextEvent {
+    /// A message was created in a channel.
+    MessageCreated {
+        room: Identifier<()>,
+        // room: Identifier<Place<Room>>,
+        message: Identifier<Message>,
+    },
+}
+
+pub enum AudioEvent {
+    /// Request to attach an audio source into the audio graph.
+    ///
+    /// The receiver receives a `SampleProducer` used to push samples into the system.
+    AddAudioSource(oneshot::Sender<Output<CHANNEL_BUFFER_SIZE>>),
+    /// Request to attach a local audio input (microphone) for sending to voice.
+    ///
+    /// The receiver receives a `SampleConsumer` used to pull samples from the input stream.
+    AddAudioInput(oneshot::Sender<Input<CHANNEL_BUFFER_SIZE>>),
 }

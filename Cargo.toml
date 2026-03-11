@@ -10,16 +10,17 @@ members = [
 
 [workspace.dependencies]
 # Logs
-tracing = "0.1.43"
+tracing = "0.1.44"
 # Serilization/Deserilization
-# facet = "0.42.0"
-facet = { git = "https://github.com/facet-rs/facet", branch = "main" }
-# facet-value = "0.42.0"
-facet-value = { git = "https://github.com/facet-rs/facet", branch = "main" }
-# facet-json = "0.42.0"
-facet-json = { git = "https://github.com/facet-rs/facet", branch = "main" }
-# facet-pretty = "0.42.0"
-facet-pretty = { git = "https://github.com/facet-rs/facet", branch = "main" }
+facet = "0.44.1"
+# facet = { git = "https://github.com/facet-rs/facet", branch = "main" }
+facet-value = "0.44.1"
+# facet-value = { git = "https://github.com/facet-rs/facet", branch = "main" }
+facet-json = "0.44.1"
+# facet-json = { git = "https://github.com/facet-rs/facet", branch = "main" }
+facet-pretty = "0.44.1"
+# facet-pretty = { git = "https://github.com/facet-rs/facet", branch = "main" }
+facet-error = "0.44.1"
 # Async
 futures = "0.3.31"
 async-trait = "0.1.89"

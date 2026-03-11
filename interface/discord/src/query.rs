@@ -1,24 +1,26 @@
 use crate::{
-    Discord,
-    api_types::{self},
+    AudioDiscord, Discord, InnerDiscord, Owned, QueryDiscord, TextDiscord, VoiceDiscord,
+    api_types::{self, SNOWFLAKE},
     downloaders::{cache_download, http_request},
 };
 use async_trait::async_trait;
 use futures::future::join_all;
 use messenger_interface::{
-    interface::{MessengerError, Query, Text},
+    interface::{AudioEvent, Query, QueryEvent, Text, TextEvent, VoiceEvent},
+    stream::{ArcStream, WeakSocketStream},
     types::{House, Identifier, Message, Place, Reaction, Room, RoomCapabilities, User},
 };
-use std::error::Error;
-use tracing::{error, info};
+use tracing::error;
 
-impl Discord {
+use std::{error::Error, sync::Arc};
+
+impl InnerDiscord<Owned> {
     fn get_auth_header(&self) -> Vec<(&str, String)> {
         vec![("Authorization", self.token.unsecure().to_string())]
     }
 }
 
-impl Discord {
+impl InnerDiscord<Owned> {
     async fn fetch_dms(
         &self,
     ) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
@@ -32,12 +34,8 @@ impl Discord {
         let rooms_producer = channels
             .iter()
             .map(async move |channel| {
-                
                 let (name, icon, room_data) = channel.to_room_data().await;
-                Discord::identifier_generator(
-                    channel.id.as_str(),
-                    Place::new(name, icon, room_data),
-                )
+                Discord::identifier_generator(channel.id, Place::new(name, icon, room_data))
             })
             .collect::<Vec<_>>();
 
@@ -68,21 +66,21 @@ impl Discord {
         )
         .await?;
 
-        let house_producer = guilds.iter().map(async move |g| {
-            let icon = g.icon.as_ref().map(async move |hash| {
+        let house_producer = guilds.iter().map(async move |guild| {
+            let icon = guild.icon.as_ref().map(async move |hash| {
                 let icon = cache_download(
                     format!(
                         "https://cdn.discordapp.com/icons/{}/{}.webp?size=80&quality=lossless",
-                        g.id, hash
+                        guild.id, hash
                     ),
-                    format!("./cache/imgs/guilds/discord/{}", g.id).into(),
+                    format!("./cache/imgs/guilds/discord/{}", guild.id).into(),
                     format!("{hash}.webp"),
                 )
                 .await;
                 match icon {
                     Ok(path) => Some(path),
                     Err(e) => {
-                        error!("Failed to download icon for guild: {}\n{}", g.name, e);
+                        error!("Failed to download icon for guild: {}\n{}", guild.name, e);
                         None
                     }
                 }
@@ -91,9 +89,9 @@ impl Discord {
             // let rooms = self.fetch_guild_channels(&g.id).await.unwrap_or_default();
 
             Discord::identifier_generator(
-                g.id.as_str(),
+                guild.id,
                 Place::new(
-                    g.name.clone(),
+                    guild.name.clone(),
                     match icon {
                         Some(icon) => icon.await,
                         None => None,
@@ -115,7 +113,7 @@ impl Discord {
 
     async fn fetch_guild_channels(
         &self,
-        guild_id: &str,
+        guild_id: SNOWFLAKE,
     ) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
         let channels = http_request::<Vec<api_types::Channel>>(
             surf::get(format!(
@@ -145,7 +143,7 @@ impl Discord {
                     .clone()
                     .unwrap_or_else(|| "Unknown".to_string());
                 let identifier = Discord::identifier_generator(
-                    channel.id.as_str(),
+                    channel.id,
                     Place::new(
                         channel_name,
                         None,
@@ -179,7 +177,7 @@ impl Query for Discord {
         .await?;
 
         let prof = Discord::identifier_generator(
-            profile.id.as_str(),
+            profile.id,
             User {
                 name: profile.username.clone(),
                 icon: None,
@@ -218,7 +216,7 @@ impl Query for Discord {
                 };
 
                 Discord::identifier_generator(
-                    friend.id.as_str(),
+                    friend.id,
                     User {
                         name: friend.user.username.clone(),
                         icon: hash,
@@ -250,11 +248,14 @@ impl Query for Discord {
             let guild_id = mapping
                 .get(house.id())
                 .ok_or("No discord guild id mapping for this house")?;
-            self.fetch_guild_channels(guild_id.as_str())
+            self.fetch_guild_channels(*guild_id)
                 .await
                 .unwrap_or_default()
         };
         Ok(House::new(Some(rooms)))
+    }
+    async fn listen(&self) -> Result<WeakSocketStream<QueryEvent>, Box<dyn Error + Sync + Send>> {
+        Ok(WeakSocketStream::new(self.0.clone().query().await))
     }
 }
 
@@ -310,7 +311,7 @@ impl Text for Discord {
                 // TODO(discord-migration): messenger_interface::types::Message currently has no author field.
                 // If UI needs author, we should reintroduce it in the interface types.
                 let identifier = Discord::identifier_generator(
-                    message.id.as_str(),
+                    message.id,
                     Message {
                         text: message.content,
                         reactions,
@@ -355,5 +356,61 @@ impl Text for Discord {
         .await?;
 
         Ok(())
+    }
+    async fn listen(&self) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
+        Ok(WeakSocketStream::new(self.0.clone().text().await))
+    }
+}
+
+#[async_trait]
+impl ArcStream for InnerDiscord<QueryDiscord> {
+    type Item = QueryEvent;
+    /// Await the next item. Works with shared ownership via `Arc`.
+    async fn next(self: Arc<Self>) -> Option<<Self as ArcStream>::Item> {
+        loop {
+            if let Some(event) = self.query_events.pop() {
+                return Some(event);
+            }
+            self.poll_for_events().await;
+        }
+    }
+}
+#[async_trait]
+impl ArcStream for InnerDiscord<TextDiscord> {
+    type Item = TextEvent;
+    /// Await the next item. Works with shared ownership via `Arc`.
+    async fn next(self: Arc<Self>) -> Option<<Self as ArcStream>::Item> {
+        loop {
+            if let Some(event) = self.text_events.pop() {
+                return Some(event);
+            }
+            self.poll_for_events().await;
+        }
+    }
+}
+#[async_trait]
+impl ArcStream for InnerDiscord<VoiceDiscord> {
+    type Item = VoiceEvent;
+    /// Await the next item. Works with shared ownership via `Arc`.
+    async fn next(self: Arc<Self>) -> Option<<Self as ArcStream>::Item> {
+        loop {
+            if let Some(event) = self.voice_events.pop() {
+                return Some(event);
+            }
+            self.poll_for_events().await;
+        }
+    }
+}
+#[async_trait]
+impl ArcStream for InnerDiscord<AudioDiscord> {
+    type Item = AudioEvent;
+    /// Await the next item. Works with shared ownership via `Arc`.
+    async fn next(self: Arc<Self>) -> Option<<Self as ArcStream>::Item> {
+        loop {
+            if let Some(event) = self.audio_events.pop() {
+                return Some(event);
+            }
+            self.poll_voice().await?;
+        }
     }
 }

@@ -8,7 +8,9 @@ repository = "https://github.com/laycookie/generic_messenger"
 
 [dependencies]
 simple-audio-channels = { path = "../audio", version = "0.0.1" }
+tracing = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
-thiserror = "2.0.17"
+facet = { workspace = true }
+facet-error = { workspace = true }
 bitflags = "2.10.0"

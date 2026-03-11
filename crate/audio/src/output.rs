@@ -122,7 +122,6 @@ impl AudioMixer {
                                 .map(|consumer| consumer.try_pop().unwrap_or(0.0))
                                 .sum();
                         }
-                        println!("{:?}", data);
                     },
                     move |err| {
                         error!("Audio stream error: {err:?}");

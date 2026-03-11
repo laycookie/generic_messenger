@@ -1,11 +1,10 @@
 use std::{
     error::Error,
-    io, mem,
-    task::{Context, Poll},
+    io,
+    sync::{OnceLock, atomic::Ordering},
     time::Duration,
 };
 
-use async_trait::async_trait;
 use async_tungstenite::{
     WebSocketStream,
     async_std::{ConnectStream, connect_async},
@@ -15,18 +14,18 @@ use facet::Facet;
 use facet_pretty::FacetPretty;
 use futures::StreamExt;
 use messenger_interface::{
-    interface::{SocketEvent, Voice},
-    types::{Identifier, Message as GlobalMessage, Place, Room},
+    interface::{QueryEvent, TextEvent},
+    types::{Identifier, Message as GlobalMessage},
 };
 use surf::http::convert::json;
 use tracing::{error, info, warn};
 
 use crate::{
-    Discord,
-    api_types::{self, Message},
+    Discord, InnerDiscord, Owned,
+    api_types::{self, Message, SNOWFLAKE},
     gateaways::{
-        Gateaway, GatewayPayload, HeartBeatingData, deserialize_event,
-        voice::{Endpoint, VoiceGateawayState},
+        Gateaway, GateawayStream, GatewayPayload, HeartBeatingData,
+        voice::{Endpoint, VoiceGateaway},
     },
 };
 
@@ -115,11 +114,11 @@ struct HelloPayload {
     _trace: Vec<String>,
 }
 
+/// <https://docs.discord.com/developers/events/gateway-events#voice-server-update>
 #[derive(Debug, Facet)]
-pub struct ServerUpdatePayload {
+pub struct VoiceServerUpdatePayload {
     token: String,
-    guild_id: Option<String>,
-    channel_id: Option<String>,
+    guild_id: Option<SNOWFLAKE>,
     endpoint: Option<String>,
 }
 
@@ -155,25 +154,13 @@ struct SessionObjectPayload {
     active: Option<bool>,
 }
 
-trait GateawayStream<Op> {
-    async fn next_gateaway_payload(&mut self) -> GatewayPayload<Op>;
+pub struct General {
+    pub voice: VoiceGateaway,
 }
 
-impl GateawayStream<Opcode> for WebSocketStream<ConnectStream> {
-    async fn next_gateaway_payload(&mut self) -> GatewayPayload<Opcode> {
-        match self.next().await.unwrap().unwrap() {
-            WebsocketMessage::Text(utf8_bytes) => {
-                facet_json::from_str::<GatewayPayload<Opcode>>(&utf8_bytes).unwrap()
-            }
-            _ => todo!(),
-        }
-    }
-}
-
-pub struct General;
 impl Gateaway<General> {
     const GATEWAY_URL: &str = "wss://gateway.discord.gg/?encoding=json&v=9";
-    pub async fn new(discord: &Discord) -> Result<Self, Box<dyn Error + Sync + Send>> {
+    pub async fn new<T>(discord: &InnerDiscord<T>) -> Result<Self, Box<dyn Error + Sync + Send>> {
         let (mut gateway_websocket, _) = connect_async(Self::GATEWAY_URL).await?;
 
         // First event send by discord has to be Hello event according to
@@ -190,6 +177,9 @@ impl Gateaway<General> {
         let hello_d = facet_value::from_value::<HelloPayload>(hello_event.d)?;
         let heart_beating_duration = Duration::from_millis(hello_d.heartbeat_interval);
 
+        // TODO: People are dumb (me included) so later maybe check the token for trailing spaces
+        // the REST_API already filters for them on Discords end anyways (presumably or at least
+        // the ones trailing at the end)
         let token = discord.token.unsecure();
         gateway_websocket
             .send(WebsocketMessage::Text(
@@ -208,53 +198,43 @@ impl Gateaway<General> {
                 .to_string()
                 .into(),
             ))
-            .await
-            .expect("Failed to send identify payload");
+            .await?;
+        info!("Token send: {token:?}");
 
         Ok(Self {
-            websocket: gateway_websocket,
-            heart_beating: HeartBeatingData::new(heart_beating_duration),
-            last_sequence_number: None,
-            type_specific_data: General,
+            websocket: crate::gateaways::Websocket::new(gateway_websocket),
+            heart_beating: HeartBeatingData::new(heart_beating_duration).into(),
+            last_sequence_number: OnceLock::new(),
+            type_specific_data: General {
+                voice: VoiceGateaway::default(),
+            },
         })
-    }
-
-    pub async fn fetch_event(
-        &mut self,
-    ) -> Result<Option<GatewayPayload<Opcode>>, Box<dyn std::error::Error + Send + Sync>> {
-        match self.websocket.next().await {
-            Some(event) => Ok(Some(deserialize_event::<Opcode>(&event?)?)),
-            None => Ok(None),
-        }
     }
 }
 
 impl GatewayPayload<Opcode> {
-    pub(super) async fn exec(
+    pub(super) async fn exec<T>(
         self,
-        discord: &Discord,
-    ) -> Result<SocketEvent, Box<dyn std::error::Error + Send + Sync>> {
-        let mut gateaway = discord.gateaway.lock().await;
-        if let Some(gateaway) = gateaway.as_mut()
-            && let Some(s) = self.s
-        {
-            gateaway.last_sequence_number = Some(s);
+        discord: &InnerDiscord<T>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let gateaway = discord.gateaway.load();
+        let Some(gateaway) = gateaway.as_ref() else {
+            return Err("TODO".into());
         };
-        drop(gateaway);
+
+        if let Some(s) = self.s {
+            gateaway
+                .last_sequence_number
+                .get_or_init(|| s.into())
+                .store(s, Ordering::Relaxed);
+        };
 
         match self.op {
-            Opcode::Hello => {
-                // Discord sends Hello when the connection is established (and sometimes on resume flows).
-                // We already handle heartbeat scheduling elsewhere, so for now we can ignore it safely.
-                //
-                // TODO(discord-migration): correctly handle Hello/resume/reconnect flows and surface
-                // `SocketEvent::Disconnected` when appropriate.
-                return Ok(SocketEvent::Skip);
-            }
+            Opcode::Hello => {}
             Opcode::Dispatch => {
                 let Some(event_name) = self.t.as_ref() else {
                     warn!("Dispatch opcode received without an event type (t)");
-                    return Ok(SocketEvent::Skip);
+                    return Ok(());
                 };
                 info!("Dispatch event: {event_name:?}");
                 // https://discord.com/developers/docs/events/gateway-events#receive-events
@@ -270,46 +250,41 @@ impl GatewayPayload<Opcode> {
                     GatewayEvent::VoiceStateUpdate => {
                         let voice_state = facet_value::from_value::<VoiceStatePayload>(self.d)?;
 
-                        let mut voice_gateaway = discord.voice_gateaway.lock().await;
-                        voice_gateaway.insert_session_id(voice_state.session_id);
+                        gateaway
+                            .voice
+                            .insert_session_id(voice_state.session_id)
+                            .await;
                     }
                     GatewayEvent::VoiceServerUpdate => {
-                        let server_update = facet_value::from_value::<ServerUpdatePayload>(self.d)?;
+                        let server_update =
+                            facet_value::from_value::<VoiceServerUpdatePayload>(self.d)?;
 
-                        let mut voice_gateaway = discord.voice_gateaway.lock().await;
-                        voice_gateaway.insert_endpoint(Endpoint::new(
-                            server_update.endpoint.unwrap(),
-                            server_update.token,
-                        ));
+                        gateaway
+                            .voice
+                            .insert_endpoint(Endpoint::new(
+                                server_update.endpoint.unwrap(),
+                                server_update.token,
+                            ))
+                            .await;
 
                         let profile = discord.profile.read().await;
                         let profile = profile.as_ref();
-                        let user_id = profile.unwrap().id.as_str();
+                        let user_id = profile.unwrap().id;
 
-                        let vc_location = match server_update.guild_id {
-                            Some(guild_id) => guild_id,
-                            None => server_update.channel_id.unwrap(),
-                        };
-
-                        *voice_gateaway = match mem::take(voice_gateaway.as_mut())
-                            .connect(user_id, &vc_location)
-                            .await
-                        {
-                            Ok(state) => state,
+                        match gateaway.voice.connect(user_id).await {
+                            Ok(_) => (),
                             Err(err) => {
                                 error!("{err:?}");
-                                VoiceGateawayState::AwaitingData
                             }
                         };
                     }
                     GatewayEvent::MessageCreate => {
                         let message = facet_value::from_value::<Message>(self.d)?;
 
-                        let channel_id_hash =
-                            Discord::discord_id_to_internal_id(message.channel_id.as_str());
-                        let msg_id_hash = Discord::discord_id_to_internal_id(message.id.as_str());
+                        let channel_id_hash = message.channel_id;
+                        let msg_id_hash = message.id;
 
-                        return Ok(SocketEvent::MessageCreated {
+                        discord.text_events.push(TextEvent::MessageCreated {
                             room: Identifier::new(channel_id_hash, ()),
                             message: Identifier::new(
                                 msg_id_hash,
@@ -324,12 +299,11 @@ impl GatewayPayload<Opcode> {
                         let channel = facet_value::from_value::<api_types::Channel>(self.d)?;
 
                         let (_name, _icon, room_data) = channel.to_room_data().await;
-                        return Ok(SocketEvent::ChannelCreated {
+                        discord.query_events.push(QueryEvent::ChannelCreated {
                             r#where: channel
                                 .guild_id
-                                .as_deref()
                                 .map(|guild_id| Discord::identifier_generator(guild_id, ())),
-                            room: Discord::identifier_generator(&channel.id, room_data),
+                            room: Discord::identifier_generator(channel.id, room_data),
                         });
                     }
                     _ => warn!("Unknown event_name received: {event_name:?}",),
@@ -342,6 +316,6 @@ impl GatewayPayload<Opcode> {
                 warn!("Unkown opcode recived: {:?}", self.op)
             }
         };
-        Ok(SocketEvent::Skip)
+        Ok(())
     }
 }
