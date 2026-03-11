@@ -5,6 +5,6 @@ LoginInfo
 /.idea
 /.cursor
 
-cargo.lock
+Cargo.lock
 
 .direnv
