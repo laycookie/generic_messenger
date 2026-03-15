@@ -8,7 +8,6 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
-    vec::IntoIter,
 };
 
 use async_trait::async_trait;
@@ -33,7 +32,7 @@ use surf::http::convert::json;
 use tracing::{error, info, warn};
 
 use crate::{
-    Discord, InnerDiscord,
+    InnerDiscord, Owned,
     gateaways::{
         general::{GatewayEvent, Opcode},
         voice::{InputChannel, VoiceOpcode, connection::VOICE_FRAME_SAMPLES},
@@ -239,9 +238,11 @@ impl<T> InnerDiscord<T> {
             return None;
         };
 
-        let mut input_buffer = voice_gateaway.input_buffer.lock().await;
+        let mut dave_session = voice_gateaway.dave_session.lock().await;
         // === Send audio, from the mic. ===
+        let mut input_buffer = voice_gateaway.input_buffer.lock().await;
         let mut input_channel = voice_gateaway.input_channel.lock().await;
+
         match &mut *input_channel {
             InputChannel::None => {
                 // Handle setting up a voice input channel if one doesn't exist.
@@ -261,31 +262,29 @@ impl<T> InnerDiscord<T> {
             }
         };
 
+        info!("Sending");
+        // TODO: Move this to somewhere static
         let mut frame = [0.0; VOICE_FRAME_SAMPLES];
         // Check if we should send stop speaking event
         // Only stop if buffer is low AND we haven't sent audio for 200ms
         if input_buffer.len() < VOICE_FRAME_SAMPLES {
-            if voice_gateaway.is_speaking.load(Ordering::Relaxed) {
-                let should_stop = connection
-                    .last_send_time()
-                    .map(|last_time| last_time.elapsed() > Duration::from_millis(200))
-                    .unwrap_or(false);
+            let should_stop = connection
+                .last_send_time()
+                .map(|last_time| last_time.elapsed() > Duration::from_millis(200))
+                .unwrap_or(false);
 
-                if should_stop {
-                    let speaking_payload = json!({
-                        "op": voice::VoiceOpcode::Speaking as u8,
-                        "d": {
-                            "speaking": 0,
-                            "delay": 0,
-                            "ssrc": connection.ssrc(),
-                        }
-                    })
-                    .to_string();
-                    if let Err(err) = voice_gateaway.websocket.send(speaking_payload.into()).await {
-                        error!("Failed to send speaking update: {err}");
-                    } else {
-                        voice_gateaway.is_speaking.store(false, Ordering::Relaxed);
+            if should_stop && voice_gateaway.is_speaking.swap(false, Ordering::Relaxed) {
+                let speaking_payload = json!({
+                    "op": voice::VoiceOpcode::Speaking as u8,
+                    "d": {
+                        "speaking": 0,
+                        "delay": 0,
+                        "ssrc": connection.ssrc(),
                     }
+                })
+                .to_string();
+                if let Err(err) = voice_gateaway.websocket.send(speaking_payload.into()).await {
+                    error!("Failed to send speaking update: {err}");
                 }
             }
         } else {
@@ -322,7 +321,6 @@ impl<T> InnerDiscord<T> {
                         }
                     }
 
-                    let mut dave_session = voice_gateaway.dave_session.lock().await;
                     if let Err(err) = connection
                         .send_audio_frame(&frame, dave_session.as_mut())
                         .await
@@ -334,56 +332,53 @@ impl<T> InnerDiscord<T> {
         }
 
         // === Receive and play audio ===
-        // DEBUG: Generate sine wave instead of using received audio
-        // TODO: Remove this and restore original recv_audio logic
-        let mut dave_session = voice_gateaway.dave_session.lock().await;
+        // let (ssrc, audio_frame) = match connection
+        //     .recv_audio(dave_session.as_mut(), &voice_gateaway.ssrc_to_user_id)
+        //     .await
+        // {
+        //     Ok(ssrc_audio_frame) => ssrc_audio_frame,
+        //     Err(err) => {
+        //         error!("{err}");
+        //         return Some(());
+        //     }
+        // };
 
-        loop {
-            let (ssrc, audio_frame) = match connection
-                .recv_audio(dave_session.as_mut(), &voice_gateaway.ssrc_to_user_id)
-                .await
-            {
-                Ok(ssrc_audio_frame) => ssrc_audio_frame,
-                Err(err) => {
-                    error!("{err}");
-                    break;
-                }
-            };
+        // let mut channel_entery = match voice_gateaway.ssrc_to_audio_channel.entry(ssrc) {
+        //     dashmap::Entry::Occupied(channel) => channel,
+        //     dashmap::Entry::Vacant(e) => {
+        //         let (sender, reciver) = oneshot::channel();
+        //         e.insert(voice::AudioChannel::Initilizing(reciver).into());
+        //         self.audio_events.push(AudioEvent::AddAudioSource(sender));
+        //         return Some(());
+        //     }
+        // };
 
-            info!("playing");
-            let mut channel_entery = match voice_gateaway.ssrc_to_audio_channel.entry(ssrc) {
-                dashmap::Entry::Occupied(channel) => channel,
-                dashmap::Entry::Vacant(e) => {
-                    let (sender, reciver) = oneshot::channel();
-                    e.insert(voice::AudioChannel::Initilizing(reciver).into());
-                    self.audio_events.push(AudioEvent::AddAudioSource(sender));
-                    return Some(());
-                }
-            };
-            let mut channel = channel_entery.get_mut().lock().await;
-            match &mut *channel {
-                voice::AudioChannel::Initilizing(receiver) => {
-                    let producer = match receiver.try_recv().unwrap() {
-                        Some(producer) => producer,
-                        None => continue,
-                    };
-                    drop(channel);
-                    channel_entery.insert(voice::AudioChannel::Connected(producer).into());
-                }
-                voice::AudioChannel::Connected(producer) => {
-                    let samples_to_push = audio_frame.len();
-                    let samples_pushed = producer.push_iter(
-                        audio_frame
-                            .iter()
-                            .map(|sample| *sample as f32 / i16::MAX as f32),
-                    );
+        // loop {
+        //     let mut channel = channel_entery.get_mut().lock().await;
+        //     match &mut *channel {
+        //         voice::AudioChannel::Initilizing(receiver) => {
+        //             let producer = match receiver.try_recv().unwrap() {
+        //                 Some(producer) => producer,
+        //                 None => continue,
+        //             };
+        //             drop(channel);
+        //             channel_entery.insert(voice::AudioChannel::Connected(producer).into());
+        //         }
+        //         voice::AudioChannel::Connected(producer) => {
+        //             let samples_to_push = audio_frame.len();
+        //             let samples_pushed = producer.push_iter(
+        //                 audio_frame
+        //                     .iter()
+        //                     .map(|sample| *sample as f32 / i16::MAX as f32),
+        //             );
 
-                    if samples_to_push != samples_pushed {
-                        error!("Audio buffer overflow");
-                    }
-                }
-            };
-        }
+        //             if samples_to_push != samples_pushed {
+        //                 error!("Audio buffer overflow");
+        //             }
+        //         }
+        //     };
+        //     break;
+        // }
         Some(())
     }
     pub async fn poll_for_events(self: &Arc<Self>) {
@@ -473,9 +468,9 @@ impl<T> InnerDiscord<T> {
 }
 
 #[async_trait]
-impl Voice for Discord {
-    async fn connect<'a>(
-        &'a self,
+impl Voice for InnerDiscord<Owned> {
+    async fn connect(
+        &self,
         location: &Identifier<Place<Room>>,
     ) -> Result<CallStatus, Box<dyn Error + Sync + Send>> {
         let load_gateaway = self.gateaway.load();
@@ -513,9 +508,8 @@ impl Voice for Discord {
             return Err(err.into());
         };
         Ok(CallStatus::Connecting("Awaiting call start"))
-        // Ok(WeakSocketStream::new(self.0.clone().audio().await))
     }
-    async fn disconnect<'a>(&'a self, location: &Identifier<Place<Room>>) {
+    async fn disconnect(&self, location: &Identifier<Place<Room>>) {
         let load_gateaway = self.gateaway.load();
         let Some(gateaway) = load_gateaway.as_ref() else {
             error!("Not connected to the socket");
@@ -550,7 +544,9 @@ impl Voice for Discord {
             .unwrap();
     }
 
-    async fn listen(&self) -> Result<WeakSocketStream<VoiceEvent>, Box<dyn Error + Sync + Send>> {
-        Ok(WeakSocketStream::new(self.0.clone().voice().await))
+    async fn listen(
+        self: Arc<Self>,
+    ) -> Result<WeakSocketStream<VoiceEvent>, Box<dyn Error + Sync + Send>> {
+        Ok(WeakSocketStream::new(self.voice().await))
     }
 }

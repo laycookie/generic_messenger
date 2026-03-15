@@ -200,7 +200,7 @@ impl Connection {
             }
         }
 
-        let rtp_packet = RtpPacket::new(rtp_packet_buf).unwrap();
+        let rtp_packet = RtpPacket::new(rtp_packet_buf).ok_or("Failed to parse rtp packet")?;
 
         let is_rtp_extended = rtp_packet.get_extension() != 0;
 
@@ -225,7 +225,7 @@ impl Connection {
                 let nonce = crypto_aead::xchacha20poly1305::Nonce::from_bytes(nonce);
 
                 let key = crypto_aead::xchacha20poly1305::Key::from_bytes(
-                    &description.secret_key().unwrap()[..],
+                    description.secret_key().unwrap(),
                 )
                 .expect("Invalid key length");
 
@@ -234,8 +234,7 @@ impl Connection {
                     Some(rtp_header),
                     &nonce,
                     &key,
-                )
-                .unwrap()
+                )?
             }
             EncryptionMode::aead_aes256_gcm => todo!("Depricated"),
             EncryptionMode::xsalsa20_poly1305 => todo!("Depricated"),
@@ -262,6 +261,13 @@ impl Connection {
             trace!("RTP extension byte 6 unexpected: {:?}", unkown_const_3);
         }
 
+        let voice_data = if rtp_packet.get_padding() == 1
+            && let Some(last_byte) = voice_data.last()
+        {
+            &voice_data[..voice_data.len() - *last_byte as usize]
+        } else {
+            voice_data
+        };
         // Decrypt Dave
         let decrypted;
         let voice_data = if let Some(dave_session) = dave_session {
@@ -364,7 +370,7 @@ impl Connection {
                 let dave_encrypted;
                 let audio_payload = if let Some(dave_session) = dave_session {
                     dave_encrypted =
-                        dave_session.encrypt(MediaType::AUDIO, Codec::AV1, opus_payload)?;
+                        dave_session.encrypt(MediaType::AUDIO, Codec::OPUS, opus_payload)?;
                     dave_encrypted.iter().as_slice()
                 } else {
                     opus_payload

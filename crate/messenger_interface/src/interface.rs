@@ -9,8 +9,8 @@
 //!   features they support.
 //! - Errors are intentionally trait-object based (`Box<dyn Error + Send + Sync>`) to
 //!   allow each backend to return its own error types without exposing them here.
-use std::error::Error;
 use std::fmt::Debug;
+use std::{error::Error, sync::Arc};
 
 // QueryPlace is kept for reference in the commented-out legacy code below
 use crate::types::{House, Identifier, Message, Place, Room, User};
@@ -34,36 +34,66 @@ pub enum MessengerError {
 
 pub trait MessengerCasterQuery {
     /// Capability: query (fetch) state from the messenger.
-    fn query(&self) -> Result<&dyn Query, MessengerError> {
+    fn query(&self) -> Result<&dyn Query, MessengerError>;
+    fn arc_query(self: Arc<Self>) -> Result<Arc<dyn Query>, MessengerError>;
+}
+impl<T: Messenger> MessengerCasterQuery for T {
+    default fn query(&self) -> Result<&dyn Query, MessengerError> {
+        Err(MessengerError::NotImplemented)
+    }
+    default fn arc_query(self: Arc<Self>) -> Result<Arc<dyn Query>, MessengerError> {
         Err(MessengerError::NotImplemented)
     }
 }
-impl<T: Query> MessengerCasterQuery for T {
+impl<T: Messenger + Query + 'static> MessengerCasterQuery for T {
     fn query(&self) -> Result<&dyn Query, MessengerError> {
+        Ok(self)
+    }
+    fn arc_query(self: Arc<Self>) -> Result<Arc<dyn Query>, MessengerError> {
         Ok(self)
     }
 }
 
 pub trait MessengerCasterText {
     /// Capability: text chat integration.
-    fn text(&self) -> Result<&dyn Text, MessengerError> {
+    fn text(&self) -> Result<&dyn Text, MessengerError>;
+    fn arc_text(self: Arc<Self>) -> Result<Arc<dyn Text>, MessengerError>;
+}
+impl<T: Messenger> MessengerCasterText for T {
+    default fn text(&self) -> Result<&dyn Text, MessengerError> {
+        Err(MessengerError::NotImplemented)
+    }
+    default fn arc_text(self: Arc<Self>) -> Result<Arc<dyn Text>, MessengerError> {
         Err(MessengerError::NotImplemented)
     }
 }
-impl<T: Text> MessengerCasterText for T {
+impl<T: Messenger + Text + 'static> MessengerCasterText for T {
     fn text(&self) -> Result<&dyn Text, MessengerError> {
+        Ok(self)
+    }
+    fn arc_text(self: Arc<Self>) -> Result<Arc<dyn Text>, MessengerError> {
         Ok(self)
     }
 }
 
 pub trait MessengerCasterVoice {
     /// Capability: voice chat integration.
-    fn voice(&self) -> Result<&dyn Voice, MessengerError> {
+    fn voice(&self) -> Result<&dyn Voice, MessengerError>;
+    fn arc_voice(self: Arc<Self>) -> Result<Arc<dyn Voice>, MessengerError>;
+}
+impl<T: Messenger> MessengerCasterVoice for T {
+    default fn voice(&self) -> Result<&dyn Voice, MessengerError> {
+        Err(MessengerError::NotImplemented)
+    }
+    default fn arc_voice(self: Arc<Self>) -> Result<Arc<dyn Voice>, MessengerError> {
         Err(MessengerError::NotImplemented)
     }
 }
-impl<T: Voice> MessengerCasterVoice for T {
+impl<T: Messenger + Voice + 'static> MessengerCasterVoice for T {
     fn voice(&self) -> Result<&dyn Voice, MessengerError> {
+        Ok(self)
+    }
+    fn arc_voice(self: Arc<Self>) -> Result<Arc<dyn Voice>, MessengerError> {
         Ok(self)
     }
 }
@@ -132,7 +162,9 @@ pub trait Query: Send + Sync {
     ) -> Result<House, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
     }
-    async fn listen(&self) -> Result<WeakSocketStream<QueryEvent>, Box<dyn Error + Sync + Send>> {
+    async fn listen(
+        self: Arc<Self>,
+    ) -> Result<WeakSocketStream<QueryEvent>, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
     }
 }
@@ -154,7 +186,9 @@ pub trait Text: Send + Sync {
         location: &Identifier<Place<Room>>,
         contents: Message,
     ) -> Result<(), Box<dyn Error + Sync + Send>>;
-    async fn listen(&self) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
+    async fn listen(
+        self: Arc<Self>,
+    ) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
     }
 }
@@ -187,14 +221,16 @@ pub enum VoiceEvent {
 #[async_trait]
 pub trait Voice: Send + Sync {
     /// Connect to voice in `location`.
-    async fn connect<'a>(
-        &'a self,
+    async fn connect(
+        &self,
         location: &Identifier<Place<Room>>,
     ) -> Result<CallStatus, Box<dyn Error + Sync + Send>>;
     /// Disconnect from voice in `location`.
-    async fn disconnect<'a>(&'a self, location: &Identifier<Place<Room>>);
+    async fn disconnect(&self, location: &Identifier<Place<Room>>);
 
-    async fn listen(&self) -> Result<WeakSocketStream<VoiceEvent>, Box<dyn Error + Sync + Send>> {
+    async fn listen(
+        self: Arc<Self>,
+    ) -> Result<WeakSocketStream<VoiceEvent>, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
     }
 }

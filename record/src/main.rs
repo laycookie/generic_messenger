@@ -3,14 +3,12 @@ use std::borrow::Cow;
 use crate::messanger_unifier::Call;
 use auth::MessangersGenerator;
 use font_kit::{family_name::FamilyName, source::SystemSource};
-use futures::{Stream, StreamExt, future::join_all, join};
+use futures::{StreamExt, future::join_all, join};
 use iced::{Element, Subscription, Task, window};
 use messanger_unifier::Messangers;
-use messenger_interface::interface::{SocketEvent, WeakSocketStream};
+use messenger_interface::interface::SocketEvent;
 use pages::{AppMessage, Login, messenger::Messenger};
 use simple_audio_channels::{AudioMixer, SampleFormat};
-
-use crate::messanger_unifier::MessangerHandle;
 
 mod auth;
 mod components;
@@ -179,33 +177,16 @@ impl App {
                         .map(|interface| (interface.handle, interface.api.to_owned()))
                         .map(async |(handle, api)| {
                             // Query
-                            let Ok(q) = api.query() else {
+                            let Ok(q) = api.clone().arc_query() else {
                                 error!("Query not impl");
                                 return None;
                             };
-
-                            let (profile, contacts, conversations, servers) =
-                                join!(q.client_user(), q.contacts(), q.rooms(), q.houses());
-
-                            let profile = match profile {
-                                Ok(profile) => profile,
-                                Err(err) => {
-                                    panic!("TODO: {err:#?}");
-                                }
-                            };
-
-                            // let Ok(query_socket) = q.listen().await else {
-                            //     error!("Problem with socket starting");
-                            //     return None;
-                            // };
-
-                            // Text
-                            let Ok(t) = api.text() else {
+                            let Ok(t) = api.clone().arc_text() else {
                                 error!("Text not impl");
                                 return None;
                             };
-                            let Ok(v) = api.voice() else {
-                                error!("Text not impl");
+                            let Ok(v) = api.clone().arc_voice() else {
+                                error!("Voice not impl");
                                 return None;
                             };
 
@@ -238,6 +219,16 @@ impl App {
 
                             // let servers: Vec<Identifier<Place>> =
                             //     house_places.unwrap_or_default();
+
+                            let (profile, contacts, conversations, servers) =
+                                join!(q.client_user(), q.contacts(), q.rooms(), q.houses());
+
+                            let profile = match profile {
+                                Ok(profile) => profile,
+                                Err(err) => {
+                                    panic!("TODO: {err:#?}");
+                                }
+                            };
 
                             Some((
                                 handle,

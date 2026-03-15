@@ -23,13 +23,13 @@ impl Display for Platform {
 }
 impl Platform {
     pub fn to_messanger(&self, auth: &str) -> Arc<dyn NeoMessanger> {
-        Arc::new(match self {
+        match self {
             // Self::Discord => Discord::new(&auth, audio_mixer.clone()),
-            Self::Discord => Discord::new(&auth),
+            Self::Discord => Discord::new(auth).cast(),
             Self::Test => {
                 todo!()
             }
-        })
+        }
     }
     fn get_login_methods(&self) -> Vec<LoginMethods> {
         match self {

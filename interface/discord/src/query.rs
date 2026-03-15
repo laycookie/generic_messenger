@@ -168,7 +168,7 @@ impl InnerDiscord<Owned> {
 }
 
 #[async_trait]
-impl Query for Discord {
+impl Query for InnerDiscord<Owned> {
     async fn client_user(&self) -> Result<Identifier<User>, Box<dyn Error + Sync + Send>> {
         let profile = http_request::<api_types::Profile>(
             surf::get("https://discord.com/api/v9/users/@me"),
@@ -254,13 +254,15 @@ impl Query for Discord {
         };
         Ok(House::new(Some(rooms)))
     }
-    async fn listen(&self) -> Result<WeakSocketStream<QueryEvent>, Box<dyn Error + Sync + Send>> {
-        Ok(WeakSocketStream::new(self.0.clone().query().await))
+    async fn listen(
+        self: Arc<Self>,
+    ) -> Result<WeakSocketStream<QueryEvent>, Box<dyn Error + Sync + Send>> {
+        Ok(WeakSocketStream::new(self.query().await))
     }
 }
 
 #[async_trait]
-impl Text for Discord {
+impl Text for InnerDiscord<Owned> {
     async fn get_messages(
         &self,
         location: &Identifier<Place<Room>>,
@@ -357,8 +359,10 @@ impl Text for Discord {
 
         Ok(())
     }
-    async fn listen(&self) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
-        Ok(WeakSocketStream::new(self.0.clone().text().await))
+    async fn listen(
+        self: Arc<Self>,
+    ) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
+        Ok(WeakSocketStream::new(self.text().await))
     }
 }
 

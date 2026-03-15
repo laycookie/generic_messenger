@@ -12,7 +12,7 @@ use ringbuf::{
     CachingCons, CachingProd, StaticRb,
     traits::{Consumer as _, Observer, Producer, Split as _},
 };
-use tracing::{error, info};
+use tracing::error;
 
 use crate::{
     AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, Channel, ChannelType, Notify, SampleConsumer,

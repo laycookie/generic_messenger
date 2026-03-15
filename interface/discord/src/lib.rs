@@ -103,6 +103,7 @@ impl<T> InnerDiscord<T> {
     }
 }
 
+#[repr(transparent)]
 pub struct Discord(Arc<InnerDiscord<Owned>>);
 impl Deref for Discord {
     type Target = InnerDiscord<Owned>;
@@ -135,9 +136,12 @@ impl Discord {
     fn identifier_generator<D>(id: SNOWFLAKE, data: D) -> Identifier<D> {
         Identifier::new(id, data)
     }
+    pub fn cast(self) -> Arc<dyn Messenger> {
+        self.0
+    }
 }
 
-impl Messenger for Discord {
+impl Messenger for InnerDiscord<Owned> {
     fn id(&self) -> String {
         self.name().to_owned() + self.token.unsecure()
     }
