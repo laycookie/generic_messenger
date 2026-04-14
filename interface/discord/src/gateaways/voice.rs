@@ -1,10 +1,9 @@
 use std::{
-    collections::VecDeque,
     error::Error,
     io, mem,
     num::NonZeroU16,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -22,13 +21,13 @@ use messenger_interface::{
     stream::WeakSocketStream,
 };
 use num_enum::TryFromPrimitive;
-use simple_audio_channels::{CHANNEL_BUFFER_SIZE, input::Input, output::Output};
+use simple_audio_channels::{input::SampleConsumer, output::SampleProducer};
 use smol::net::UdpSocket;
 use surf::http::convert::json;
 use tracing::{error, info, warn};
 
 use crate::{
-    ChannelID, InnerDiscord,
+    AudioDiscord, ChannelID, InnerDiscord,
     api_types::SNOWFLAKE,
     gateaways::{
         Gateaway, GateawayStream, GatewayPayload, HeartBeatingData, Websocket,
@@ -262,16 +261,16 @@ impl VoiceGateaway {
 }
 
 pub enum AudioChannel {
-    Initilizing(oneshot::Receiver<Output<CHANNEL_BUFFER_SIZE>>),
-    Connected(Output<CHANNEL_BUFFER_SIZE>),
+    Initilizing(oneshot::Receiver<SampleProducer>),
+    Connected(SampleProducer),
 }
 
 #[derive(Default)]
 pub enum InputChannel {
     #[default]
     None,
-    Initilizing(oneshot::Receiver<Input<CHANNEL_BUFFER_SIZE>>),
-    Connected(Input<CHANNEL_BUFFER_SIZE>),
+    Initilizing(oneshot::Receiver<SampleConsumer>),
+    Connected(SampleConsumer),
 }
 
 pub struct Voice {
@@ -279,11 +278,9 @@ pub struct Voice {
     pub guild_id: Option<SNOWFLAKE>,
     pub dave_pending_transitions: DashMap<u16, NonZeroU16>, // transition_id, dave_protocol_version
     pub dave_session: AsyncMutex<Option<DaveSession>>,
-    pub connection: AsyncMutex<Option<Connection>>,
-    pub ssrc_to_audio_channel: DashMap<Ssrc, AsyncMutex<AudioChannel>>,
+    pub connection: ArcSwapOption<Connection>,
+    pub ssrc_to_audio_channel: DashMap<Ssrc, Mutex<AudioChannel>>,
     pub ssrc_to_user_id: DashMap<Ssrc, SNOWFLAKE>,
-    pub input_channel: AsyncMutex<InputChannel>,
-    pub input_buffer: AsyncMutex<VecDeque<f32>>,
     pub is_speaking: AtomicBool,
 }
 impl Gateaway<Voice> {
@@ -337,11 +334,9 @@ impl Gateaway<Voice> {
                 guild_id,
                 dave_pending_transitions: DashMap::new(),
                 dave_session: AsyncMutex::new(None),
-                connection: AsyncMutex::new(None),
+                connection: Default::default(),
                 ssrc_to_audio_channel: DashMap::new(),
                 ssrc_to_user_id: Default::default(),
-                input_channel: Default::default(),
-                input_buffer: Default::default(),
                 is_speaking: false.into(),
             },
         })
@@ -424,14 +419,19 @@ impl GatewayPayload<VoiceOpcode> {
                 .await;
 
                 // Commit description to connection
-                if let Some(connection) = voice_gateaway.connection.lock().await.as_mut() {
+                if let Some(connection) = voice_gateaway.connection.load().as_ref() {
                     connection.set_description(session_description).unwrap();
                 };
 
                 discord
                     .voice_events
                     .push(VoiceEvent::CallStatusUpdate(CallStatus::Connected(
-                        WeakSocketStream::new(discord.clone().audio().await),
+                        WeakSocketStream::new(unsafe {
+                            discord
+                                .to_owned()
+                                .cast_and_downgrade::<AudioDiscord>()
+                                .await
+                        }),
                     )));
             }
             VoiceOpcode::Speaking => {
@@ -483,8 +483,9 @@ impl GatewayPayload<VoiceOpcode> {
                     ip_address = &ip_address[..null_position]
                 };
                 {
-                    let mut connection = voice_gateaway.connection.lock().await;
-                    *connection = Some(Connection::new(udp, recv_ip_discovery.ssrc.get()));
+                    voice_gateaway.connection.store(Some(
+                        Connection::new(udp, recv_ip_discovery.ssrc.get()).into(),
+                    ));
                 }
                 let protocol_select = json!({
                     "op": VoiceOpcode::SelectProtocol as u8,

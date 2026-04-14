@@ -1,9 +1,4 @@
-use std::{
-    error::Error,
-    fmt::Debug,
-    ops::{Deref, DerefMut},
-    sync::Arc,
-};
+use std::{error::Error, fmt::Debug};
 
 use cpal::{
     ChannelCount, SampleFormat, SampleRate,
@@ -16,32 +11,34 @@ use ringbuf::{
 use tracing::{error, info};
 
 use crate::{
-    AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, Channel, ChannelType, Notify, SampleConsumer,
-    SampleProducer, SampleRb,
+    AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, Channel, ChannelType, Notify, SampleConsum,
+    SampleProd, SampleRb,
 };
 
-#[repr(transparent)]
-pub struct Output<const N: usize>(SampleProducer<N>);
-impl<const N: usize> ChannelType<N> for Output<N> {
-    fn from(rb: SampleRb<N>) -> Self {
-        Self(CachingProd::new(rb.clone()))
+pub struct SampleProducer(SampleProd<CHANNEL_BUFFER_SIZE>);
+impl SampleProducer {
+    pub fn new(caching: SampleProd<CHANNEL_BUFFER_SIZE>) -> Self {
+        Self(caching)
+    }
+    pub fn push_iter<I: Iterator<Item = AudioSampleType>>(&mut self, iter: I) -> usize {
+        self.0.push_iter(iter)
     }
 }
-impl<const N: usize> Deref for Output<N> {
-    type Target = SampleProducer<N>;
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+pub struct Output(SampleRb<CHANNEL_BUFFER_SIZE>);
+impl ChannelType for Output {
+    fn new() -> Self {
+        Self(SampleRb::default())
     }
 }
-impl<const N: usize> DerefMut for Output<N> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+impl Output {
+    pub fn push_iter<I: Iterator<Item = AudioSampleType>>(&self, iter: I) -> usize {
+        CachingProd::new(self.0.clone()).push_iter(iter)
     }
 }
 
 pub enum OutputRxEvent {
-    AddOutputChannel(SampleConsumer<CHANNEL_BUFFER_SIZE>),
+    AddOutputChannel(SampleConsum<CHANNEL_BUFFER_SIZE>),
 }
 impl Debug for OutputRxEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,17 +57,14 @@ impl AudioMixer {
         channel_mode: ChannelCount,
         sample_format: SampleFormat,
         sample_rate: SampleRate,
-    ) -> Result<Output<CHANNEL_BUFFER_SIZE>, Box<dyn Error>> {
-        let (channel, producer) = Channel::<_, Output<CHANNEL_BUFFER_SIZE>>::new(
-            channel_mode,
-            sample_format,
-            sample_rate,
-        );
+    ) -> Result<SampleProducer, Box<dyn Error>> {
+        let channel = Channel::<Output>::new(channel_mode, sample_format, sample_rate);
+        let producer = SampleProducer(CachingProd::new(channel.interface.0.clone()));
 
         if let Some(master) = &mut self.output
             && let Some(stream) = &mut master.stream
         {
-            let sample_consumer = CachingCons::new(channel.rb.clone());
+            let sample_consumer = CachingCons::new(channel.interface.0.clone());
             stream
                 .to_audio_thread
                 .try_push(OutputRxEvent::AddOutputChannel(sample_consumer))
@@ -93,8 +87,8 @@ impl AudioMixer {
             let mut sample_consumers = self
                 .output_channels
                 .iter()
-                .map(|channel| CachingCons::new(channel.rb.clone()))
-                .collect::<Vec<SampleConsumer<CHANNEL_BUFFER_SIZE>>>();
+                .map(|channel| CachingCons::new(channel.interface.0.clone()))
+                .collect::<Vec<SampleConsum<CHANNEL_BUFFER_SIZE>>>();
 
             let (prod, mut cons) = StaticRb::default().split();
             let stream_close_notification = Notify::new();

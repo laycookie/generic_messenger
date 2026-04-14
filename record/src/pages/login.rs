@@ -24,8 +24,7 @@ impl Display for Platform {
 impl Platform {
     pub fn to_messanger(&self, auth: &str) -> Arc<dyn NeoMessanger> {
         match self {
-            // Self::Discord => Discord::new(&auth, audio_mixer.clone()),
-            Self::Discord => Discord::new(auth).cast(),
+            Self::Discord => Discord::new_messenger(auth),
             Self::Test => {
                 todo!()
             }

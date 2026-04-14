@@ -378,6 +378,7 @@ impl App {
                             .create_output_channel(2, SampleFormat::I16, 48_000)
                             .unwrap();
 
+                        info!("Sending microphone");
                         if sender.send(producer).is_err() {
                             warn!("Couldn't send audio channel to the adapter");
                         };
@@ -405,8 +406,8 @@ impl App {
             }
             AppMessage::StartOutputStream => {
                 if let Some(notify) = self.audio.start_stream_output() {
-                    return Task::future(async {
-                        notify.await;
+                    return Task::future(async move {
+                        notify.notified().await;
                     })
                     .then(|_| Task::done(AppMessage::StopOutputStream));
                 } else {
@@ -422,8 +423,8 @@ impl App {
             }
             AppMessage::StartInputStream => {
                 if let Some(notify) = self.audio.start_stream_input() {
-                    return Task::future(async {
-                        notify.await;
+                    return Task::future(async move {
+                        notify.notified().await;
                     })
                     .then(|_| Task::done(AppMessage::StopInputStream));
                 } else {

@@ -20,7 +20,8 @@ pub use crate::stream::{ArcStream, WeakSocketStream};
 use async_trait::async_trait;
 use facet::Facet;
 use futures::channel::oneshot;
-use simple_audio_channels::{CHANNEL_BUFFER_SIZE, input::Input, output::Output};
+use simple_audio_channels::input::SampleConsumer;
+use simple_audio_channels::output::SampleProducer;
 
 #[derive(Debug, Facet)]
 #[facet(derive(Error))]
@@ -195,11 +196,11 @@ pub trait Text: Send + Sync {
 
 /// Status of a voice call connection.
 pub enum CallStatus {
-    /// Successfully connected to the voice channel.
     Connected(WeakSocketStream<AudioEvent>),
     /// Currently attempting to connect to the voice channel.
     Connecting(&'static str), // String contains info of what stage in the "Connecting" pipeline we are at.
     Failed,
+    // TODO: Add Retrying.
 }
 impl Debug for CallStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -209,10 +210,6 @@ impl Debug for CallStatus {
             Self::Failed => write!(f, "Failed"),
         }
     }
-}
-
-pub enum VoiceEvent {
-    CallStatusUpdate(CallStatus),
 }
 
 /// Minimal voice lifecycle API.
@@ -252,11 +249,11 @@ pub enum SocketEvent {
     /// Request to attach an audio source into the audio graph.
     ///
     /// The receiver receives a `SampleProducer` used to push samples into the system.
-    AddAudioSource(oneshot::Sender<Output<CHANNEL_BUFFER_SIZE>>),
+    AddAudioSource(oneshot::Sender<SampleProducer>),
     /// Request to attach a local audio input (microphone) for sending to voice.
     ///
     /// The receiver receives a `SampleConsumer` used to pull samples from the input stream.
-    AddAudioInput(oneshot::Sender<Input<CHANNEL_BUFFER_SIZE>>),
+    AddAudioInput(oneshot::Sender<SampleConsumer>),
     /// Socket disconnected (cleanly or due to error).
     Disconnected,
     /// No-op / placeholder event (used by some backends to "tick" the stream).
@@ -314,13 +311,18 @@ pub enum TextEvent {
     },
 }
 
+/// Updates in the status of the voice call
+pub enum VoiceEvent {
+    CallStatusUpdate(CallStatus),
+}
+/// Audio events that are meant to be processed with the mixer
 pub enum AudioEvent {
     /// Request to attach an audio source into the audio graph.
     ///
     /// The receiver receives a `SampleProducer` used to push samples into the system.
-    AddAudioSource(oneshot::Sender<Output<CHANNEL_BUFFER_SIZE>>),
+    AddAudioSource(oneshot::Sender<SampleProducer>),
     /// Request to attach a local audio input (microphone) for sending to voice.
     ///
     /// The receiver receives a `SampleConsumer` used to pull samples from the input stream.
-    AddAudioInput(oneshot::Sender<Input<CHANNEL_BUFFER_SIZE>>),
+    AddAudioInput(oneshot::Sender<SampleConsumer>),
 }

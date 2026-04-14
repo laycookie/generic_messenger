@@ -1,4 +1,4 @@
-#![feature(specialization)]
+#![feature(specialization, never_type)]
 
 pub mod interface;
 pub mod stream;

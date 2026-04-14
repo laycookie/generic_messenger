@@ -10,6 +10,7 @@ use messenger_interface::{
     stream::{ArcStream, WeakSocketStream},
     types::{House, Identifier, Message, Place, Reaction, Room, RoomCapabilities, User},
 };
+use simple_audio_channels::input::SampleConsumer;
 use tracing::error;
 
 use std::{error::Error, sync::Arc};
@@ -257,7 +258,9 @@ impl Query for InnerDiscord<Owned> {
     async fn listen(
         self: Arc<Self>,
     ) -> Result<WeakSocketStream<QueryEvent>, Box<dyn Error + Sync + Send>> {
-        Ok(WeakSocketStream::new(self.query().await))
+        Ok(WeakSocketStream::new(unsafe {
+            self.cast_and_downgrade::<QueryDiscord>().await
+        }))
     }
 }
 
@@ -362,7 +365,9 @@ impl Text for InnerDiscord<Owned> {
     async fn listen(
         self: Arc<Self>,
     ) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
-        Ok(WeakSocketStream::new(self.text().await))
+        Ok(WeakSocketStream::new(unsafe {
+            self.cast_and_downgrade::<TextDiscord>().await
+        }))
     }
 }
 
@@ -405,6 +410,7 @@ impl ArcStream for InnerDiscord<VoiceDiscord> {
         }
     }
 }
+
 #[async_trait]
 impl ArcStream for InnerDiscord<AudioDiscord> {
     type Item = AudioEvent;

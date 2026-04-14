@@ -1,8 +1,4 @@
-use std::{
-    error::Error,
-    fmt::Debug,
-    ops::{Deref, DerefMut},
-};
+use std::{error::Error, fmt::Debug};
 
 use cpal::{
     ChannelCount, SampleFormat, SampleRate,
@@ -12,44 +8,43 @@ use ringbuf::{
     CachingCons, CachingProd, StaticRb,
     traits::{Consumer as _, Observer, Producer, Split as _},
 };
-use tracing::error;
+use tracing::{error, info};
 
 use crate::{
-    AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, Channel, ChannelType, Notify, SampleConsumer,
-    SampleProducer, SampleRb,
+    AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, Channel, ChannelType, Notify, SampleConsum,
+    SampleProd, SampleRb,
 };
 
 pub enum InputRxEvent {
-    AddInputChannel(SampleProducer<CHANNEL_BUFFER_SIZE>),
+    AddInputChannel(SampleProd<CHANNEL_BUFFER_SIZE>, Notify),
 }
 impl Debug for InputRxEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AddInputChannel(_) => f.debug_tuple("AddInputChannel").finish(),
+            Self::AddInputChannel(_, _) => f.debug_tuple("AddInputChannel").finish(),
         }
     }
 }
 
-// TODO: Replace with a configurable noise gate/AGC once mic pipeline is finalized.
 const NOISE_FLOOR: AudioSampleType = 0.002;
 
-#[repr(transparent)]
-pub struct Input<const N: usize>(SampleConsumer<N>);
-impl<const N: usize> ChannelType<N> for Input<N> {
-    fn from(rb: SampleRb<N>) -> Self {
-        Self(CachingCons::new(rb.clone()))
+pub struct SampleConsumer(SampleConsum<CHANNEL_BUFFER_SIZE>, Notify);
+impl SampleConsumer {
+    pub async fn pop_iter(
+        &mut self,
+    ) -> ringbuf::consumer::PopIter<'_, SampleConsum<CHANNEL_BUFFER_SIZE>> {
+        self.1.notified().await;
+        self.0.pop_iter()
+    }
+    pub fn try_pop(&mut self) -> Option<AudioSampleType> {
+        self.0.try_pop()
     }
 }
-impl<const N: usize> Deref for Input<N> {
-    type Target = SampleConsumer<N>;
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl<const N: usize> DerefMut for Input<N> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+pub(super) struct Input(SampleRb<CHANNEL_BUFFER_SIZE>, Notify);
+impl ChannelType for Input {
+    fn new() -> Self {
+        Self(SampleRb::default(), Notify::default())
     }
 }
 
@@ -59,20 +54,23 @@ impl AudioMixer {
         channel_mode: ChannelCount,
         sample_format: SampleFormat,
         sample_rate: SampleRate,
-    ) -> Result<Input<CHANNEL_BUFFER_SIZE>, Box<dyn Error>> {
-        let (channel, consumer) =
-            Channel::<_, Input<CHANNEL_BUFFER_SIZE>>::new(channel_mode, sample_format, sample_rate);
+    ) -> Result<SampleConsumer, Box<dyn Error>> {
+        let channel = Channel::<Input>::new(channel_mode, sample_format, sample_rate);
+        let Input(rb, notify) = &channel.interface;
+        let consumer = SampleConsumer(CachingCons::new(rb.clone()), notify.clone());
 
         if let Some(master) = &mut self.input
             && let Some(stream) = &mut master.stream
         {
-            let sample_producer = CachingProd::new(channel.rb.clone());
+            let sample_producer = CachingProd::new(rb.clone());
             stream
                 .to_audio_thread
-                .try_push(InputRxEvent::AddInputChannel(sample_producer))
+                .try_push(InputRxEvent::AddInputChannel(
+                    sample_producer,
+                    notify.clone(),
+                ))
                 .map_err(|err| format!("Could not exec: {:?}", err))?;
         }
-
         self.input_channels.push(channel);
 
         Ok(consumer)
@@ -85,30 +83,36 @@ impl AudioMixer {
 
             stream_config.sample_rate = 48_000; // TODO: Determine by device preference in future
 
-            let (prod, mut cons) = StaticRb::default().split();
+            let (event_prod, mut event_cons) = StaticRb::default().split();
             let stream_close_notification = Notify::new();
             let send_stream_close_notification = stream_close_notification.clone();
 
             let mut sample_producers = self
                 .input_channels
                 .iter()
-                .map(|channel| CachingProd::new(channel.rb.clone()))
-                .collect::<Vec<SampleProducer<CHANNEL_BUFFER_SIZE>>>();
+                .map(|channel| {
+                    let Input(rb, notify) = &channel.interface;
+                    (CachingProd::new(rb.clone()), notify.clone())
+                })
+                .collect::<Vec<_>>();
             let stream = input
                 .device
                 .build_input_stream(
                     &stream_config,
                     move |data: &[AudioSampleType], &_| {
-                        for event in cons.pop_iter() {
+                        for event in event_cons.pop_iter() {
                             match event {
-                                InputRxEvent::AddInputChannel(prod) => {
-                                    sample_producers.push(prod);
+                                InputRxEvent::AddInputChannel(prod, notify) => {
+                                    sample_producers.push((prod, notify));
                                 }
                             };
                         }
-                        sample_producers.retain(|producers| producers.read_is_held());
+
+                        sample_producers.retain(|producers| producers.0.read_is_held());
                         if sample_producers.is_empty() {
+                            info!("Closing input audio stream");
                             send_stream_close_notification.notify();
+                            return;
                         }
 
                         for sample_producer in sample_producers.iter_mut() {
@@ -125,7 +129,8 @@ impl AudioMixer {
                             };
 
                             if frame_rms > NOISE_FLOOR {
-                                sample_producer.push_iter(data.iter().copied());
+                                sample_producer.0.push_iter(data.iter().copied());
+                                sample_producer.1.notify();
                             }
                         }
                     },
@@ -139,7 +144,7 @@ impl AudioMixer {
             stream.play().unwrap();
             input.stream = Some(crate::InputStream {
                 stream,
-                to_audio_thread: prod,
+                to_audio_thread: event_prod,
             });
             return Some(stream_close_notification);
         }
