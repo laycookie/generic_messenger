@@ -1,6 +1,8 @@
 use iced::{
     Color, Element, Length, Padding,
-    widget::{Button, Column, Scrollable, Text, button, column, container, image, row, text::Wrapping},
+    widget::{
+        Button, Column, Scrollable, Text, button, column, container, image, row, text::Wrapping,
+    },
 };
 use iced_palace::widget::ellipsized_text;
 use messenger_interface::types::{Identifier, Place, Room, RoomCapabilities};
@@ -13,7 +15,6 @@ pub struct Server {
     pub handle: MessangerHandle,
     pub channels: Vec<Identifier<Place<Room>>>,
 }
-
 impl Server {
     pub fn new(handle: MessangerHandle, channels: Vec<Identifier<Place<Room>>>) -> Self {
         Self { handle, channels }

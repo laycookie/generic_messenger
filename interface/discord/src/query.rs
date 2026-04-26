@@ -10,8 +10,7 @@ use messenger_interface::{
     stream::{ArcStream, WeakSocketStream},
     types::{House, Identifier, Message, Place, Reaction, Room, RoomCapabilities, User},
 };
-use simple_audio_channels::input::SampleConsumer;
-use tracing::error;
+use tracing::{error, info};
 
 use std::{error::Error, sync::Arc};
 
@@ -35,8 +34,8 @@ impl InnerDiscord<Owned> {
         let rooms_producer = channels
             .iter()
             .map(async move |channel| {
-                let (name, icon, room_data) = channel.to_room_data().await;
-                Discord::identifier_generator(channel.id, Place::new(name, icon, room_data))
+                let place_room = channel.to_room_data().await;
+                Discord::identifier_generator(channel.id, place_room)
             })
             .collect::<Vec<_>>();
 
@@ -313,13 +312,19 @@ impl Text for InnerDiscord<Owned> {
                     })
                     .collect();
 
-                // TODO(discord-migration): messenger_interface::types::Message currently has no author field.
-                // If UI needs author, we should reintroduce it in the interface types.
+                let author = messenger_interface::types::Identifier::new(
+                    message.author.id,
+                    messenger_interface::types::User {
+                        name: message.author.username,
+                        icon: None,
+                    },
+                );
                 let identifier = Discord::identifier_generator(
                     message.id,
                     Message {
                         text: message.content,
                         reactions,
+                        author: Some(author),
                     },
                 );
 
@@ -391,9 +396,14 @@ impl ArcStream for InnerDiscord<TextDiscord> {
     async fn next(self: Arc<Self>) -> Option<<Self as ArcStream>::Item> {
         loop {
             if let Some(event) = self.text_events.pop() {
+                info!("Poped");
                 return Some(event);
+            } else {
+                info!("Queue empty");
             }
+            info!("Polling");
             self.poll_for_events().await;
+            info!("Polled");
         }
     }
 }

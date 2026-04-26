@@ -15,7 +15,7 @@ mod components;
 mod messanger_unifier;
 mod pages;
 
-use tracing::{Level, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 use tracing_subscriber::FmtSubscriber;
 
 pub enum Screen {
@@ -29,7 +29,9 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = FmtSubscriber::builder()
         .without_time()
         .with_line_number(true)
-        .with_max_level(Level::INFO)
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "record=trace,discord=trace,info",
+        ))
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
@@ -72,45 +74,28 @@ impl App {
     fn boot() -> (Self, Task<AppMessage>) {
         let mut app = App::new(Messangers::default(), Screen::Loading);
 
-        let messangers = MessangersGenerator::messengers_from_file("./LoginInfo".into());
-
-        match messangers {
+        let messangers = match MessangersGenerator::messengers_from_file("./LoginInfo".into()) {
             Ok(messangers) => {
                 if messangers.len() > 0 {
                     app.messangers = messangers;
                     true
                 } else {
-                    false
-                };
-            }
-            Err(err) => {
-                error!("{err:#?}");
-            }
-        };
-
-        let loaded_messangers =
-            match MessangersGenerator::messengers_from_file("./LoginInfo".into()) {
-                Ok(messangers) => {
-                    if messangers.len() > 0 {
-                        app.messangers = messangers;
-                        true
-                    } else {
-                        trace!("No massengers were found");
-                        app.page = Screen::Login(Login::default());
-                        false
-                    }
-                }
-                Err(err) => {
-                    error!("{err}");
+                    trace!("No massengers were found");
                     app.page = Screen::Login(Login::default());
                     false
                 }
-            };
+            }
+            Err(err) => {
+                error!("{err}");
+                app.page = Screen::Login(Login::default());
+                false
+            }
+        };
 
         let (_window_id, window_task) = window::open(window::Settings::default());
         (
             app,
-            window_task.then(move |_| match loaded_messangers {
+            window_task.then(move |_| match messangers {
                 true => Task::done(AppMessage::StartUp),
                 false => Task::none(),
             }),
@@ -147,6 +132,7 @@ impl App {
                         data.conversations = conversations;
                         data.guilds = servers;
                     }
+                    pages::MessangerData::Servers(servers) => data.guilds = servers,
                     pages::MessangerData::Chat((id, v)) => {
                         data.chats.insert(id, v);
                     }
@@ -333,28 +319,43 @@ impl App {
                             }
                         };
                     }
-                    SocketEvent::ChannelCreated { r#where, room } => {
+                    SocketEvent::ChannelCreated {
+                        r#where,
+                        room: new_room,
+                    } => {
                         let d = self.messangers.mut_data_from_handle(handle).unwrap();
 
                         match r#where {
                             None => {
                                 // It's a DM or group DM, add to conversations
-                                // if !d.conversations.iter().any(|r| r.id() == room.id()) {
-                                //     d.conversations.push(room);
-                                // }
+                                if !d.conversations.iter().any(|r| r.id() == new_room.id()) {
+                                    d.conversations.push(new_room);
+                                }
                             }
                             Some(server_id) => {
                                 info!("Adding: {server_id:?}");
+                                if let Some(server) =
+                                    d.guilds.iter_mut().find(|g| g.id() == server_id.id())
+                                {
+                                    info!("Server");
+                                    if let Some(rooms) = server.rooms.as_mut() {
+                                        info!("Rooms");
+                                        if !rooms.iter().any(|r| r.id() == new_room.id()) {
+                                            info!("Room");
+                                        }
+                                    }
+                                }
                                 // It's a channel in a server, add to the server's rooms
-                                // if let Some(server_identifier) =
-                                //     d.guilds.iter_mut().find(|g| g.id() == server_id.id())
-                                // {
-                                //     let mut house = (**server_identifier).clone();
-                                //     if !house.rooms.iter().any(|r| r.id() == room.id()) {
-                                //         house.rooms.push(room);
-                                //         *server_identifier = server_identifier.swap_data(house);
-                                //     }
-                                // }
+                                if let Some(server) =
+                                    d.guilds.iter_mut().find(|g| g.id() == server_id.id())
+                                    && let Some(rooms) = server.rooms.as_mut()
+                                    && !rooms.iter().any(|r| r.id() == new_room.id())
+                                {
+                                    info!("Added: {new_room:?}");
+                                    rooms.push(new_room);
+                                } else {
+                                    info!("COULDN'T FIND SERVER FEATCHED");
+                                }
                             }
                         }
                     }
@@ -470,6 +471,12 @@ impl App {
                 };
                 match chat.update(message, &self.messangers) {
                     pages::messenger::Action::None => Task::none(),
+                    pages::messenger::Action::UpdateMessanger((handle, data)) => {
+                        Task::done(AppMessage::SetMessangerData {
+                            messanger_handle: handle,
+                            new_data: data,
+                        })
+                    }
                     pages::messenger::Action::UpdateChat { handle, kv } => {
                         Task::done(AppMessage::SetMessangerData {
                             messanger_handle: handle,
@@ -478,7 +485,6 @@ impl App {
                     }
                     pages::messenger::Action::Call { interface, channel } => {
                         let api = interface.api.to_owned();
-                        let handle = interface.handle;
 
                         Task::future(async move {
                             let vc = api.voice();
@@ -491,17 +497,9 @@ impl App {
                             };
                             // Convert Place<Room> to Room for voice API
                             let room_id = channel.swap_data((*channel).clone());
-                            vc.connect(&room_id).await;
-
-                            // let vc_stream = match vc.listen().await {
-                            //     Ok(stream) => Task::stream(stream.map(move |event| {
-                            //         AppMessage::SocketEvent((handle, event.into()))
-                            //     })),
-                            //     Err(err) => {
-                            //         error!("{err:?}");
-                            //         Task::none()
-                            //     }
-                            // };
+                            if let Err(err) = vc.connect(&room_id).await {
+                                error!("{err}");
+                            };
 
                             Task::done(AppMessage::SetMessangerData {
                                 messanger_handle: interface.handle,

@@ -8,6 +8,7 @@ use std::{
 };
 
 use arc_swap::ArcSwapOption;
+use asyncs_sync::Notify;
 use crossbeam::queue::SegQueue;
 use futures::{channel::oneshot, lock::Mutex as AsyncMutex};
 use futures_locks::RwLock as RwLockAwait;
@@ -36,6 +37,32 @@ struct ChannelID {
 type GuildID = SNOWFLAKE;
 type MessageID = SNOWFLAKE;
 
+/// Public interface for creating the discord messanger
+pub struct Discord;
+impl Discord {
+    pub fn new_messenger(token: &str) -> Arc<dyn Messenger> {
+        Arc::new(InnerDiscord {
+            token: token.into(),
+            intents: 194557,
+            audio_manager: Default::default(),
+            gateaway: Default::default(),
+            pulled_notification: Default::default(),
+            query_events: SegQueue::new(),
+            text_events: SegQueue::new(),
+            voice_events: SegQueue::new(),
+            audio_events: SegQueue::new(),
+            profile: RwLockAwait::new(None),
+            guild_id_mappings: RwLockAwait::new(HashMap::new()),
+            channel_id_mappings: RwLockAwait::new(HashMap::new()),
+            msg_data: RwLockAwait::new(HashMap::new()),
+            _marker: PhantomData,
+        })
+    }
+    fn identifier_generator<D>(id: SNOWFLAKE, data: D) -> Identifier<D> {
+        Identifier::new(id, data)
+    }
+}
+
 trait UnitStruct {}
 
 struct Owned;
@@ -55,7 +82,7 @@ struct AudioManager {
     microphone: Option<SampleConsumer>,
 }
 
-pub struct InnerDiscord<T> {
+struct InnerDiscord<T: UnitStruct> {
     // Metadata
     token: SecureString,
     intents: u32,
@@ -63,6 +90,7 @@ pub struct InnerDiscord<T> {
     audio_manager: AsyncMutex<AudioManager>,
     // socket related
     gateaway: ArcSwapOption<Gateaway<General>>,
+    pulled_notification: Notify,
     // event queues
     query_events: SegQueue<QueryEvent>,
     text_events: SegQueue<TextEvent>,
@@ -76,7 +104,7 @@ pub struct InnerDiscord<T> {
     // etc
     _marker: PhantomData<T>,
 }
-impl<T> InnerDiscord<T> {
+impl<T: UnitStruct> InnerDiscord<T> {
     async unsafe fn cast_and_downgrade<C: UnitStruct>(self: Arc<Self>) -> Weak<InnerDiscord<C>> {
         if self.gateaway.load().is_none() {
             self.gateaway.store(Some(Arc::new(
@@ -87,31 +115,6 @@ impl<T> InnerDiscord<T> {
         let weak = Arc::downgrade(&self);
         let ptr = Weak::into_raw(weak) as *const InnerDiscord<C>;
         unsafe { Weak::from_raw(ptr) }
-    }
-}
-
-#[repr(transparent)]
-pub struct Discord;
-impl Discord {
-    pub fn new_messenger(token: &str) -> Arc<dyn Messenger> {
-        Arc::new(InnerDiscord {
-            token: token.into(),
-            intents: 194557,
-            audio_manager: Default::default(),
-            gateaway: Default::default(),
-            query_events: SegQueue::new(),
-            text_events: SegQueue::new(),
-            voice_events: SegQueue::new(),
-            audio_events: SegQueue::new(),
-            profile: RwLockAwait::new(None),
-            guild_id_mappings: RwLockAwait::new(HashMap::new()),
-            channel_id_mappings: RwLockAwait::new(HashMap::new()),
-            msg_data: RwLockAwait::new(HashMap::new()),
-            _marker: PhantomData,
-        })
-    }
-    fn identifier_generator<D>(id: SNOWFLAKE, data: D) -> Identifier<D> {
-        Identifier::new(id, data)
     }
 }
 

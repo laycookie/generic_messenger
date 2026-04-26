@@ -103,6 +103,7 @@ impl Chat {
                             InterfaceMessage {
                                 text: contents,
                                 reactions: Vec::new(),
+                                author: None,
                             },
                         )
                         .await

@@ -4,7 +4,12 @@ LoginInfo
 
 /.idea
 /.cursor
+/.claude
 
 Cargo.lock
+# Note that flake.lock is not supposed to be here, unlike other packet
+# managers, the version of proggrames are stored in the lock file, and
+# not in the flake.nix
+# flake.lock 
 
 .direnv

@@ -11,4 +11,4 @@ tracing = { workspace = true }
 futures = { workspace = true }
 ringbuf = "0.4.8"
 # async-broadcast = "0.7.2"
-cpal = "0.17.0"
+cpal = "0.17.3"

@@ -3,11 +3,14 @@ use std::error::Error;
 use crate::{
     components::divider::Divider,
     messanger_unifier::{Call, MessangerHandle, MessangerInterface, Messangers},
-    pages::messenger::{
-        chat::{Action as ChatAction, Chat},
-        contacts::{Contacts, Message as ContactsMessage},
-        conversation_sidebar::{Action as SidebarAction, Server, Sidebar},
-        navbar::{Action as NavbarAction, Navbar},
+    pages::{
+        MessangerData,
+        messenger::{
+            chat::{Action as ChatAction, Chat},
+            contacts::{Contacts, Message as ContactsMessage},
+            conversation_sidebar::{Action as SidebarAction, Server, Sidebar},
+            navbar::{Action as NavbarAction, Navbar},
+        },
     },
 };
 
@@ -35,6 +38,8 @@ pub(crate) enum Message {
     ChangeMain(Main),
     SetSidebarServer(Option<Server>), // TODO: Make it just a SetSidebar
     DividerChange(f32),
+    UpdateMessanger((MessangerHandle, MessangerData)),
+    // TODO: Depricate UpdateChat, switch to use UpdateMessenger
     UpdateChat {
         handle: MessangerHandle,
         kv: (ID, Vec<Identifier<InterfaceMessage>>),
@@ -67,6 +72,7 @@ pub enum Action {
         handle: MessangerHandle,
         kv: (ID, Vec<Identifier<InterfaceMessage>>),
     },
+    UpdateMessanger((MessangerHandle, MessangerData)),
     Run(Task<Message>),
     Call {
         interface: MessangerInterface,
@@ -94,6 +100,9 @@ impl Messenger {
                 Action::None
             }
             Message::UpdateChat { handle, kv } => Action::UpdateChat { handle, kv },
+            Message::UpdateMessanger((messanger_handle, messanger_data)) => {
+                Action::UpdateMessanger((messanger_handle, messanger_data))
+            }
             Message::Chat(msg) => {
                 if let Main::Chat(chat) = &mut self.main {
                     return match msg {
@@ -135,53 +144,35 @@ impl Messenger {
                     if server.rooms.is_some() {
                         // Extract rooms from House data
                         let channels = server.rooms.clone().unwrap_or_default();
-                        return Action::Run(Task::done(Message::SetSidebarServer(Some(Server::new(
-                            interface.handle,
-                            channels,
-                        )))));
+                        return Action::Run(Task::done(Message::SetSidebarServer(Some(
+                            Server::new(interface.handle, channels),
+                        ))));
                     }
 
                     // Rooms not loaded, fetch them via house_details
-                    Action::Run(Task::future({
-                        let interface = interface.to_owned();
-                        let server = server.clone();
-                        async move {
-                            let query = interface.query();
-                            match query {
-                                Ok(q) => {
-                                    match q.house_details(server).await {
-                                        Ok(house) => {
-                                            // Use the fetched rooms
-                                            let channels = house.rooms.clone().unwrap_or_default();
-                                            Ok((interface.handle, channels))
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to fetch house details: {e:#?}");
-                                            Err(e)
-                                        }
-                                    }
-                                }
+                    Action::Run(
+                        Task::future({
+                            let interface = interface.to_owned();
+                            let server = server.clone();
+                            async move {
+                                let query = interface.query()?;
+                                let house = query.house_details(server).await?;
+                                // Use the fetched rooms
+                                Ok((interface.handle, house.rooms))
+                            }
+                        })
+                        .then(
+                            |result: Result<_, Box<dyn Error + Send + Sync>>| match result {
+                                Ok((handle, channels)) => Task::done(Message::SetSidebarServer(
+                                    Some(Server::new(handle, channels.unwrap_or_default())),
+                                )),
                                 Err(e) => {
-                                    error!("Query not available: {e:?}");
-                                    Err(Box::new(e) as Box<dyn Error + Send + Sync>)
+                                    error!("{e:#?}");
+                                    Task::none()
                                 }
-                            }
-                        }
-                    })
-                    .then(|result| {
-                        match result {
-                            Ok((handle, channels)) => {
-                                Task::done(Message::SetSidebarServer(Some(Server::new(
-                                    handle,
-                                    channels,
-                                ))))
-                            }
-                            Err(e) => {
-                                error!("Error fetching house details: {e:#?}");
-                                Task::none()
-                            }
-                        }
-                    }))
+                            },
+                        ),
+                    )
                 }
             },
             Message::Sidebar(action) => match action {
@@ -235,14 +226,7 @@ impl Messenger {
                                 let msgs = text.get_messages(&conversation, None).await?;
                                 let handle = interface.handle;
 
-                                Ok::<
-                                    (
-                                        MessangerHandle,
-                                        Identifier<Place<Room>>,
-                                        Vec<Identifier<InterfaceMessage>>,
-                                    ),
-                                    Box<dyn Error + Send + Sync>,
-                                >((handle, conversation, msgs))
+                                Ok((handle, conversation, msgs))
                             }
                         })
                         .then(

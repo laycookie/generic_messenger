@@ -243,7 +243,7 @@ pub enum SocketEvent {
     /// A channel/room was created (optionally within a server/place).
     ChannelCreated {
         r#where: Option<Identifier<()>>,
-        room: Identifier<Room>,
+        room: Identifier<Place<Room>>,
     },
     CallStatusUpdate(CallStatus),
     /// Request to attach an audio source into the audio graph.
@@ -299,7 +299,7 @@ pub enum QueryEvent {
     ChannelCreated {
         r#where: Option<Identifier<()>>,
         // r#where: Option<Identifier<Place<House>>>,
-        room: Identifier<Room>,
+        room: Identifier<Place<Room>>,
     },
 }
 pub enum TextEvent {

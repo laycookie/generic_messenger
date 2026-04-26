@@ -1,5 +1,9 @@
 use bitflags::bitflags;
-use std::{hash::Hash, ops::Deref, path::PathBuf};
+use std::{
+    hash::Hash,
+    ops::{Deref, DerefMut},
+    path::PathBuf,
+};
 
 /// Unique identifier type used throughout the messenger interface.
 pub type ID = u64;
@@ -43,6 +47,11 @@ impl<D> Deref for Identifier<D> {
         &self.data
     }
 }
+impl<D> DerefMut for Identifier<D> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
 impl<D, E> PartialEq<Identifier<E>> for Identifier<D> {
     fn eq(&self, other: &Identifier<E>) -> bool {
         self.id == other.id
@@ -74,6 +83,8 @@ pub struct Message {
     pub text: String,
     /// List of reactions on this message.
     pub reactions: Vec<Reaction>,
+    /// The author of this message, if known.
+    pub author: Option<Identifier<User>>,
 }
 
 /// Bitflags representing the capabilities supported by a room/channel.
@@ -182,7 +193,7 @@ pub struct Place<PD> {
     /// Optional path to the place's icon/avatar image.
     pub icon: Option<PathBuf>,
     /// Type-specific data (Room or House).
-    place_data: PD,
+    pub place_data: PD,
 }
 impl<PD> Place<PD> {
     /// Create a new Place with the given name, icon, and place data.
@@ -199,5 +210,10 @@ impl<PD> Deref for Place<PD> {
 
     fn deref(&self) -> &Self::Target {
         &self.place_data
+    }
+}
+impl<PD> DerefMut for Place<PD> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.place_data
     }
 }

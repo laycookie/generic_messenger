@@ -11,11 +11,11 @@ use messenger_interface::{
     interface::SocketEvent,
     types::{House, ID, Identifier, Message, Place, Room, User},
 };
-use std::{fmt::Debug, task::Waker};
+use std::fmt::Debug;
 
 use crate::Screen;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum MessangerData {
     Everything {
         profile: Identifier<User>,
@@ -23,6 +23,7 @@ pub(crate) enum MessangerData {
         conversations: Vec<Identifier<Place<Room>>>,
         servers: Vec<Identifier<Place<House>>>,
     },
+    Servers(Vec<Identifier<Place<House>>>),
     Chat((ID, Vec<Identifier<Message>>)),
     Call(Call),
 }

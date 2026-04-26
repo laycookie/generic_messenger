@@ -1,5 +1,5 @@
 use facet::Facet;
-use messenger_interface::types::{Identifier, Room, RoomCapabilities};
+use messenger_interface::types::{Identifier, Place, Room, RoomCapabilities};
 use tracing::error;
 
 use crate::{Discord, downloaders::cache_download};
@@ -124,14 +124,14 @@ pub struct Channel {
 impl Channel {
     // TODO: This method is deprecated - use to_room_data() instead
     // Kept for backward compatibility during migration
-    pub async fn to_room(&self) -> (String, Option<std::path::PathBuf>, Room) {
-        let (name, icon, room) = self.to_room_data().await;
-        (name, icon, room)
+    #[deprecated]
+    pub async fn to_room(&self) -> Place<Room> {
+        self.to_room_data().await
     }
 
     /// Extract room data, name, and icon from a channel.
     /// Returns (name, icon, room_data).
-    pub async fn to_room_data(&self) -> (String, Option<std::path::PathBuf>, Room) {
+    pub async fn to_room_data(&self) -> Place<Room> {
         let name = self.name.to_owned().unwrap_or_else(|| {
             self.recipients
                 .as_ref()
@@ -197,7 +197,11 @@ impl Channel {
             None,
         );
 
-        (name, icon, room)
+        Place {
+            name,
+            icon,
+            place_data: room,
+        }
     }
 }
 

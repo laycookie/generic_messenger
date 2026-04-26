@@ -70,12 +70,18 @@ where
 
 pub fn message_text<'a, M: Clone + 'static>(msg: &'a Identifier<Message>) -> Element<'a, M> {
     // === Author ===
-    // TODO(record-migration): `messenger_interface::types::Message` no longer includes an author.
-    // If the UI should display author names/avatars, we should reintroduce it in the interface types
-    // (and have adapters populate it).
-    let icon: std::path::PathBuf = "./public/imgs/placeholder.jpg".into();
+    let icon: std::path::PathBuf = msg
+        .author
+        .as_ref()
+        .and_then(|a| a.icon.clone())
+        .unwrap_or_else(|| "./public/imgs/placeholder.jpg".into());
     let image_height = Length::Fixed(36.0);
-    let author = Text::from("Unknown");
+    let author_name: &str = msg
+        .author
+        .as_ref()
+        .map(|a| a.name.as_str())
+        .unwrap_or("Unknown");
+    let author = Text::from(author_name);
 
     // === Create Message text box ===
     let mut spans: std::vec::Vec<Span<'_>> = Vec::new();
