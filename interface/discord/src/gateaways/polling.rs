@@ -243,7 +243,6 @@ impl<T: UnitStruct> InnerDiscord<T> {
             if let Some(deserilized_event) = match event {
                 Some(Ok(event)) => match event {
                     WebsocketMessage::Text(utf8_bytes) => {
-                        info!("Gateway raw text: {utf8_bytes}");
                         match facet_json::from_str::<GatewayPayload<Opcode>>(&utf8_bytes) {
                             Ok(event) => {
                                 info!("Parsed gateway event OK: op={:?} t={:?}", event.op, event.t);

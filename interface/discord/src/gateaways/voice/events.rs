@@ -16,14 +16,14 @@ use tracing::{error, info, warn};
 
 use async_tungstenite::tungstenite::Message;
 
-use crate::{AudioDiscord, InnerDiscord, UnitStruct};
-use crate::api_types::SNOWFLAKE;
-use crate::gateaways::{GatewayPayload, Websocket};
 use super::{
     VoiceOpcode,
     connection::{Connection, EncryptionMode, SessionDescription},
     payloads::{DAVEPrepareEpoch, ReadyPayload, SpeakingPayload},
 };
+use crate::api_types::SNOWFLAKE;
+use crate::gateaways::{GatewayPayload, Websocket};
+use crate::{AudioDiscord, InnerDiscord, UnitStruct};
 
 // Local types for IP discovery packet layout.
 // Only used in the VoiceOpcode::Ready handler below.
@@ -90,8 +90,7 @@ impl GatewayPayload<VoiceOpcode> {
         info!("VoiceOpcode: {:?}", self.op);
         match self.op {
             VoiceOpcode::SessionDescription => {
-                let session_description =
-                    facet_value::from_value::<SessionDescription>(self.d)?;
+                let session_description = facet_value::from_value::<SessionDescription>(self.d)?;
 
                 // Init DAVE
                 let mut dave_session = voice_gateaway.dave_session.lock().await;
@@ -159,8 +158,8 @@ impl GatewayPayload<VoiceOpcode> {
 
                 let mut buf = [0u8; 74];
                 match udp.recv(&mut buf).await {
-                    Ok(len) => println!("Got {len} bytes\n{buf:?}"),
-                    Err(e) => eprintln!("No response: {e:?}"),
+                    Ok(len) => info!("Got {len} bytes\n{buf:?}"),
+                    Err(e) => error!("No response: {e:?}"),
                 }
                 let recv_ip_discovery = unsafe { mem::transmute::<[u8; 74], IpDiscovery>(buf) };
 

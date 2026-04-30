@@ -1,8 +1,4 @@
-use std::{
-    error::Error,
-    sync::OnceLock,
-    time::Instant,
-};
+use std::{error::Error, sync::OnceLock, time::Instant};
 
 use dashmap::DashMap;
 use davey::{Codec, DaveSession, MediaType};
@@ -263,10 +259,6 @@ impl SendAudioFuture<'_> {
                     ..RTP_HEADER_LEN + encrypted.len() + nonce_u32.len()]
                     .copy_from_slice(&nonce_u32);
 
-                info!(
-                    "{:?}",
-                    &self.rtp_packet_buf[..RTP_HEADER_LEN + encrypted.len() + nonce_u32.len()]
-                );
                 self.udp
                     .send(
                         &self.rtp_packet_buf[..RTP_HEADER_LEN + encrypted.len() + nonce_u32.len()],

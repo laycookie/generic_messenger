@@ -50,7 +50,7 @@ impl GatewayPayload<Opcode> {
                     GatewayEvent::SessionsReplace => {
                         info!("Session replace");
                         let session = facet_value::from_value::<Vec<SessionObjectPayload>>(self.d)?;
-                        info!("{}", session.pretty());
+                        println!("{}", session.pretty());
                     }
                     GatewayEvent::VoiceStateUpdate => {
                         let voice_state = facet_value::from_value::<VoiceStatePayload>(self.d)?;

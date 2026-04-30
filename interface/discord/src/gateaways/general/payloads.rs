@@ -47,7 +47,7 @@ pub(super) struct VoiceStatePayload {
 }
 
 /// https://docs.discord.food/resources/presence#session-object
-#[derive(Facet)]
+#[derive(Debug, Facet)]
 pub(super) struct SessionObjectPayload {
     pub(super) session_id: String,
     // client_info: ?

@@ -1,7 +1,7 @@
 use facet::Facet;
 
-use crate::api_types::SNOWFLAKE;
 use super::connection::{EncryptionMode, Ssrc};
+use crate::api_types::SNOWFLAKE;
 
 /// <https://docs.discord.food/topics/voice-connections#hello-structure>
 #[derive(Facet)]
@@ -24,7 +24,7 @@ pub(super) struct ReadyPayload {
 /// <https://docs.discord.food/topics/voice-connections#speaking-structure>
 #[derive(Facet)]
 pub(super) struct SpeakingPayload {
-    pub(super) speaking: bool, // Should be u8
+    pub(super) speaking: u8,
     pub(super) ssrc: Ssrc,
     pub(super) user_id: SNOWFLAKE, // Only sent by the voice server.
     pub(super) delay: Option<u32>, // Not sent by the voice server.

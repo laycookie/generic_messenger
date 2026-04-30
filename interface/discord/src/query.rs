@@ -396,14 +396,9 @@ impl ArcStream for InnerDiscord<TextDiscord> {
     async fn next(self: Arc<Self>) -> Option<<Self as ArcStream>::Item> {
         loop {
             if let Some(event) = self.text_events.pop() {
-                info!("Poped");
                 return Some(event);
-            } else {
-                info!("Queue empty");
             }
-            info!("Polling");
             self.poll_for_events().await;
-            info!("Polled");
         }
     }
 }

@@ -1,8 +1,4 @@
-use std::{
-    error::Error,
-    mem,
-    sync::Arc,
-};
+use std::{error::Error, mem, sync::Arc};
 
 use arc_swap::ArcSwapOption;
 use facet::Facet;
@@ -11,9 +7,9 @@ use futures::lock::Mutex as AsyncMutex;
 use num_enum::TryFromPrimitive;
 use simple_audio_channels::{input::SampleConsumer, output::SampleProducer};
 
-use crate::{ChannelID, api_types::SNOWFLAKE};
-use crate::gateaways::Gateaway;
 use self::gateway::Voice;
+use crate::gateaways::Gateaway;
+use crate::{ChannelID, api_types::SNOWFLAKE};
 
 pub(super) mod connection;
 mod events;
@@ -44,11 +40,18 @@ pub enum VoiceOpcode {
     Heartbeat = 3,
     SessionDescription = 4,
     Speaking = 5,
+    HeartbeatACK = 6,
+    Resume = 7,
     Hello = 8,
+    Resumed = 9,
     ClientConnect = 11,
     Video = 12,
     ClientDisconnect = 13,
+    SessionUpdate = 14,
+    MediaSinkWants = 15,
+    VoiceBackendVersion = 16,
     ClientFlags = 18,
+    SpeedTest = 19,
     ClientPlatform = 20,
     DAVEProtocolPrepareTransition = 21,
     DAVEProtocolExecuteTransition = 22,
