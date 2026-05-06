@@ -75,65 +75,64 @@ impl AudioMixer {
         Ok(producer)
     }
 
-    pub fn start_stream_output(&mut self) -> Option<Notify> {
-        if let Some(output) = &mut self.output {
-            // TODO: Return Result instead of Option so device errors can propagate
-            let config = output.device.default_output_config().unwrap();
-            let mut stream_config = config.config();
+    pub fn start_stream_output(&mut self) -> Result<Option<Notify>, Box<dyn Error>> {
+        let Some(output) = &mut self.output else {
+            return Ok(None);
+        };
 
-            stream_config.sample_rate = 48_000; // TODO: Determine by device preference in future
+        let config = output.device.default_output_config()?;
+        let mut stream_config = config.config();
 
-            debug!("Starting output stream with config: {:#?}", stream_config);
+        stream_config.sample_rate = 48_000; // TODO: Determine by device preference in future
 
-            let mut sample_consumers = self
-                .output_channels
-                .iter()
-                .map(|channel| CachingCons::new(channel.interface.0.clone()))
-                .collect::<Vec<SampleConsum<CHANNEL_BUFFER_SIZE>>>();
+        debug!("Starting output stream with config: {:#?}", stream_config);
 
-            let (prod, mut cons) = StaticRb::default().split();
-            let stream_close_notification = Notify::new();
-            let send_stream_close_notification = stream_close_notification.clone();
-            let stream = output
-                .device
-                .build_output_stream(
-                    &stream_config,
-                    move |data: &mut [AudioSampleType], _| {
-                        for event in cons.pop_iter() {
-                            match event {
-                                OutputRxEvent::AddOutputChannel(cons) => {
-                                    sample_consumers.push(cons);
-                                }
-                            };
-                        }
-                        sample_consumers.retain(|consumer| consumer.write_is_held());
-                        if sample_consumers.is_empty() {
-                            send_stream_close_notification.notify();
-                        }
-                        // Mix audio from all channels
-                        for stream_sample in data.iter_mut() {
-                            *stream_sample = sample_consumers
-                                .iter_mut()
-                                .map(|consumer| consumer.try_pop().unwrap_or(0.0))
-                                .sum::<AudioSampleType>()
-                                .clamp(-1.0, 1.0);
-                        }
-                    },
-                    move |err| {
-                        error!("Audio stream error: {err:?}");
-                    },
-                    None,
-                )
-                .unwrap();
+        let mut sample_consumers = self
+            .output_channels
+            .iter()
+            .map(|channel| CachingCons::new(channel.interface.0.clone()))
+            .collect::<Vec<SampleConsum<CHANNEL_BUFFER_SIZE>>>();
 
-            stream.play().unwrap();
-            output.stream = Some(crate::OutputStream {
-                stream,
-                to_audio_thread: prod,
-            });
-            return Some(stream_close_notification);
-        }
-        None
+        let (prod, mut cons) = StaticRb::default().split();
+        let stream_close_notification = Notify::new();
+        let send_stream_close_notification = stream_close_notification.clone();
+        let stream = output
+            .device
+            .build_output_stream(
+                &stream_config,
+                move |data: &mut [AudioSampleType], _| {
+                    for event in cons.pop_iter() {
+                        match event {
+                            OutputRxEvent::AddOutputChannel(cons) => {
+                                sample_consumers.push(cons);
+                            }
+                        };
+                    }
+                    sample_consumers.retain(|consumer| consumer.write_is_held());
+                    if sample_consumers.is_empty() {
+                        send_stream_close_notification.notify();
+                    }
+                    // Mix audio from all channels
+                    for stream_sample in data.iter_mut() {
+                        *stream_sample = sample_consumers
+                            .iter_mut()
+                            .map(|consumer| consumer.try_pop().unwrap_or(0.0))
+                            .sum::<AudioSampleType>()
+                            .clamp(-1.0, 1.0);
+                    }
+                },
+                move |err| {
+                    error!("Audio stream error: {err:?}");
+                },
+                None,
+            )?;
+
+        stream.play()?;
+        output.stream = Some(crate::OutputStream {
+            stream,
+            to_audio_thread: prod,
+        });
+        Ok(Some(stream_close_notification))
     }
 
     pub fn stop_stream_output(&mut self) {

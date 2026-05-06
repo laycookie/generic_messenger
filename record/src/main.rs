@@ -406,14 +406,19 @@ impl App {
                 Task::none()
             }
             AppMessage::StartOutputStream => {
-                if let Some(notify) = self.audio.start_stream_output() {
-                    return Task::future(async move {
-                        notify.notified().await;
-                    })
-                    .then(|_| Task::done(AppMessage::StopOutputStream));
-                } else {
-                    // TODO: Remove this after making control flow simpler
-                    error!("Stream is already running?");
+                match self.audio.start_stream_output() {
+                    Ok(Some(notify)) => {
+                        return Task::future(async move {
+                            notify.notified().await;
+                        })
+                        .then(|_| Task::done(AppMessage::StopOutputStream));
+                    }
+                    Ok(None) => {
+                        error!("No output device available");
+                    }
+                    Err(err) => {
+                        error!("Failed to start output stream: {err}");
+                    }
                 };
 
                 Task::none()
@@ -423,14 +428,19 @@ impl App {
                 Task::none()
             }
             AppMessage::StartInputStream => {
-                if let Some(notify) = self.audio.start_stream_input() {
-                    return Task::future(async move {
-                        notify.notified().await;
-                    })
-                    .then(|_| Task::done(AppMessage::StopInputStream));
-                } else {
-                    // TODO: Remove this after making control flow simpler
-                    error!("Input stream is already running?");
+                match self.audio.start_stream_input() {
+                    Ok(Some(notify)) => {
+                        return Task::future(async move {
+                            notify.notified().await;
+                        })
+                        .then(|_| Task::done(AppMessage::StopInputStream));
+                    }
+                    Ok(None) => {
+                        error!("No input device available");
+                    }
+                    Err(err) => {
+                        error!("Failed to start input stream: {err}");
+                    }
                 };
 
                 Task::none()
