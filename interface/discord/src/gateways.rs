@@ -19,7 +19,7 @@ use futures::{StreamExt, lock::Mutex as AsyncMutex};
 use futures_timer::Delay;
 use tracing::warn;
 
-use crate::gateaways::general::GatewayEvent;
+use crate::gateways::general::GatewayEvent;
 
 pub mod general;
 pub mod voice;
@@ -27,14 +27,14 @@ mod polling;
 
 struct Websocket {
     sender: AsyncMutex<WebSocketSender<ConnectStream>>,
-    reciver: AsyncMutex<WebSocketReceiver<ConnectStream>>,
+    receiver: AsyncMutex<WebSocketReceiver<ConnectStream>>,
 }
 impl Websocket {
     fn new(websocket: WebSocketStream<ConnectStream>) -> Self {
-        let (sender, reciver) = websocket.split();
+        let (sender, receiver) = websocket.split();
         Self {
             sender: sender.into(),
-            reciver: reciver.into(),
+            receiver: receiver.into(),
         }
     }
     async fn send(
@@ -59,22 +59,22 @@ impl Websocket {
     async fn next(
         &self,
     ) -> Option<Result<WebsocketMessage, async_tungstenite::tungstenite::Error>> {
-        if let Some(mut reciver) = self.reciver.try_lock() {
-            return reciver.next().await;
+        if let Some(mut receiver) = self.receiver.try_lock() {
+            return receiver.next().await;
         }
-        let mut reciver = self.reciver.lock().await;
-        reciver.next().await
+        let mut receiver = self.receiver.lock().await;
+        receiver.next().await
     }
 }
 
-pub struct Gateaway<T> {
+pub struct Gateway<T> {
     websocket: Websocket,
     heart_beating: AsyncMutex<HeartBeatingData>,
     last_sequence_number: OnceLock<AtomicUsize>,
     type_specific_data: T,
 }
-impl<T> Gateaway<T> {}
-impl<T> Deref for Gateaway<T> {
+impl<T> Gateway<T> {}
+impl<T> Deref for Gateway<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -107,11 +107,11 @@ impl<Op> GatewayPayload<Op> {
 }
 
 #[deprecated]
-trait GateawayStream {
-    async fn next_gateaway_payload<Op: Facet<'static>>(&mut self) -> GatewayPayload<Op>;
+trait GatewayStream {
+    async fn next_gateway_payload<Op: Facet<'static>>(&mut self) -> GatewayPayload<Op>;
 }
-impl GateawayStream for WebSocketStream<ConnectStream> {
-    async fn next_gateaway_payload<Op: Facet<'static>>(&mut self) -> GatewayPayload<Op> {
+impl GatewayStream for WebSocketStream<ConnectStream> {
+    async fn next_gateway_payload<Op: Facet<'static>>(&mut self) -> GatewayPayload<Op> {
         // NOTE: this trait can't return a Result, so we "best-effort" skip frames until a valid
         // text payload arrives.
         //

@@ -8,15 +8,15 @@ use iced_palace::widget::ellipsized_text;
 use messenger_interface::types::{Identifier, Place, Room, RoomCapabilities};
 
 use super::PLACEHOLDER_PFP;
-use crate::messanger_unifier::{Call, MessangerHandle, Messangers};
+use crate::messenger_unifier::{Call, MessengerHandle, Messengers};
 
 #[derive(Debug, Clone)]
 pub struct Server {
-    pub handle: MessangerHandle,
+    pub handle: MessengerHandle,
     pub channels: Vec<Identifier<Place<Room>>>,
 }
 impl Server {
-    pub fn new(handle: MessangerHandle, channels: Vec<Identifier<Place<Room>>>) -> Self {
+    pub fn new(handle: MessengerHandle, channels: Vec<Identifier<Place<Room>>>) -> Self {
         Self { handle, channels }
     }
 }
@@ -33,7 +33,7 @@ pub enum Action {
     Disconnect(Call),
     OpenContacts,
     OpenChat {
-        handle: crate::messanger_unifier::MessangerHandle,
+        handle: crate::messenger_unifier::MessengerHandle,
         conversation: Identifier<Place<Room>>,
     },
 }
@@ -46,7 +46,7 @@ impl Sidebar {
         }
     }
 
-    pub fn view<'a>(&'a self, messengers: &'a Messangers) -> Element<'a, Action> {
+    pub fn view<'a>(&'a self, messengers: &'a Messengers) -> Element<'a, Action> {
         let elements = match &self.server_selected {
             Some(server) => Column::from_iter(server.channels.iter().map(|chan| {
                 // If the backend provides a "category/spacer" row, represent it as a room with

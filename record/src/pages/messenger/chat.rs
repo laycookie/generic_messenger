@@ -7,12 +7,12 @@ use tracing::error;
 
 use crate::{
     components::message_text::message_text,
-    messanger_unifier::{MessangerInterface, Messangers},
+    messenger_unifier::{MessengerInterface, Messengers},
 };
 
 #[derive(Clone)]
 pub struct Chat {
-    interface: MessangerInterface,
+    interface: MessengerInterface,
     room: Identifier<Place<Room>>,
     msg_box: String,
 }
@@ -20,7 +20,7 @@ pub struct Chat {
 #[derive(Clone)]
 pub enum Action {
     Call {
-        interface: MessangerInterface,
+interface: MessengerInterface,
         room: Identifier<Place<Room>>,
     },
     Message(Message),
@@ -33,7 +33,7 @@ pub enum Message {
 }
 
 impl Chat {
-    pub fn new(interface: MessangerInterface, room: Identifier<Place<Room>>) -> Self {
+    pub fn new(interface: MessengerInterface, room: Identifier<Place<Room>>) -> Self {
         Self {
             interface,
             room,
@@ -41,7 +41,7 @@ impl Chat {
         }
     }
 
-    pub fn get_element<'a>(&self, messengers: &'a Messangers) -> Element<'a, Action> {
+    pub fn get_element<'a>(&self, messengers: &'a Messengers) -> Element<'a, Action> {
         let channel_info = row![
             Text::new(self.room.name.clone()),
             Button::new("CALL").on_press(Action::Call {

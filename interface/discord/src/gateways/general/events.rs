@@ -1,11 +1,11 @@
-use std::sync::atomic::Ordering;
+use std::{io, sync::atomic::Ordering};
 
 use facet_pretty::FacetPretty;
 use messenger_interface::{
     interface::{QueryEvent, TextEvent},
     types::{Identifier, Message as GlobalMessage, User as GlobalUser},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{
     GatewayEvent, Opcode,
@@ -14,21 +14,21 @@ use super::{
 use crate::{
     Discord, InnerDiscord, UnitStruct,
     api_types::{self, Message},
-    gateaways::{GatewayPayload, voice::Endpoint},
+    gateways::{GatewayPayload, voice::Endpoint},
 };
 
 impl GatewayPayload<Opcode> {
-    pub(in crate::gateaways) async fn exec<T: UnitStruct>(
+    pub(in crate::gateways) async fn exec<T: UnitStruct>(
         self,
         discord: &InnerDiscord<T>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let gateaway = discord.gateaway.load();
-        let Some(gateaway) = gateaway.as_ref() else {
-            return Err("TODO".into());
+        let gateway = discord.gateway.load();
+        let Some(gateway) = gateway.as_ref() else {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "gateway not connected").into());
         };
 
         if let Some(s) = self.s {
-            gateaway
+            gateway
                 .last_sequence_number
                 .get_or_init(|| s.into())
                 .store(s, Ordering::Relaxed);
@@ -41,21 +41,21 @@ impl GatewayPayload<Opcode> {
                     warn!("Dispatch opcode received without an event type (t)");
                     return Ok(());
                 };
-                info!("Dispatch event: {event_name:?}");
+                debug!("Dispatch event: {event_name:?}");
                 // https://discord.com/developers/docs/events/gateway-events#receive-events
                 match event_name {
                     GatewayEvent::Ready => {
-                        info!("importing data");
+                        debug!("importing data");
                     }
                     GatewayEvent::SessionsReplace => {
-                        info!("Session replace");
+                        debug!("Session replace");
                         let session = facet_value::from_value::<Vec<SessionObjectPayload>>(self.d)?;
-                        println!("{}", session.pretty());
+                        debug!("{}", session.pretty());
                     }
                     GatewayEvent::VoiceStateUpdate => {
                         let voice_state = facet_value::from_value::<VoiceStatePayload>(self.d)?;
 
-                        gateaway
+                        gateway
                             .voice
                             .insert_session_id(voice_state.session_id)
                             .await;
@@ -64,19 +64,19 @@ impl GatewayPayload<Opcode> {
                         let server_update =
                             facet_value::from_value::<VoiceServerUpdatePayload>(self.d)?;
 
-                        gateaway
+                        gateway
                             .voice
                             .insert_endpoint(Endpoint::new(
-                                server_update.endpoint.unwrap(),
+                                server_update.endpoint.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing voice server endpoint"))?,
                                 server_update.token,
                             ))
                             .await;
 
                         let profile = discord.profile.read().await;
                         let profile = profile.as_ref();
-                        let user_id = profile.unwrap().id;
+                        let user_id = profile.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "user profile not loaded"))?.id;
 
-                        match gateaway.voice.connect(user_id).await {
+                        match gateway.voice.connect(user_id).await {
                             Ok(_) => (),
                             Err(err) => {
                                 error!("{err:?}");
@@ -89,7 +89,7 @@ impl GatewayPayload<Opcode> {
                         let channel_id_hash = message.channel_id;
                         let msg_id_hash = message.id;
 
-                        info!(
+                        debug!(
                             "MessageCreate: channel={} msg={} text={:?}",
                             channel_id_hash, msg_id_hash, &message.content
                         );
@@ -111,7 +111,7 @@ impl GatewayPayload<Opcode> {
                                 },
                             ),
                         });
-                        info!(
+                        debug!(
                             "text_events queue length after push: {}",
                             discord.text_events.len()
                         );
@@ -131,10 +131,10 @@ impl GatewayPayload<Opcode> {
                 }
             }
             Opcode::HeartbeatAck => {
-                info!("HeartbeatAck");
+                debug!("HeartbeatAck");
             }
             _ => {
-                warn!("Unkown opcode recived: {:?}", self.op)
+                warn!("Unknown opcode received: {:?}", self.op)
             }
         };
         Ok(())

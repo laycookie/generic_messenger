@@ -113,13 +113,13 @@ impl Notify {
 pub(crate) struct OutputStream {
     stream: cpal::Stream,
     to_audio_thread: Caching<Arc<StaticRb<OutputRxEvent, 8>>, true, false>,
-    // reciver: oneshot::Receiver<TxEvent>,
+    // receiver: oneshot::Receiver<TxEvent>,
 }
 
 pub(crate) struct InputStream {
     stream: cpal::Stream,
     to_audio_thread: Caching<Arc<StaticRb<InputRxEvent, 8>>, true, false>,
-    // reciver: oneshot::Receiver<TxEvent>,
+    // receiver: oneshot::Receiver<TxEvent>,
 }
 
 struct OutputMaster {

@@ -1,9 +1,12 @@
 use crate::AudioSampleType;
 
+// TODO: Wire up effects pipeline into audio stream processing.
+
 pub trait Afx {
     fn apply_to(&mut self, audio: &mut [AudioSampleType]);
 }
 
+#[allow(dead_code)]
 struct Gain {
     multiplier: f32,
 }

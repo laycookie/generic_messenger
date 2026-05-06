@@ -1,4 +1,4 @@
-use std::{error::Error, mem, sync::Arc};
+use std::{error::Error, io, mem, sync::Arc};
 
 use arc_swap::ArcSwapOption;
 use facet::Facet;
@@ -8,7 +8,7 @@ use num_enum::TryFromPrimitive;
 use simple_audio_channels::{input::SampleConsumer, output::SampleProducer};
 
 use self::gateway::Voice;
-use crate::gateaways::Gateaway;
+use crate::gateways::Gateway;
 use crate::{ChannelID, api_types::SNOWFLAKE};
 
 pub(super) mod connection;
@@ -67,7 +67,7 @@ pub enum VoiceOpcode {
 }
 
 #[derive(Default)]
-pub enum VoiceGateawayStatus {
+pub enum VoiceGatewayStatus {
     #[default]
     Closed,
     AwaitingData {
@@ -87,7 +87,7 @@ pub enum VoiceGateawayStatus {
         session_id: SessionId,
     },
 }
-impl VoiceGateawayStatus {
+impl VoiceGatewayStatus {
     pub fn insert_endpoint(&mut self, endpoint: Endpoint) {
         *self = match mem::take(self) {
             Self::Closed => Self::Closed,
@@ -108,9 +108,9 @@ impl VoiceGateawayStatus {
                 channel_id,
             },
             Self::Ready {
-                endpoint,
                 session_id,
                 channel_id,
+                ..
             } => Self::Ready {
                 endpoint,
                 session_id,
@@ -142,8 +142,8 @@ impl VoiceGateawayStatus {
             },
             Self::Ready {
                 endpoint,
-                session_id,
                 channel_id,
+                ..
             } => Self::Ready {
                 endpoint,
                 session_id,
@@ -154,16 +154,16 @@ impl VoiceGateawayStatus {
 }
 
 #[derive(Default)]
-pub struct VoiceGateaway {
-    status: AsyncMutex<VoiceGateawayStatus>,
-    voice_gateaway: ArcSwapOption<Gateaway<Voice>>,
+pub struct VoiceGateway {
+    status: AsyncMutex<VoiceGatewayStatus>,
+    voice_gateway: ArcSwapOption<Gateway<Voice>>,
 }
-impl VoiceGateaway {
+impl VoiceGateway {
     pub async fn initiate_connection(&self, channel_id: ChannelID) {
         let mut status = self.status.lock().await;
-        *status = VoiceGateawayStatus::AwaitingData { channel_id };
+        *status = VoiceGatewayStatus::AwaitingData { channel_id };
     }
-    pub async fn replace_status(&self, new_status: VoiceGateawayStatus) {
+    pub async fn replace_status(&self, new_status: VoiceGatewayStatus) {
         let mut status = self.status.lock().await;
         *status = new_status;
     }
@@ -175,24 +175,24 @@ impl VoiceGateaway {
         let mut status = self.status.lock().await;
         status.insert_session_id(session_id);
     }
-    pub fn full_load_gateaway(&self) -> Option<Arc<Gateaway<Voice>>> {
-        self.voice_gateaway.load_full()
+    pub fn full_load_gateway(&self) -> Option<Arc<Gateway<Voice>>> {
+        self.voice_gateway.load_full()
     }
     pub async fn connect(&self, user_id: SNOWFLAKE) -> Result<(), Box<dyn Error + Send + Sync>> {
         let status = self.status.lock().await;
 
         let (endpoint, session_id, channel_id) = match &*status {
-            VoiceGateawayStatus::Ready {
+            VoiceGatewayStatus::Ready {
                 endpoint,
                 session_id,
                 channel_id,
             } => (endpoint, session_id, channel_id),
             _ => {
-                return Err("Does not have enough info about the peer to connect".into());
+                return Err(io::Error::new(io::ErrorKind::NotConnected, "voice gateway not ready").into());
             }
         };
 
-        let gateaway = Gateaway::<Voice>::new(
+        let gateway = Gateway::<Voice>::new(
             endpoint,
             session_id,
             channel_id.guild_id,
@@ -200,20 +200,20 @@ impl VoiceGateaway {
             user_id,
         )
         .await?;
-        self.voice_gateaway.store(Some(Arc::new(gateaway)));
+        self.voice_gateway.store(Some(Arc::new(gateway)));
 
         Ok(())
     }
 
     pub async fn disconnect(&self) {
         let mut status = self.status.lock().await;
-        *status = VoiceGateawayStatus::default();
-        self.voice_gateaway.store(None);
+        *status = VoiceGatewayStatus::default();
+        self.voice_gateway.store(None);
     }
 }
 
 pub enum AudioChannel {
-    Initilizing(oneshot::Receiver<SampleProducer>),
+    Initializing(oneshot::Receiver<SampleProducer>),
     Connected(SampleProducer),
 }
 
@@ -221,6 +221,6 @@ pub enum AudioChannel {
 pub enum InputChannel {
     #[default]
     None,
-    Initilizing(oneshot::Receiver<SampleConsumer>),
+    Initializing(oneshot::Receiver<SampleConsumer>),
     Connected(SampleConsumer),
 }

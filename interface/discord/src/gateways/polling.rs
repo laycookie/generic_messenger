@@ -1,5 +1,6 @@
 use std::{
     error::Error,
+    io,
     pin::pin,
     sync::{Arc, atomic::Ordering},
     time::Duration,
@@ -17,7 +18,7 @@ use messenger_interface::{
 };
 use smol::future::yield_now;
 use surf::http::convert::json;
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 
 use super::{
     GatewayPayload,
@@ -33,48 +34,49 @@ impl<T: UnitStruct> InnerDiscord<T> {
             ref microphone_recv,
         } = *self.audio_manager.lock().await;
         if microphone.is_none() {
-            let Some(reciver) = microphone_recv.take() else {
+            let Some(receiver) = microphone_recv.take() else {
                 let (sender, receiver) = oneshot::channel();
                 self.audio_events.push(AudioEvent::AddAudioInput(sender));
                 microphone_recv.set(Some(receiver));
                 return Some(());
             };
-            *microphone = Some(reciver.await.unwrap());
+            // TODO: Handle oneshot channel error (sender dropped)
+            *microphone = Some(receiver.await.unwrap());
         };
         let microphone_input = microphone.as_mut().unwrap();
 
-        let gateaway = self.gateaway.load();
-        let Some(gateaway) = gateaway.as_ref() else {
-            warn!("Not connected to the gateaway");
+        let gateway = self.gateway.load();
+        let Some(gateway) = gateway.as_ref() else {
+            warn!("Not connected to the gateway");
             return None;
         };
-        info!("gateaway inited.");
-        let Some(voice_gateaway) = gateaway.voice.full_load_gateaway() else {
-            warn!("Not connected to the voice_gateaway");
+        debug!("gateway initialized.");
+        let Some(voice_gateway) = gateway.voice.full_load_gateway() else {
+            warn!("Not connected to the voice_gateway");
             return None;
         };
-        info!("voice gateaway inited.");
-        let connection = voice_gateaway.connection.load();
+        debug!("voice gateway initialized.");
+        let connection = voice_gateway.connection.load();
         let Some(ref connection) = *connection else {
             warn!("Not connected to the udp");
             return None;
         };
-        info!("udp inited.");
+        debug!("udp initialized.");
 
-        let (mut audio_recver, mut audio_sender) = connection
+        let (mut audio_receiver, mut audio_sender) = connection
             .init_audio(
-                &voice_gateaway.dave_session,
-                &voice_gateaway.ssrc_to_user_id,
+                &voice_gateway.dave_session,
+                &voice_gateway.ssrc_to_user_id,
             )
             .ok()?;
-        info!("inited audio reciver, and sender.");
+        debug!("initialized audio receiver, and sender.");
 
         let mut frame = [0.0; VOICE_FRAME_SAMPLES];
         let mut microphone_input_stream = pin!(stream::unfold::<_, _, _, ()>(
             (microphone_input, &mut audio_sender, &mut frame),
             async |(microphone_input, audio_sender, frame)| {
                 loop {
-                    let recived_audio = {
+                    let received_audio = {
                         let microphone_sample_iter = microphone_input.pop_iter().await;
                         if microphone_sample_iter.len() >= VOICE_FRAME_SAMPLES {
                             for (i, s) in
@@ -88,9 +90,9 @@ impl<T: UnitStruct> InnerDiscord<T> {
                         }
                     };
 
-                    if recived_audio {
-                        if !voice_gateaway.is_speaking.load(Ordering::Relaxed) {
-                            info!("Send speaking packet");
+                    if received_audio {
+                        if !voice_gateway.is_speaking.load(Ordering::Relaxed) {
+                            debug!("Send speaking packet");
                             let speaking_payload = json!({
                                 "op": voice::VoiceOpcode::Speaking as u8,
                                 "d": {
@@ -101,14 +103,14 @@ impl<T: UnitStruct> InnerDiscord<T> {
                             })
                             .to_string();
 
-                            match voice_gateaway
+                            match voice_gateway
                                 .websocket
                                 .send(speaking_payload.clone().into())
                                 .await
                             {
                                 Ok(_) => {
-                                    info!("Speaking: {}", speaking_payload);
-                                    voice_gateaway.is_speaking.store(true, Ordering::Relaxed)
+                                    debug!("Speaking: {}", speaking_payload);
+                                    voice_gateway.is_speaking.store(true, Ordering::Relaxed)
                                 }
                                 Err(err) => {
                                     error!("Failed to send speaking update: {err}");
@@ -125,9 +127,9 @@ impl<T: UnitStruct> InnerDiscord<T> {
                             .map(|last_time| last_time.elapsed() > Duration::from_millis(200))
                             .unwrap_or(false);
 
-                        if should_stop && voice_gateaway.is_speaking.swap(false, Ordering::Relaxed)
+                        if should_stop && voice_gateway.is_speaking.swap(false, Ordering::Relaxed)
                         {
-                            info!("Send stop speaking packet");
+                            debug!("Send stop speaking packet");
                             let speaking_payload = json!({
                                 "op": voice::VoiceOpcode::Speaking as u8,
                                 "d": {
@@ -139,7 +141,7 @@ impl<T: UnitStruct> InnerDiscord<T> {
                             .to_string();
 
                             if let Err(err) =
-                                voice_gateaway.websocket.send(speaking_payload.into()).await
+                                voice_gateway.websocket.send(speaking_payload.into()).await
                             {
                                 error!("Failed to send speaking update: {err}");
                             }
@@ -150,34 +152,36 @@ impl<T: UnitStruct> InnerDiscord<T> {
         ));
 
         let mut audio_recv_stream = pin!(stream::unfold::<_, _, _, ()>(
-            &mut audio_recver,
-            async |audio_recver| {
+            &mut audio_receiver,
+            async |audio_receiver| {
                 loop {
-                    match audio_recver.recv_audio().await {
+                    match audio_receiver.recv_audio().await {
                         Ok((ssrc, incoming_audio_frame)) => {
-                            let mut channel_entery =
-                                match voice_gateaway.ssrc_to_audio_channel.entry(ssrc) {
+                            let mut channel_entry =
+                                match voice_gateway.ssrc_to_audio_channel.entry(ssrc) {
                                     dashmap::Entry::Occupied(channel) => channel,
                                     dashmap::Entry::Vacant(vacant_entry) => {
-                                        let (sender, reciver) = oneshot::channel();
+                                        let (sender, receiver) = oneshot::channel();
                                         vacant_entry.insert(
-                                            voice::AudioChannel::Initilizing(reciver).into(),
+                                            voice::AudioChannel::Initializing(receiver).into(),
                                         );
                                         self.audio_events.push(AudioEvent::AddAudioSource(sender));
                                         // TODO: Save incoming_audio_frame
-                                        return Some(((), audio_recver));
+                                        return Some(((), audio_receiver));
                                     }
                                 };
                             loop {
-                                let mut channel = channel_entery.get().lock().unwrap();
+                                // TODO: Handle mutex poison error
+                                let mut channel = channel_entry.get().lock().unwrap();
                                 match &mut *channel {
-                                    voice::AudioChannel::Initilizing(receiver) => {
+                                    voice::AudioChannel::Initializing(receiver) => {
+                                        // TODO: Handle oneshot channel error (sender dropped)
                                         let producer = match receiver.try_recv().unwrap() {
                                             Some(producer) => producer,
                                             None => continue,
                                         };
                                         drop(channel);
-                                        channel_entery.insert(
+                                        channel_entry.insert(
                                             voice::AudioChannel::Connected(producer).into(),
                                         );
                                     }
@@ -189,7 +193,7 @@ impl<T: UnitStruct> InnerDiscord<T> {
                                         );
                                         if incoming_audio_frame.len() != samples_pushed {
                                             error!(
-                                                "Audio buffer overflow. Pusehd: {}, Sucseeded: {}",
+                                                "Audio buffer overflow. Pushed: {}, Succeeded: {}",
                                                 incoming_audio_frame.len(),
                                                 samples_pushed
                                             );
@@ -212,8 +216,8 @@ impl<T: UnitStruct> InnerDiscord<T> {
     }
 
     pub async fn poll_for_events(self: &Arc<Self>) {
-        let gateaway = self.gateaway.load();
-        let Some(ref_gateaway) = gateaway.as_ref() else {
+        let gateway = self.gateway.load();
+        let Some(ref_gateway) = gateway.as_ref() else {
             warn!("Stream has not started, or has been killed");
             pending!();
             return;
@@ -222,30 +226,30 @@ impl<T: UnitStruct> InnerDiscord<T> {
         // the lock state. We also need to yield here, as try_lock isn't a future which means
         // that a stream polling at the moment might relock before ever yielding to us.
         yield_now().await;
-        let Some(mut gateaway_reciver) = ref_gateaway.websocket.reciver.try_lock() else {
+        let Some(mut gateway_receiver) = ref_gateway.websocket.receiver.try_lock() else {
             self.pulled_notification.notified().await;
             return;
         };
 
-        let voice_gateaway = ref_gateaway.voice.full_load_gateaway();
-        let voice_gateaway_event_fut = {
-            let voice_gateaway = voice_gateaway.clone();
+        let voice_gateway = ref_gateway.voice.full_load_gateway();
+        let voice_gateway_event_fut = {
+            let voice_gateway = voice_gateway.clone();
             async {
-                match voice_gateaway {
-                    Some(voice_gateaway) => voice_gateaway.websocket.next().await,
+                match voice_gateway {
+                    Some(voice_gateway) => voice_gateway.websocket.next().await,
                     None => futures::future::pending().await,
                 }
             }
         };
 
         select! {
-        event = gateaway_reciver.next() => {
-            if let Some(deserilized_event) = match event {
+        event = gateway_receiver.next() => {
+            if let Some(deserialized_event) = match event {
                 Some(Ok(event)) => match event {
                     WebsocketMessage::Text(utf8_bytes) => {
                         match facet_json::from_str::<GatewayPayload<Opcode>>(&utf8_bytes) {
                             Ok(event) => {
-                                info!("Parsed gateway event OK: op={:?} t={:?}", event.op, event.t);
+                                debug!("Parsed gateway event OK: op={:?} t={:?}", event.op, event.t);
                                 Some(event)
                             },
                             Err(err) => {
@@ -264,13 +268,13 @@ impl<T: UnitStruct> InnerDiscord<T> {
                     None
                 }
                 None => None,
-            } && let Err(err) = deserilized_event.exec(self).await
+            } && let Err(err) = deserialized_event.exec(self).await
             {
                 warn!("Failed to execute gateway event: {err}")
             }
         }
-        event = voice_gateaway_event_fut.fuse() => {
-            if let Some(deserilized_event) = match event {
+        event = voice_gateway_event_fut.fuse() => {
+            if let Some(deserialized_event) = match event {
                 Some(Ok(event)) => match event {
                     WebsocketMessage::Text(utf8_bytes) => match facet_json::from_str::<GatewayPayload<VoiceOpcode>>(&utf8_bytes) {
                         Ok(event) => Some(event),
@@ -279,9 +283,12 @@ impl<T: UnitStruct> InnerDiscord<T> {
                             None
                         },
                     }
-                    WebsocketMessage::Binary(bytes) =>  {
-                        let opcode_sample = VoiceOpcode::try_from(bytes[0]).unwrap();
-                        Some(GatewayPayload::<VoiceOpcode>::new_binary(opcode_sample, None, bytes[0..].to_vec()))
+                    WebsocketMessage::Binary(bytes) => match VoiceOpcode::try_from(bytes[0]) {
+                        Ok(opcode) => Some(GatewayPayload::<VoiceOpcode>::new_binary(opcode, None, bytes[0..].to_vec())),
+                        Err(err) => {
+                            warn!("Unknown voice binary opcode {}: {err}", bytes[0]);
+                            None
+                        }
                     }
                     msg => {
                         error!("Failed: {msg:?}");
@@ -294,18 +301,18 @@ impl<T: UnitStruct> InnerDiscord<T> {
                 }
                 None => {
                     warn!("Stream closed");
-                    ref_gateaway.voice.disconnect().await;
+                    ref_gateway.voice.disconnect().await;
                     None
                 }
-            } && let Err(err) = deserilized_event.exec(self).await
+            } && let Err(err) = deserialized_event.exec(self).await
             {
                 warn!("Failed to execute gateway event: {err}")
             }
         }
-        _ = ref_gateaway.heartbeat().fuse() => {}
+        _ = ref_gateway.heartbeat().fuse() => {}
         _ = async {
-                match voice_gateaway {
-                    Some(voice_gateaway) => voice_gateaway.heartbeat().await,
+                match voice_gateway {
+                    Some(voice_gateway) => voice_gateway.heartbeat().await,
                     None => futures::future::pending().await,
                 }
             }.fuse() => {}
@@ -320,9 +327,9 @@ impl VoiceTrait for InnerDiscord<Owned> {
         &self,
         location: &Identifier<Place<Room>>,
     ) -> Result<CallStatus, Box<dyn Error + Sync + Send>> {
-        let load_gateaway = self.gateaway.load();
-        let Some(gateaway) = load_gateaway.as_ref() else {
-            return Err("Not connected to the socket".into());
+        let load_gateway = self.gateway.load();
+        let Some(gateway) = load_gateway.as_ref() else {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "gateway not connected").into());
         };
 
         let channels_map = self.channel_id_mappings.read().await;
@@ -333,12 +340,12 @@ impl VoiceTrait for InnerDiscord<Owned> {
                 // and support guild voice channels too.
                 warn!("Tried to connect voice for a Room without a discord channel mapping");
                 return Err(
-                    "Tried to connect voice for a Room without a discord channel mapping".into(),
+                    io::Error::new(io::ErrorKind::NotFound, "no channel mapping for this room").into(),
                 );
             }
         };
 
-        gateaway.voice.initiate_connection(channel.to_owned()).await;
+        gateway.voice.initiate_connection(channel.to_owned()).await;
 
         let payload = json!({
             "op": Opcode::VoiceStateUpdate as u8,
@@ -350,20 +357,20 @@ impl VoiceTrait for InnerDiscord<Owned> {
               }
         });
 
-        if let Err(err) = gateaway.websocket.send(payload.to_string().into()).await {
-            gateaway.voice.disconnect().await;
+        if let Err(err) = gateway.websocket.send(payload.to_string().into()).await {
+            gateway.voice.disconnect().await;
             return Err(err.into());
         };
         Ok(CallStatus::Connecting("Awaiting call start"))
     }
 
     async fn disconnect(&self, location: &Identifier<Place<Room>>) {
-        let load_gateaway = self.gateaway.load();
-        let Some(gateaway) = load_gateaway.as_ref() else {
+        let load_gateway = self.gateway.load();
+        let Some(gateway) = load_gateway.as_ref() else {
             error!("Not connected to the socket");
             return;
         };
-        gateaway.voice.disconnect().await;
+        gateway.voice.disconnect().await;
 
         let channels_map = self.channel_id_mappings.read().await;
         let channel = match channels_map.get(location.id()) {
@@ -380,16 +387,15 @@ impl VoiceTrait for InnerDiscord<Owned> {
             "op": Opcode::VoiceStateUpdate as u8,
             "d": {
                 "guild_id": channel.guild_id,
+                "channel_id": null,
                 "self_mute": false,
                 "self_deaf": false
               }
         });
 
-        gateaway
-            .websocket
-            .send(payload.to_string().into())
-            .await
-            .unwrap();
+        if let Err(err) = gateway.websocket.send(payload.to_string().into()).await {
+            error!("Failed to send voice disconnect: {err}");
+        }
     }
 
     async fn listen(

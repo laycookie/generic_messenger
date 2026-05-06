@@ -12,7 +12,7 @@ use davey::{DAVE_PROTOCOL_VERSION, DaveSession};
 use facet_pretty::FacetPretty;
 use futures::lock::Mutex as AsyncMutex;
 use surf::http::convert::json;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::{
     Endpoint, SessionId, VoiceOpcode,
@@ -20,7 +20,7 @@ use super::{
     payloads::HelloPayload,
 };
 use crate::api_types::SNOWFLAKE;
-use crate::gateaways::{Gateaway, GateawayStream, HeartBeatingData, Websocket};
+use crate::gateways::{Gateway, GatewayStream, HeartBeatingData, Websocket};
 
 pub struct Voice {
     heartbeat_version: u8,
@@ -34,7 +34,7 @@ pub struct Voice {
     pub is_speaking: AtomicBool,
 }
 
-impl Gateaway<Voice> {
+impl Gateway<Voice> {
     const VERSION: usize = 7; // TODO: Upgrade to 9
     pub async fn new(
         endpoint: &Endpoint,
@@ -61,24 +61,23 @@ impl Gateaway<Voice> {
             "max_dave_protocol_version": DAVE_PROTOCOL_VERSION,
           }
         });
-        info!("{identify_payload:#?}");
+        debug!("{identify_payload:#?}");
         voice_websocket
             .send(identify_payload.to_string().into())
-            .await
-            .unwrap();
+            .await?;
 
-        let hello_event = voice_websocket.next_gateaway_payload().await;
+        let hello_event = voice_websocket.next_gateway_payload().await;
 
         let VoiceOpcode::Hello = hello_event.op else {
             return Err(io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Expected to recive hello event as the first event",
+                "Expected to receive hello event as the first event",
             )
             .into());
         };
 
         let hello_d = facet_value::from_value::<HelloPayload>(hello_event.d)?;
-        println!("{}", hello_d.pretty());
+        debug!("{}", hello_d.pretty());
         let heart_beating_duration = Duration::from_millis(hello_d.heartbeat_interval);
 
         Ok(Self {
@@ -111,13 +110,11 @@ impl Gateaway<Voice> {
                     },
             })
             .to_string(),
-            // Everything beyond this point is kind of a guess and isn't tested
-            1..=7 => json!({
+            _ => json!({
                     "op": VoiceOpcode::Heartbeat as u8,
                     "d": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
             })
             .to_string(),
-            _ => todo!(),
         };
 
         self.websocket.send(payload.into()).await

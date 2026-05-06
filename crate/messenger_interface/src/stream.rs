@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::Stream;
-use tracing::info;
+use tracing::debug;
 
 /// Trait for event sources that can be polled via `Arc` (shared ownership).
 ///
@@ -59,7 +59,7 @@ where
         let socket_arc = match self.socket.upgrade() {
             Some(arc) => arc,
             None => {
-                info!("Killed");
+                debug!("Killed");
                 return Poll::Ready(None);
             }
         };

@@ -5,7 +5,7 @@ use iced::widget::{Button, Column, Scrollable, image};
 use iced::{ContentFit, Element, Length};
 use messenger_interface::types::{House, Identifier, Place};
 
-use crate::messanger_unifier::{MessangerHandle, Messangers};
+use crate::messenger_unifier::{MessengerHandle, Messengers};
 use crate::pages::messenger::PLACEHOLDER_PFP;
 
 #[derive(Debug)]
@@ -15,13 +15,13 @@ pub struct Navbar;
 pub enum Action {
     GetDMs,
     GetGuild {
-        handle: MessangerHandle,
+        handle: MessengerHandle,
         server: Identifier<Place<House>>,
     },
 }
 
 impl Navbar {
-    pub fn get_element<'a>(messengers: &'a Messangers) -> Element<'a, Action> {
+    pub fn get_element<'a>(messengers: &'a Messengers) -> Element<'a, Action> {
         let dm_switch = Element::from(Button::new("test").on_press(Action::GetDMs));
 
         let servers = messengers.data_iter().flat_map(|data| {

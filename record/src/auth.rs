@@ -5,11 +5,11 @@ use std::{
     str::FromStr,
 };
 
-use crate::{messanger_unifier::Messangers, pages::login::Platform};
+use crate::{messenger_unifier::Messengers, pages::login::Platform};
 
-pub struct MessangersGenerator;
-impl MessangersGenerator {
-    pub fn messengers_from_file(path: PathBuf) -> Result<Messangers, Box<dyn std::error::Error>> {
+pub struct MessengersGenerator;
+impl MessengersGenerator {
+    pub fn messengers_from_file(path: PathBuf) -> Result<Messengers, Box<dyn std::error::Error>> {
         let auth_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -18,7 +18,7 @@ impl MessangersGenerator {
 
         let buf_reader = BufReader::new(&auth_file);
 
-        let mut messangers = Messangers::default();
+        let mut messengers = Messengers::default();
         for auth_line in buf_reader.lines() {
             let auth_line = auth_line.unwrap(); // For now we don't handle this
 
@@ -28,13 +28,13 @@ impl MessangersGenerator {
             };
 
             // In theory should never return false
-            let auth = Platform::from_str(platform).unwrap().to_messanger(token);
+            let auth = Platform::from_str(platform).unwrap().to_messenger(token);
 
-            messangers.add_messanger(auth);
+            messengers.add_messenger(auth);
         }
-        Ok(messangers)
+        Ok(messengers)
     }
-    pub fn messangers_to_file(messangers: &Messangers, path: PathBuf) {
+    pub fn messengers_to_file(messengers: &Messengers, path: PathBuf) {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -49,12 +49,12 @@ impl MessangersGenerator {
         // project.
         file.seek(SeekFrom::Start(0)).unwrap();
         file.set_len(0).unwrap();
-        messangers.interface_iter().for_each(|messanger| {
-            // if messanger.pressistent == false {
+        messengers.interface_iter().for_each(|messenger| {
+            // if messenger.persistent == false {
             //     return;
             // }
 
-            writeln!(file, "{}:{}", messanger.name(), messanger.auth()).unwrap();
+            writeln!(file, "{}:{}", messenger.name(), messenger.auth()).unwrap();
         });
     }
 }

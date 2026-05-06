@@ -3,7 +3,7 @@ use iced::{
     widget::{Column, Text, TextInput},
 };
 
-use crate::messanger_unifier::Messangers;
+use crate::messenger_unifier::Messengers;
 
 #[derive(Debug, Clone, Default)]
 pub struct Contacts {
@@ -16,7 +16,7 @@ pub enum Message {
 }
 
 impl Contacts {
-    pub fn get_element<'a>(&self, messengers: &'a Messangers) -> Element<'a, Message> {
+    pub fn get_element<'a>(&self, messengers: &'a Messengers) -> Element<'a, Message> {
         let widget = Column::new();
         let widget =
             widget.push(TextInput::new("Search", &self.search_input).on_input(Message::MsgInput));
@@ -24,8 +24,8 @@ impl Contacts {
             .push(
                 messengers
                     .data_iter()
-                    .flat_map(|messanger| {
-                        messanger.contacts.iter().filter_map(|i| {
+                    .flat_map(|messenger| {
+                        messenger.contacts.iter().filter_map(|i| {
                             if self.search_input.is_empty()
                                 || i.name
                                     .to_lowercase()

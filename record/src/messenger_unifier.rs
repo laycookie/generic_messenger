@@ -9,19 +9,19 @@ use messenger_interface::{
 
 #[derive(Debug, Clone)]
 pub struct Call {
-    messanger_handle: MessangerHandle,
+    messenger_handle: MessengerHandle,
     source: Identifier<Place<Room>>,
 }
 
 impl Call {
-    pub fn new(messanger_handle: MessangerHandle, source: Identifier<Place<Room>>) -> Self {
+    pub fn new(messenger_handle: MessengerHandle, source: Identifier<Place<Room>>) -> Self {
         Self {
-            messanger_handle,
+            messenger_handle,
             source,
         }
     }
-    pub fn handle(&self) -> MessangerHandle {
-        self.messanger_handle
+    pub fn handle(&self) -> MessengerHandle {
+        self.messenger_handle
     }
     pub fn source(&self) -> &Identifier<Place<Room>> {
         &self.source
@@ -34,8 +34,8 @@ impl Call {
     }
 }
 #[derive(Debug)]
-pub struct MessangerData {
-    handle: MessangerHandle,
+pub struct MessengerData {
+    handle: MessengerHandle,
 
     pub profile: Option<Identifier<User>>,
     pub contacts: Vec<Identifier<User>>,
@@ -45,8 +45,8 @@ pub struct MessangerData {
     pub calls: Vec<Call>,
 }
 
-impl MessangerData {
-    pub fn new(handle: MessangerHandle) -> Self {
+impl MessengerData {
+    pub fn new(handle: MessengerHandle) -> Self {
         Self {
             handle,
             profile: None,
@@ -57,28 +57,28 @@ impl MessangerData {
             calls: Vec::new(),
         }
     }
-    pub fn handle(&self) -> MessangerHandle {
+    pub fn handle(&self) -> MessengerHandle {
         self.handle
     }
 }
 // ===
 #[derive(Debug, Clone, Copy)]
-pub struct MessangerHandle {
+pub struct MessengerHandle {
     id: usize,
     index: usize,
 }
-impl PartialEq for MessangerHandle {
+impl PartialEq for MessengerHandle {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
 
 #[derive(Clone)]
-pub struct MessangerInterface {
-    pub handle: MessangerHandle,
+pub struct MessengerInterface {
+    pub handle: MessengerHandle,
     pub api: Arc<dyn Messenger>,
 }
-impl Deref for MessangerInterface {
+impl Deref for MessengerInterface {
     type Target = Arc<dyn Messenger>;
 
     fn deref(&self) -> &Self::Target {
@@ -87,73 +87,73 @@ impl Deref for MessangerInterface {
 }
 
 #[derive(Default)]
-pub struct Messangers {
+pub struct Messengers {
     id_counter: usize,
-    interface: Vec<MessangerInterface>,
-    data: Vec<MessangerData>,
+    interface: Vec<MessengerInterface>,
+    data: Vec<MessengerData>,
 }
 
-impl Messangers {
+impl Messengers {
     pub fn len(&self) -> usize {
         self.interface.len()
     }
-    pub fn interface_iter(&self) -> std::slice::Iter<'_, MessangerInterface> {
+    pub fn interface_iter(&self) -> std::slice::Iter<'_, MessengerInterface> {
         self.interface.iter()
     }
-    pub fn data_iter(&self) -> std::slice::Iter<'_, MessangerData> {
+    pub fn data_iter(&self) -> std::slice::Iter<'_, MessengerData> {
         self.data.iter()
     }
     pub fn interface_from_handle(
         &self,
-        messanger_handle: MessangerHandle,
-    ) -> Option<&MessangerInterface> {
-        if self.interface.len() > messanger_handle.index
-            && messanger_handle == self.interface[messanger_handle.index].handle
+        messenger_handle: MessengerHandle,
+    ) -> Option<&MessengerInterface> {
+        if self.interface.len() > messenger_handle.index
+            && messenger_handle == self.interface[messenger_handle.index].handle
         {
-            return Some(&self.interface[messanger_handle.index]);
+            return Some(&self.interface[messenger_handle.index]);
         }
 
-        self.interface.iter().find(|a| a.handle == messanger_handle)
+        self.interface.iter().find(|a| a.handle == messenger_handle)
     }
-    pub fn data_from_handle(&self, messanger_handle: MessangerHandle) -> Option<&MessangerData> {
-        if self.data.len() > messanger_handle.index
-            && messanger_handle == self.data[messanger_handle.index].handle
+    pub fn data_from_handle(&self, messenger_handle: MessengerHandle) -> Option<&MessengerData> {
+        if self.data.len() > messenger_handle.index
+            && messenger_handle == self.data[messenger_handle.index].handle
         {
-            return Some(&self.data[messanger_handle.index]);
+            return Some(&self.data[messenger_handle.index]);
         }
 
         self.data
             .iter()
-            .find(|data| data.handle == messanger_handle)
+            .find(|data| data.handle == messenger_handle)
     }
     pub fn mut_data_from_handle(
         &mut self,
-        messanger_handle: MessangerHandle,
-    ) -> Option<&mut MessangerData> {
-        if self.data.len() > messanger_handle.index
-            && messanger_handle == self.data[messanger_handle.index].handle
+        messenger_handle: MessengerHandle,
+    ) -> Option<&mut MessengerData> {
+        if self.data.len() > messenger_handle.index
+            && messenger_handle == self.data[messenger_handle.index].handle
         {
-            return Some(&mut self.data[messanger_handle.index]);
+            return Some(&mut self.data[messenger_handle.index]);
         }
 
         self.data
             .iter_mut()
-            .find(|data| data.handle == messanger_handle)
+            .find(|data| data.handle == messenger_handle)
     }
-    pub fn add_messanger(&mut self, api: Arc<dyn Messenger>) -> MessangerHandle {
-        let handle = MessangerHandle {
+    pub fn add_messenger(&mut self, api: Arc<dyn Messenger>) -> MessengerHandle {
+        let handle = MessengerHandle {
             id: self.id_counter,
             index: self.interface.len(),
         };
 
-        self.data.push(MessangerData::new(handle));
-        self.interface.push(MessangerInterface { handle, api });
+        self.data.push(MessengerData::new(handle));
+        self.interface.push(MessengerInterface { handle, api });
 
         self.id_counter += 1;
 
         handle
     }
-    pub fn remove_by_handle(&mut self, handle_to_remove: MessangerHandle) {
+    pub fn remove_by_handle(&mut self, handle_to_remove: MessengerHandle) {
         self.interface.remove(handle_to_remove.index);
         // Updates all cached indexes that are now wrong.
         for (i, interface) in self.interface[handle_to_remove.index..]

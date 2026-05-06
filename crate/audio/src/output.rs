@@ -1,4 +1,4 @@
-use std::{error::Error, fmt::Debug};
+use std::{error::Error, fmt::Debug, io};
 
 use cpal::{
     ChannelCount, SampleFormat, SampleRate,
@@ -8,7 +8,7 @@ use ringbuf::{
     CachingCons, CachingProd, StaticRb,
     traits::{Consumer as _, Observer as _, Producer, Split},
 };
-use tracing::{error, info};
+use tracing::{debug, error};
 
 use crate::{
     AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, Channel, ChannelType, Notify, SampleConsum,
@@ -68,7 +68,7 @@ impl AudioMixer {
             stream
                 .to_audio_thread
                 .try_push(OutputRxEvent::AddOutputChannel(sample_consumer))
-                .map_err(|err| format!("Could not exec: {:?}", err))?;
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("failed to push output channel event: {err:?}")))?;
         }
         self.output_channels.push(channel);
 
@@ -77,12 +77,13 @@ impl AudioMixer {
 
     pub fn start_stream_output(&mut self) -> Option<Notify> {
         if let Some(output) = &mut self.output {
+            // TODO: Return Result instead of Option so device errors can propagate
             let config = output.device.default_output_config().unwrap();
             let mut stream_config = config.config();
 
-            stream_config.sample_rate = 48_000; // TODO: Determene by device preference in future
+            stream_config.sample_rate = 48_000; // TODO: Determine by device preference in future
 
-            info!("Starting output stream with config: {:#?}", stream_config);
+            debug!("Starting output stream with config: {:#?}", stream_config);
 
             let mut sample_consumers = self
                 .output_channels
@@ -114,7 +115,8 @@ impl AudioMixer {
                             *stream_sample = sample_consumers
                                 .iter_mut()
                                 .map(|consumer| consumer.try_pop().unwrap_or(0.0))
-                                .sum();
+                                .sum::<AudioSampleType>()
+                                .clamp(-1.0, 1.0);
                         }
                     },
                     move |err| {

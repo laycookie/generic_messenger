@@ -3,10 +3,10 @@
 pub mod login;
 pub mod messenger;
 
-use crate::messanger_unifier::{Call, MessangerHandle};
+use crate::messenger_unifier::{Call, MessengerHandle};
 pub use login::Login;
 use login::Message as LoginMessage;
-use messenger::Message as MessangerMessage;
+use messenger::Message as MessengerMessage;
 use messenger_interface::{
     interface::SocketEvent,
     types::{House, ID, Identifier, Message, Place, Room, User},
@@ -16,7 +16,7 @@ use std::fmt::Debug;
 use crate::Screen;
 
 #[derive(Debug, Clone)]
-pub(crate) enum MessangerData {
+pub(crate) enum MessengerData {
     Everything {
         profile: Identifier<User>,
         contacts: Vec<Identifier<User>>,
@@ -29,7 +29,7 @@ pub(crate) enum MessangerData {
 }
 
 #[derive(Debug)]
-pub(crate) enum MessangerDataType {
+pub(crate) enum MessengerDataType {
     Call,
 }
 
@@ -37,16 +37,16 @@ pub(crate) enum AppMessage {
     // === UI ===
     OpenPage(Screen),
     // === Control Messenger Obj Data ===
-    SetMessangerData {
-        messanger_handle: MessangerHandle,
-        new_data: MessangerData,
+    SetMessengerData {
+        messenger_handle: MessengerHandle,
+        new_data: MessengerData,
     },
-    RemoveMessangerData {
-        messanger_handle: MessangerHandle,
-        data_type: MessangerDataType,
+    RemoveMessengerData {
+        messenger_handle: MessengerHandle,
+        data_type: MessengerDataType,
         data_id: ID,
     },
-    RemoveMessanger(MessangerHandle),
+    RemoveMessenger(MessengerHandle),
     // === State Managers ===
     StartUp,
     SaveMessengersCredentialToDisk,
@@ -57,7 +57,7 @@ pub(crate) enum AppMessage {
     StopInputStream,
     // === Pages ===
     Login(LoginMessage),
-    Chat(MessangerMessage),
+    Chat(MessengerMessage),
     // === Socket ===
-    SocketEvent((MessangerHandle, SocketEvent)),
+    SocketEvent((MessengerHandle, SocketEvent)),
 }

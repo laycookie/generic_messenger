@@ -1,4 +1,4 @@
-use std::{error::Error, fmt::Debug};
+use std::{error::Error, fmt::Debug, io};
 
 use cpal::{
     ChannelCount, SampleFormat, SampleRate,
@@ -8,7 +8,7 @@ use ringbuf::{
     CachingCons, CachingProd, StaticRb,
     traits::{Consumer as _, Observer, Producer, Split as _},
 };
-use tracing::{error, info};
+use tracing::{debug, error};
 
 use crate::{
     AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, Channel, ChannelType, Notify, SampleConsum,
@@ -69,7 +69,7 @@ impl AudioMixer {
                     sample_producer,
                     notify.clone(),
                 ))
-                .map_err(|err| format!("Could not exec: {:?}", err))?;
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("failed to push input channel event: {err:?}")))?;
         }
         self.input_channels.push(channel);
 
@@ -78,6 +78,7 @@ impl AudioMixer {
 
     pub fn start_stream_input(&mut self) -> Option<Notify> {
         if let Some(input) = &mut self.input {
+            // TODO: Return Result instead of Option so device errors can propagate
             let config = input.device.default_input_config().unwrap();
             let mut stream_config = config.config();
 
@@ -110,7 +111,7 @@ impl AudioMixer {
 
                         sample_producers.retain(|producers| producers.0.read_is_held());
                         if sample_producers.is_empty() {
-                            info!("Closing input audio stream");
+                            debug!("Closing input audio stream");
                             send_stream_close_notification.notify();
                             return;
                         }

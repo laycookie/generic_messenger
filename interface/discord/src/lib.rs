@@ -21,12 +21,12 @@ use simple_audio_channels::input::SampleConsumer;
 
 use crate::{
     api_types::SNOWFLAKE,
-    gateaways::{Gateaway, general::General},
+    gateways::{Gateway, general::General},
 };
 
 mod api_types;
 mod downloaders;
-mod gateaways;
+mod gateways;
 mod query;
 
 #[derive(Clone)]
@@ -37,7 +37,7 @@ struct ChannelID {
 type GuildID = SNOWFLAKE;
 type MessageID = SNOWFLAKE;
 
-/// Public interface for creating the discord messanger
+/// Public interface for creating the discord messenger
 pub struct Discord;
 impl Discord {
     pub fn new_messenger(token: &str) -> Arc<dyn Messenger> {
@@ -45,7 +45,7 @@ impl Discord {
             token: token.into(),
             intents: 194557,
             audio_manager: Default::default(),
-            gateaway: Default::default(),
+            gateway: Default::default(),
             pulled_notification: Default::default(),
             query_events: SegQueue::new(),
             text_events: SegQueue::new(),
@@ -89,7 +89,7 @@ struct InnerDiscord<T: UnitStruct> {
     // Microphone
     audio_manager: AsyncMutex<AudioManager>,
     // socket related
-    gateaway: ArcSwapOption<Gateaway<General>>,
+    gateway: ArcSwapOption<Gateway<General>>,
     pulled_notification: Notify,
     // event queues
     query_events: SegQueue<QueryEvent>,
@@ -106,9 +106,9 @@ struct InnerDiscord<T: UnitStruct> {
 }
 impl<T: UnitStruct> InnerDiscord<T> {
     async unsafe fn cast_and_downgrade<C: UnitStruct>(self: Arc<Self>) -> Weak<InnerDiscord<C>> {
-        if self.gateaway.load().is_none() {
-            self.gateaway.store(Some(Arc::new(
-                Gateaway::<General>::new(&self).await.unwrap(),
+        if self.gateway.load().is_none() {
+            self.gateway.store(Some(Arc::new(
+                Gateway::<General>::new(&self).await.unwrap(),
             )));
         }
 

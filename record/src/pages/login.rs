@@ -3,7 +3,7 @@ use iced::{
     Alignment,
     widget::{Button, Column, ComboBox, Container, TextInput, column, combo_box::State},
 };
-use messenger_interface::interface::Messenger as NeoMessanger;
+use messenger_interface::interface::Messenger as NeoMessenger;
 use std::{fmt::Display, sync::Arc};
 use strum::EnumString;
 
@@ -22,7 +22,7 @@ impl Display for Platform {
     }
 }
 impl Platform {
-    pub fn to_messanger(&self, auth: &str) -> Arc<dyn NeoMessanger> {
+    pub fn to_messenger(&self, auth: &str) -> Arc<dyn NeoMessenger> {
         match self {
             Self::Discord => Discord::new_messenger(auth),
             Self::Test => {
@@ -54,7 +54,7 @@ pub enum Message {
 
 pub enum Action {
     None,
-    Login(Arc<dyn NeoMessanger>),
+    Login(Arc<dyn NeoMessenger>),
 }
 
 #[derive(Debug, Clone)]
@@ -98,8 +98,8 @@ impl Login {
                 let platform = self.selected_platform.clone();
                 let token = self.token.clone();
 
-                let messanger = platform.to_messanger(&token);
-                return Action::Login(messanger);
+                let messenger = platform.to_messenger(&token);
+                return Action::Login(messenger);
             }
         }
 

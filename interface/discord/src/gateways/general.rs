@@ -8,11 +8,11 @@ use std::{
 use async_tungstenite::{async_std::connect_async, tungstenite::Message as WebsocketMessage};
 use facet::Facet;
 use surf::http::convert::json;
-use tracing::info;
+use tracing::debug;
 
 use crate::{
     InnerDiscord, UnitStruct,
-    gateaways::{Gateaway, GateawayStream, HeartBeatingData, voice::VoiceGateaway},
+    gateways::{Gateway, GatewayStream, HeartBeatingData, voice::VoiceGateway},
 };
 use self::payloads::HelloPayload;
 
@@ -89,10 +89,10 @@ pub enum GatewayEvent {
 }
 
 pub struct General {
-    pub voice: VoiceGateaway,
+    pub voice: VoiceGateway,
 }
 
-impl Gateaway<General> {
+impl Gateway<General> {
     const GATEWAY_URL: &str = "wss://gateway.discord.gg/?encoding=json&v=9";
     pub async fn new<T: UnitStruct>(
         discord: &InnerDiscord<T>,
@@ -101,12 +101,12 @@ impl Gateaway<General> {
 
         // First event send by discord has to be Hello event according to
         // https://docs.discord.food/topics/gateway#connections
-        let hello_event = gateway_websocket.next_gateaway_payload().await;
+        let hello_event = gateway_websocket.next_gateway_payload().await;
 
         let Opcode::Hello = hello_event.op else {
             return Err(Box::new(io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Expected to recive hello event as the first event",
+                "Expected to receive hello event as the first event",
             )));
         };
 
@@ -135,14 +135,14 @@ impl Gateaway<General> {
                 .into(),
             ))
             .await?;
-        info!("Token send: {token:?}");
+        debug!("Identify payload sent");
 
         Ok(Self {
-            websocket: crate::gateaways::Websocket::new(gateway_websocket),
+            websocket: crate::gateways::Websocket::new(gateway_websocket),
             heart_beating: HeartBeatingData::new(heart_beating_duration).into(),
             last_sequence_number: OnceLock::new(),
             type_specific_data: General {
-                voice: VoiceGateaway::default(),
+                voice: VoiceGateway::default(),
             },
         })
     }

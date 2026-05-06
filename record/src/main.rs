@@ -1,21 +1,21 @@
 use std::borrow::Cow;
 
-use crate::messanger_unifier::Call;
-use auth::MessangersGenerator;
+use crate::messenger_unifier::Call;
+use auth::MessengersGenerator;
 use font_kit::{family_name::FamilyName, source::SystemSource};
 use futures::{StreamExt, future::join_all, join};
 use iced::{Element, Subscription, Task, window};
-use messanger_unifier::Messangers;
+use messenger_unifier::Messengers;
 use messenger_interface::interface::SocketEvent;
 use pages::{AppMessage, Login, messenger::Messenger};
 use simple_audio_channels::{AudioMixer, SampleFormat};
 
 mod auth;
 mod components;
-mod messanger_unifier;
+mod messenger_unifier;
 mod pages;
 
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 use tracing_subscriber::FmtSubscriber;
 
 pub enum Screen {
@@ -58,26 +58,26 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct App {
     audio: AudioMixer,
     page: Screen,
-    messangers: Messangers,
+    messengers: Messengers,
 }
 
 impl App {
-    fn new(messangers: Messangers, page: Screen) -> Self {
+    fn new(messengers: Messengers, page: Screen) -> Self {
         Self {
             audio: AudioMixer::default(),
             page,
-            messangers,
+            messengers,
             // socket_sender: None,
         }
     }
 
     fn boot() -> (Self, Task<AppMessage>) {
-        let mut app = App::new(Messangers::default(), Screen::Loading);
+        let mut app = App::new(Messengers::default(), Screen::Loading);
 
-        let messangers = match MessangersGenerator::messengers_from_file("./LoginInfo".into()) {
-            Ok(messangers) => {
-                if messangers.len() > 0 {
-                    app.messangers = messangers;
+        let messengers = match MessengersGenerator::messengers_from_file("./LoginInfo".into()) {
+            Ok(messengers) => {
+                if messengers.len() > 0 {
+                    app.messengers = messengers;
                     true
                 } else {
                     trace!("No massengers were found");
@@ -95,7 +95,7 @@ impl App {
         let (_window_id, window_task) = window::open(window::Settings::default());
         (
             app,
-            window_task.then(move |_| match messangers {
+            window_task.then(move |_| match messengers {
                 true => Task::done(AppMessage::StartUp),
                 false => Task::none(),
             }),
@@ -104,24 +104,24 @@ impl App {
     fn update(&mut self, message: AppMessage) -> Task<AppMessage> {
         match message {
             AppMessage::SaveMessengersCredentialToDisk => {
-                MessangersGenerator::messangers_to_file(&self.messangers, "./LoginInfo".into());
+                MessengersGenerator::messengers_to_file(&self.messengers, "./LoginInfo".into());
                 Task::none()
             }
-            AppMessage::RemoveMessanger(handle) => {
-                self.messangers.remove_by_handle(handle);
+            AppMessage::RemoveMessenger(handle) => {
+                self.messengers.remove_by_handle(handle);
                 Task::none()
             }
-            AppMessage::SetMessangerData {
-                messanger_handle,
+            AppMessage::SetMessengerData {
+                messenger_handle,
                 new_data,
             } => {
                 let data = self
-                    .messangers
-                    .mut_data_from_handle(messanger_handle)
+                    .messengers
+                    .mut_data_from_handle(messenger_handle)
                     .unwrap();
                 match new_data {
-                    pages::MessangerData::Call(call_status) => data.calls.push(call_status),
-                    pages::MessangerData::Everything {
+                    pages::MessengerData::Call(call_status) => data.calls.push(call_status),
+                    pages::MessengerData::Everything {
                         profile,
                         contacts,
                         conversations,
@@ -132,24 +132,24 @@ impl App {
                         data.conversations = conversations;
                         data.guilds = servers;
                     }
-                    pages::MessangerData::Servers(servers) => data.guilds = servers,
-                    pages::MessangerData::Chat((id, v)) => {
+                    pages::MessengerData::Servers(servers) => data.guilds = servers,
+                    pages::MessengerData::Chat((id, v)) => {
                         data.chats.insert(id, v);
                     }
                 };
                 Task::none()
             }
-            AppMessage::RemoveMessangerData {
-                messanger_handle,
+            AppMessage::RemoveMessengerData {
+                messenger_handle,
                 data_type,
                 data_id,
             } => {
                 let data = self
-                    .messangers
-                    .mut_data_from_handle(messanger_handle)
+                    .messengers
+                    .mut_data_from_handle(messenger_handle)
                     .unwrap();
                 match data_type {
-                    pages::MessangerDataType::Call => {
+                    pages::MessengerDataType::Call => {
                         data.calls.retain(|call| call.id() != data_id);
                     }
                 };
@@ -158,7 +158,7 @@ impl App {
             }
             AppMessage::StartUp => {
                 Task::future(join_all(
-                    self.messangers
+                    self.messengers
                         .interface_iter()
                         .map(|interface| (interface.handle, interface.api.to_owned()))
                         .map(async |(handle, api)| {
@@ -243,7 +243,7 @@ impl App {
                         //     Ok(m) => m,
                         //     Err((handle, e)) => {
                         //         error!("Failed to fetch the data: {e}");
-                        //         return Task::done(AppMessage::RemoveMessanger(handle));
+                        //         return Task::done(AppMessage::RemoveMessenger(handle));
                         //     }
                         // };
                         let (
@@ -257,9 +257,9 @@ impl App {
                             voice_socket,
                         ) = m.unwrap();
 
-                        let task = Task::done(AppMessage::SetMessangerData {
-                            messanger_handle: handle,
-                            new_data: pages::MessangerData::Everything {
+                        let task = Task::done(AppMessage::SetMessengerData {
+                            messenger_handle: handle,
+                            new_data: pages::MessengerData::Everything {
                                 profile,
                                 contacts,
                                 conversations,
@@ -306,12 +306,12 @@ impl App {
             }
             AppMessage::SocketEvent((handle, socket_event)) => {
                 match socket_event {
-                    SocketEvent::Skip => info!("Skipped"),
+                    SocketEvent::Skip => trace!("Skipped"),
                     SocketEvent::MessageCreated {
                         room: channel,
                         message: msg,
                     } => {
-                        let d = self.messangers.mut_data_from_handle(handle).unwrap();
+                        let d = self.messengers.mut_data_from_handle(handle).unwrap();
                         match d.chats.get_mut(&channel.id()) {
                             Some(msgs) => msgs.push(msg),
                             None => {
@@ -323,7 +323,7 @@ impl App {
                         r#where,
                         room: new_room,
                     } => {
-                        let d = self.messangers.mut_data_from_handle(handle).unwrap();
+                        let d = self.messengers.mut_data_from_handle(handle).unwrap();
 
                         match r#where {
                             None => {
@@ -333,15 +333,15 @@ impl App {
                                 }
                             }
                             Some(server_id) => {
-                                info!("Adding: {server_id:?}");
+                                debug!("Adding: {server_id:?}");
                                 if let Some(server) =
                                     d.guilds.iter_mut().find(|g| g.id() == server_id.id())
                                 {
-                                    info!("Server");
+                                    debug!("Server");
                                     if let Some(rooms) = server.rooms.as_mut() {
-                                        info!("Rooms");
+                                        debug!("Rooms");
                                         if !rooms.iter().any(|r| r.id() == new_room.id()) {
-                                            info!("Room");
+                                            debug!("Room");
                                         }
                                     }
                                 }
@@ -351,10 +351,10 @@ impl App {
                                     && let Some(rooms) = server.rooms.as_mut()
                                     && !rooms.iter().any(|r| r.id() == new_room.id())
                                 {
-                                    info!("Added: {new_room:?}");
+                                    debug!("Added: {new_room:?}");
                                     rooms.push(new_room);
                                 } else {
-                                    info!("COULDN'T FIND SERVER FEATCHED");
+                                    warn!("COULDN'T FIND SERVER FEATCHED");
                                 }
                             }
                         }
@@ -368,18 +368,18 @@ impl App {
                             }));
                         }
                         messenger_interface::interface::CallStatus::Connecting(msg) => {
-                            info!("{msg}")
+                            debug!("{msg}")
                         }
                         messenger_interface::interface::CallStatus::Failed => error!("TODO"),
                     },
-                    SocketEvent::Disconnected => info!("Disconnected"),
+                    SocketEvent::Disconnected => debug!("Disconnected"),
                     SocketEvent::AddAudioSource(sender) => {
                         let producer = self
                             .audio
                             .create_output_channel(2, SampleFormat::I16, 48_000)
                             .unwrap();
 
-                        info!("Sending microphone");
+                        debug!("Sending microphone");
                         if sender.send(producer).is_err() {
                             warn!("Couldn't send audio channel to the adapter");
                         };
@@ -447,8 +447,8 @@ impl App {
                 match login.update(message) {
                     pages::login::Action::None => Task::none(),
                     pages::login::Action::Login(messenger) => {
-                        let handle = self.messangers.add_messanger(messenger);
-                        let interface = self.messangers.interface_from_handle(handle).unwrap();
+                        let handle = self.messengers.add_messenger(messenger);
+                        let interface = self.messengers.interface_from_handle(handle).unwrap();
                         Task::done(AppMessage::StartUp)
                         // let mut sender = self.socket_sender.clone().unwrap();
                         // Task::perform(
@@ -469,18 +469,18 @@ impl App {
                 let Screen::Chat(chat) = &mut self.page else {
                     return Task::none();
                 };
-                match chat.update(message, &self.messangers) {
+                match chat.update(message, &self.messengers) {
                     pages::messenger::Action::None => Task::none(),
-                    pages::messenger::Action::UpdateMessanger((handle, data)) => {
-                        Task::done(AppMessage::SetMessangerData {
-                            messanger_handle: handle,
+                    pages::messenger::Action::UpdateMessenger((handle, data)) => {
+                        Task::done(AppMessage::SetMessengerData {
+                            messenger_handle: handle,
                             new_data: data,
                         })
                     }
                     pages::messenger::Action::UpdateChat { handle, kv } => {
-                        Task::done(AppMessage::SetMessangerData {
-                            messanger_handle: handle,
-                            new_data: pages::MessangerData::Chat(kv),
+                        Task::done(AppMessage::SetMessengerData {
+                            messenger_handle: handle,
+                            new_data: pages::MessengerData::Chat(kv),
                         })
                     }
                     pages::messenger::Action::Call { interface, channel } => {
@@ -501,9 +501,9 @@ impl App {
                                 error!("{err}");
                             };
 
-                            Task::done(AppMessage::SetMessangerData {
-                                messanger_handle: interface.handle,
-                                new_data: pages::MessangerData::Call(Call::new(
+                            Task::done(AppMessage::SetMessengerData {
+                                messenger_handle: interface.handle,
+                                new_data: pages::MessengerData::Call(Call::new(
                                     interface.handle,
                                     channel,
                                 )),
@@ -514,7 +514,7 @@ impl App {
                     }
                     pages::messenger::Action::DisconnectFromCall(call) => {
                         let interface = self
-                            .messangers
+                            .messengers
                             .interface_from_handle(call.handle())
                             .unwrap();
 
@@ -533,9 +533,9 @@ impl App {
                             call
                         })
                         .then(move |call| {
-                            Task::done(AppMessage::RemoveMessangerData {
-                                messanger_handle: call.handle(),
-                                data_type: pages::MessangerDataType::Call,
+                            Task::done(AppMessage::RemoveMessengerData {
+                                messenger_handle: call.handle(),
+                                data_type: pages::MessengerDataType::Call,
                                 data_id: call.id(),
                             })
                         })
@@ -548,7 +548,7 @@ impl App {
     fn view<'a>(&'a self, _window: window::Id) -> Element<'a, AppMessage> {
         match &self.page {
             Screen::Login(login) => login.view().map(AppMessage::Login),
-            Screen::Chat(chat) => chat.view(&self.messangers).map(AppMessage::Chat),
+            Screen::Chat(chat) => chat.view(&self.messengers).map(AppMessage::Chat),
             Screen::Loading => iced::widget::text("Loading").into(),
         }
     }

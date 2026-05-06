@@ -7,7 +7,7 @@ use std::{
 
 use facet::Facet;
 use surf::{RequestBuilder, StatusCode};
-use tracing::{error, info};
+use tracing::{debug, error};
 
 pub async fn http_request<T: for<'a> Facet<'a>>(
     mut req: RequestBuilder,
@@ -54,7 +54,7 @@ pub async fn cache_download(
 
     // Create a file at the specified path
     match fs::create_dir_all(&path) {
-        Ok(_) => info!("Directory created successfully: {:?}", path),
+        Ok(_) => debug!("Directory created successfully: {:?}", path),
         Err(e) => error!("Failed to create directory: {}", e),
     }
 

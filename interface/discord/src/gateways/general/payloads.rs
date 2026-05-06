@@ -2,16 +2,6 @@ use crate::api_types::SNOWFLAKE;
 use facet::Facet;
 
 #[derive(Facet)]
-pub(super) struct ReadyPayload {
-    pub(super) ssrc: u64,
-    pub(super) ip: String,
-    pub(super) port: u64,
-    pub(super) modes: Vec<String>,
-    pub(super) experiments: Vec<String>,
-    // streams: Vec<?>
-}
-
-#[derive(Facet)]
 pub(super) struct HelloPayload {
     pub(super) heartbeat_interval: u64,
     pub(super) _trace: Vec<String>,

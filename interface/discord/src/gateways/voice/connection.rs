@@ -1,4 +1,4 @@
-use std::{error::Error, sync::OnceLock, time::Instant};
+use std::{error::Error, io, sync::OnceLock, time::Instant};
 
 use dashmap::DashMap;
 use davey::{Codec, DaveSession, MediaType};
@@ -7,7 +7,7 @@ use libsodium_rs::crypto_aead;
 use pnet_macros_support::packet::Packet;
 use simple_audio_channels::AudioSampleType;
 use smol::net::UdpSocket;
-use tracing::{info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::api_types::SNOWFLAKE;
 use rtp::{DiscordPacketType, RtpPacket, WrapU16, WrapU32};
@@ -18,7 +18,7 @@ pub mod rtp;
 pub use encryption::{EncryptionMode, SessionDescription};
 pub use rtp::Ssrc;
 
-pub const VOICE_FREQUANCY: usize = 48_000;
+pub const VOICE_FREQUENCY: usize = 48_000;
 pub const VOICE_CHANNELS: usize = 2; // Stereo
 pub const VOICE_FRAME_SAMPLES: usize = 960 * VOICE_CHANNELS;
 
@@ -33,8 +33,8 @@ pub struct RecvAudioFuture<'a> {
 }
 impl RecvAudioFuture<'_> {
     pub async fn recv_audio(&mut self) -> Result<(Ssrc, &[i16]), Box<dyn Error>> {
-        let n_bytes_recived = self.udp.recv(&mut self.rtp_packet_buf).await?;
-        let rtp_packet_buf = &self.rtp_packet_buf[..n_bytes_recived];
+        let n_bytes_received = self.udp.recv(&mut self.rtp_packet_buf).await?;
+        let rtp_packet_buf = &self.rtp_packet_buf[..n_bytes_received];
 
         let packet_type = DiscordPacketType::try_from(rtp_packet_buf[1]);
 
@@ -44,27 +44,27 @@ impl RecvAudioFuture<'_> {
             }
             Ok(DiscordPacketType::RtcpSenderReport | DiscordPacketType::RtcpReceiverReport) => {
                 // RTCP control packets - ignore silently
-                return Err("Expected voice packet".into());
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "expected voice packet, got RTCP").into());
             }
             _ => {
                 trace!("Unknown packet type on UDP: {:?}", rtp_packet_buf[1]);
-                return Err("Expected voice packet".into());
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "expected voice packet, got unknown type").into());
             }
         }
 
-        let rtp_packet = RtpPacket::new(rtp_packet_buf).ok_or("Failed to parse rtp packet")?;
+        let rtp_packet = RtpPacket::new(rtp_packet_buf).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "failed to parse RTP packet"))?;
 
         let is_rtp_extended = rtp_packet.get_extension() != 0;
 
         let rtp_header_len = if is_rtp_extended {
             rtp_packet.packet().len() - rtp_packet.payload().len() + 4
         } else {
-            info!("None-extended");
+            debug!("None-extended");
             rtp_packet.packet().len() - rtp_packet.payload().len()
         };
         let (rtp_header, rtp_body) = rtp_packet.packet().split_at(rtp_header_len);
 
-        let mode = self.description.mode().unwrap();
+        let mode = self.description.mode().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing encryption mode"))?;
         let decrypted_payload = match mode {
             EncryptionMode::aead_aes256_gcm_rtpsize => unimplemented!(),
             EncryptionMode::aead_xchacha20_poly1305_rtpsize => {
@@ -76,7 +76,7 @@ impl RecvAudioFuture<'_> {
                 let nonce = crypto_aead::xchacha20poly1305::Nonce::from_bytes(nonce);
 
                 let key = crypto_aead::xchacha20poly1305::Key::from_bytes(
-                    self.description.secret_key().unwrap(),
+                    self.description.secret_key().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing secret key"))?,
                 )
                 .expect("Invalid key length");
 
@@ -87,11 +87,11 @@ impl RecvAudioFuture<'_> {
                     &key,
                 )?
             }
-            EncryptionMode::aead_aes256_gcm => unimplemented!("Depricated"),
-            EncryptionMode::xsalsa20_poly1305 => unimplemented!("Depricated"),
-            EncryptionMode::xsalsa20_poly1305_suffix => unimplemented!("Depricated"),
-            EncryptionMode::xsalsa20_poly1305_lite => unimplemented!("Depricated"),
-            EncryptionMode::xsalsa20_poly1305_lite_rtpsize => unimplemented!("Depricated"),
+            EncryptionMode::aead_aes256_gcm => unimplemented!("Deprecated"),
+            EncryptionMode::xsalsa20_poly1305 => unimplemented!("Deprecated"),
+            EncryptionMode::xsalsa20_poly1305_suffix => unimplemented!("Deprecated"),
+            EncryptionMode::xsalsa20_poly1305_lite => unimplemented!("Deprecated"),
+            EncryptionMode::xsalsa20_poly1305_lite_rtpsize => unimplemented!("Deprecated"),
         };
 
         // <https://datatracker.ietf.org/doc/html/rfc6464>
@@ -127,7 +127,7 @@ impl RecvAudioFuture<'_> {
                 *self
                     .ssrc_to_user_id
                     .get(&rtp_packet.get_ssrc())
-                    .ok_or("No mapping of ssrc to user_id TODO: Make this better")?,
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no SSRC to user mapping"))?,
                 MediaType::AUDIO,
                 voice_data,
             )?;
@@ -177,16 +177,16 @@ impl SendAudioFuture<'_> {
             return Ok(());
         }
         if !samples.len().is_multiple_of(2) {
-            return Err("Expected interleaved stereo samples".into());
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected interleaved stereo samples").into());
         }
 
-        let mode = self.description.mode().ok_or("Missing encryption mode")?;
-        let secret_key = self.description.secret_key().ok_or("Missing secret key")?;
+        let mode = self.description.mode().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing encryption mode"))?;
+        let secret_key = self.description.secret_key().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing secret key"))?;
 
         let encoded_len = self
             .encoder
             .encode_float(samples, self.encoded_audio_buf.as_mut_slice())
-            .map_err(|err| format!("Opus encode failed: {err:?}"))?;
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("opus encode failed: {err:?}")))?;
         let opus_payload = &self.encoded_audio_buf[..encoded_len];
 
         let samples_per_channel = (samples.len() / VOICE_CHANNELS) as u32;
@@ -198,7 +198,7 @@ impl SendAudioFuture<'_> {
             let elapsed = now.duration_since(last_time);
             let expected_frame_duration = std::time::Duration::from_micros(
                 // TODO: Get rid of 1M to convert micros to secs
-                (samples_per_channel * 1_000_000 / VOICE_FREQUANCY as u32) as u64,
+                (samples_per_channel * 1_000_000 / VOICE_FREQUENCY as u32) as u64,
             );
 
             // If gap is significantly longer than expected frame time, we had silence
@@ -266,7 +266,7 @@ impl SendAudioFuture<'_> {
                     .await?;
             }
             _ => {
-                return Err(format!("Unsupported encryption mode: {:?}", mode).into());
+                return Err(io::Error::new(io::ErrorKind::Unsupported, format!("unsupported encryption mode: {mode:?}")).into());
             }
         }
 
@@ -287,7 +287,7 @@ impl Connection {
         ssrc_to_user_id: &'a DashMap<Ssrc, SNOWFLAKE>,
     ) -> Result<(RecvAudioFuture<'a>, SendAudioFuture<'a>), Box<dyn Error>> {
         let Some(description) = self.description() else {
-            return Err("No description provided".into());
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "no session description provided").into());
         };
 
         Ok((
@@ -297,8 +297,7 @@ impl Connection {
                 dave_session,
                 ssrc_to_user_id,
                 rtp_packet_buf: [0; 1024],
-                decoder: opus::Decoder::new(VOICE_FREQUANCY as u32, opus::Channels::Stereo)
-                    .unwrap(),
+                decoder: opus::Decoder::new(VOICE_FREQUENCY as u32, opus::Channels::Stereo)?,
                 decoded_audio_buf: [0; 8048],
             },
             SendAudioFuture {
@@ -313,11 +312,10 @@ impl Connection {
                 rtp_packet_buf: [0; 1024],
                 encoded_audio_buf: [0; 1276],
                 encoder: opus::Encoder::new(
-                    VOICE_FREQUANCY as u32,
+                    VOICE_FREQUENCY as u32,
                     opus::Channels::Stereo,
                     opus::Application::Voip,
-                )
-                .unwrap(),
+                )?,
             },
         ))
     }

@@ -2,9 +2,9 @@ use std::error::Error;
 
 use crate::{
     components::divider::Divider,
-    messanger_unifier::{Call, MessangerHandle, MessangerInterface, Messangers},
+    messenger_unifier::{Call, MessengerHandle, MessengerInterface, Messengers},
     pages::{
-        MessangerData,
+        MessengerData,
         messenger::{
             chat::{Action as ChatAction, Chat},
             contacts::{Contacts, Message as ContactsMessage},
@@ -38,10 +38,10 @@ pub(crate) enum Message {
     ChangeMain(Main),
     SetSidebarServer(Option<Server>), // TODO: Make it just a SetSidebar
     DividerChange(f32),
-    UpdateMessanger((MessangerHandle, MessangerData)),
-    // TODO: Depricate UpdateChat, switch to use UpdateMessenger
+    UpdateMessenger((MessengerHandle, MessengerData)),
+    // TODO: Deprecate UpdateChat, switch to use UpdateMessenger
     UpdateChat {
-        handle: MessangerHandle,
+        handle: MessengerHandle,
         kv: (ID, Vec<Identifier<InterfaceMessage>>),
     },
 }
@@ -69,20 +69,20 @@ impl Messenger {
 pub enum Action {
     None,
     UpdateChat {
-        handle: MessangerHandle,
+        handle: MessengerHandle,
         kv: (ID, Vec<Identifier<InterfaceMessage>>),
     },
-    UpdateMessanger((MessangerHandle, MessangerData)),
+    UpdateMessenger((MessengerHandle, MessengerData)),
     Run(Task<Message>),
     Call {
-        interface: MessangerInterface,
+        interface: MessengerInterface,
         channel: Identifier<Place<Room>>,
     },
     DisconnectFromCall(Call),
 }
 
 impl Messenger {
-    pub(crate) fn update(&mut self, message: Message, messengers: &Messangers) -> Action {
+    pub(crate) fn update(&mut self, message: Message, messengers: &Messengers) -> Action {
         match message {
             Message::SetSidebarServer(server) => {
                 self.sidebar.server_selected = server;
@@ -100,8 +100,8 @@ impl Messenger {
                 Action::None
             }
             Message::UpdateChat { handle, kv } => Action::UpdateChat { handle, kv },
-            Message::UpdateMessanger((messanger_handle, messanger_data)) => {
-                Action::UpdateMessanger((messanger_handle, messanger_data))
+            Message::UpdateMessenger((messenger_handle, messenger_data)) => {
+                Action::UpdateMessenger((messenger_handle, messenger_data))
             }
             Message::Chat(msg) => {
                 if let Main::Chat(chat) = &mut self.main {
@@ -202,8 +202,8 @@ impl Messenger {
                     };
 
                     // Check cache
-                    if let Some(messanger) = messengers.data_from_handle(handle)
-                        && messanger.chats.contains_key(conversation.id())
+                    if let Some(messenger) = messengers.data_from_handle(handle)
+                        && messenger.chats.contains_key(conversation.id())
                     {
                         return Action::Run(Task::done(Message::ChangeMain(Main::Chat(
                             Chat::new(interface.to_owned(), conversation),
@@ -232,7 +232,7 @@ impl Messenger {
                         .then(
                             |t: Result<
                                 (
-                                    MessangerHandle,
+                                    MessengerHandle,
                                     Identifier<Place<Room>>,
                                     Vec<Identifier<InterfaceMessage>>,
                                 ),
@@ -256,7 +256,7 @@ impl Messenger {
         }
     }
 
-    pub(crate) fn view<'a>(&'a self, messengers: &'a Messangers) -> iced::Element<'a, Message> {
+    pub(crate) fn view<'a>(&'a self, messengers: &'a Messengers) -> iced::Element<'a, Message> {
         let profiles = row![Text::from(match messengers.data_iter().next() {
             Some(data) => {
                 match &data.profile {
@@ -264,7 +264,7 @@ impl Messenger {
                     None => "No connection made?",
                 }
             }
-            None => "No messangers connected",
+            None => "No messengers connected",
         })];
 
         let navbar = Navbar::get_element(messengers).map(Message::Navbar);
