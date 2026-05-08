@@ -108,10 +108,10 @@ impl<Op> GatewayPayload<Op> {
 
 #[deprecated]
 trait GatewayStream {
-    async fn next_gateway_payload<Op: Facet<'static>>(&mut self) -> GatewayPayload<Op>;
+    async fn next_gateway_payload<Op: Facet<'static>>(&mut self) -> Option<GatewayPayload<Op>>;
 }
 impl GatewayStream for WebSocketStream<ConnectStream> {
-    async fn next_gateway_payload<Op: Facet<'static>>(&mut self) -> GatewayPayload<Op> {
+    async fn next_gateway_payload<Op: Facet<'static>>(&mut self) -> Option<GatewayPayload<Op>> {
         // NOTE: this trait can't return a Result, so we "best-effort" skip frames until a valid
         // text payload arrives.
         //
@@ -120,7 +120,7 @@ impl GatewayStream for WebSocketStream<ConnectStream> {
         while let Some(next) = self.next().await {
             match next {
                 Ok(WebsocketMessage::Text(utf8)) => {
-                    return facet_json::from_str::<GatewayPayload<Op>>(&utf8).unwrap();
+                    return Some(facet_json::from_str::<GatewayPayload<Op>>(&utf8).unwrap());
                 }
                 Ok(WebsocketMessage::Ping(_)) | Ok(WebsocketMessage::Pong(_)) => {
                     // ignore
@@ -138,7 +138,7 @@ impl GatewayStream for WebSocketStream<ConnectStream> {
                 }
             }
         }
-        panic!("Gateway websocket closed before receiving a payload");
+        None
     }
 }
 

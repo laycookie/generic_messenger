@@ -442,7 +442,9 @@ fn execute_pending_transition(
 
     let old_version = dave_session.protocol_version();
     if old_version != new_version {
-        error!("Downgrade or upgrade");
+        // TODO: Actually apply the version transition here. Currently the new protocol
+        // version is acknowledged (removed from pending) but never applied to the session.
+        error!("DAVE protocol version mismatch: old={old_version:?}, new={new_version:?}. Transition not applied");
     }
 }
 

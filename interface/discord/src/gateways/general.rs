@@ -101,7 +101,8 @@ impl Gateway<General> {
 
         // First event send by discord has to be Hello event according to
         // https://docs.discord.food/topics/gateway#connections
-        let hello_event = gateway_websocket.next_gateway_payload().await;
+        let hello_event = gateway_websocket.next_gateway_payload().await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "gateway closed before receiving hello"))?;
 
         let Opcode::Hello = hello_event.op else {
             return Err(Box::new(io::Error::new(

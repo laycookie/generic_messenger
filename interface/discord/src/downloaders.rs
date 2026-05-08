@@ -52,11 +52,7 @@ pub async fn cache_download(
         return Err(format!("Failed to download file. Status: {}", res.status()).into());
     };
 
-    // Create a file at the specified path
-    match fs::create_dir_all(&path) {
-        Ok(_) => debug!("Directory created successfully: {:?}", path),
-        Err(e) => error!("Failed to create directory: {}", e),
-    }
+    fs::create_dir_all(&path)?;
 
     let mut file = File::create(&file_path)?;
 

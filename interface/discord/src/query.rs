@@ -1,5 +1,6 @@
 use crate::{
-    AudioDiscord, Discord, InnerDiscord, Owned, QueryDiscord, TextDiscord, VoiceDiscord,
+    DISCORD_API, AudioDiscord, Discord, InnerDiscord, Owned, QueryDiscord, TextDiscord,
+    VoiceDiscord,
     api_types::{self, SNOWFLAKE},
     downloaders::{cache_download, http_request},
 };
@@ -26,7 +27,7 @@ impl InnerDiscord<Owned> {
     ) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
         // DMs / group DMs
         let channels = http_request::<Vec<api_types::Channel>>(
-            surf::get("https://discord.com/api/v10/users/@me/channels"),
+            surf::get(format!("{DISCORD_API}/users/@me/channels")),
             self.get_auth_header(),
         )
         .await?;
@@ -61,7 +62,7 @@ impl InnerDiscord<Owned> {
     ) -> Result<Vec<Identifier<Place<House>>>, Box<dyn Error + Sync + Send>> {
         // Guilds / servers
         let guilds = http_request::<Vec<api_types::Guild>>(
-            surf::get("https://discord.com/api/v10/users/@me/guilds"),
+            surf::get(format!("{DISCORD_API}/users/@me/guilds")),
             self.get_auth_header(),
         )
         .await?;
@@ -116,10 +117,7 @@ impl InnerDiscord<Owned> {
         guild_id: SNOWFLAKE,
     ) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
         let channels = http_request::<Vec<api_types::Channel>>(
-            surf::get(format!(
-                "https://discord.com/api/v10/guilds/{}/channels",
-                guild_id
-            )),
+            surf::get(format!("{DISCORD_API}/guilds/{guild_id}/channels")),
             self.get_auth_header(),
         )
         .await?;
@@ -128,13 +126,12 @@ impl InnerDiscord<Owned> {
         Ok(channels
             .into_iter()
             .filter_map(|channel| {
-                if channel
-                    .permission_overwrites
-                    .as_ref()?
-                    .iter()
-                    // TODO: Rewrite
-                    .any(|a| a.deny.parse::<u32>().unwrap() & (1 << 10) == (1 << 10))
-                {
+                if channel.permission_overwrites.as_ref().map_or(false, |overwrites| {
+                    overwrites
+                        .iter()
+                        // TODO: Rewrite
+                        .any(|a| a.deny.parse::<u64>().unwrap_or(0) & (1 << 10) != 0)
+                }) {
                     return None;
                 };
 
@@ -171,7 +168,7 @@ impl InnerDiscord<Owned> {
 impl Query for InnerDiscord<Owned> {
     async fn client_user(&self) -> Result<Identifier<User>, Box<dyn Error + Sync + Send>> {
         let profile = http_request::<api_types::Profile>(
-            surf::get("https://discord.com/api/v9/users/@me"),
+            surf::get(format!("{DISCORD_API}/users/@me")),
             self.get_auth_header(),
         )
         .await?;
@@ -192,7 +189,7 @@ impl Query for InnerDiscord<Owned> {
 
     async fn contacts(&self) -> Result<Vec<Identifier<User>>, Box<dyn Error + Sync + Send>> {
         let friends = http_request::<Vec<api_types::Friend>>(
-            surf::get("https://discord.com/api/v9/users/@me/relationships"),
+            surf::get(format!("{DISCORD_API}/users/@me/relationships")),
             self.get_auth_header(),
         )
         .await?;
@@ -288,7 +285,7 @@ impl Text for InnerDiscord<Owned> {
 
         let messages = http_request::<Vec<api_types::Message>>(
             surf::get(format!(
-                "https://discord.com/api/v10/channels/{}/messages{}",
+                "{DISCORD_API}/channels/{}/messages{}",
                 channel_id.id, before,
             )),
             self.get_auth_header(),
@@ -356,7 +353,7 @@ impl Text for InnerDiscord<Owned> {
 
         let _msg = http_request::<api_types::Message>(
             surf::post(format!(
-                "https://discord.com/api/v9/channels/{}/messages",
+                "{DISCORD_API}/channels/{}/messages",
                 channel_id.id,
             ))
             .body(msg_string)

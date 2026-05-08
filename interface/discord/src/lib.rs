@@ -29,6 +29,8 @@ mod downloaders;
 mod gateways;
 mod query;
 
+pub(crate) const DISCORD_API: &str = "https://discord.com/api/v10";
+
 #[derive(Clone)]
 struct ChannelID {
     guild_id: Option<SNOWFLAKE>,
@@ -80,6 +82,7 @@ impl UnitStruct for AudioDiscord {}
 struct AudioManager {
     microphone_recv: Cell<Option<oneshot::Receiver<SampleConsumer>>>,
     microphone: Option<SampleConsumer>,
+    microphone_retries: u8,
 }
 
 struct InnerDiscord<T: UnitStruct> {

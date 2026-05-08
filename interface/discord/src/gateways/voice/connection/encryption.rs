@@ -48,8 +48,9 @@ impl EncryptionMode {
         }
     }
 }
-impl From<&str> for EncryptionMode {
-    fn from(value: &str) -> Self {
+impl TryFrom<&str> for EncryptionMode {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
         for mode in [
             EncryptionMode::aead_aes256_gcm_rtpsize,
             EncryptionMode::aead_xchacha20_poly1305_rtpsize,
@@ -60,10 +61,10 @@ impl From<&str> for EncryptionMode {
             EncryptionMode::xsalsa20_poly1305_lite,
         ] {
             if mode.as_str() == value {
-                return mode;
+                return Ok(mode);
             }
         }
-        panic!("Not implemented: {}", value);
+        Err(format!("Unknown encryption mode: {}", value))
     }
 }
 

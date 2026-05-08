@@ -66,7 +66,8 @@ impl Gateway<Voice> {
             .send(identify_payload.to_string().into())
             .await?;
 
-        let hello_event = voice_websocket.next_gateway_payload().await;
+        let hello_event = voice_websocket.next_gateway_payload().await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "voice gateway closed before receiving hello"))?;
 
         let VoiceOpcode::Hello = hello_event.op else {
             return Err(io::Error::new(

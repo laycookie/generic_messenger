@@ -29,19 +29,40 @@ use crate::{AudioManager, InnerDiscord, Owned, UnitStruct, VoiceDiscord};
 
 impl<T: UnitStruct> InnerDiscord<T> {
     pub async fn poll_voice(&self) -> Option<()> {
+        const MAX_MICROPHONE_RETRIES: u8 = 3;
+
         let AudioManager {
             ref mut microphone,
             ref microphone_recv,
+            ref mut microphone_retries,
         } = *self.audio_manager.lock().await;
         if microphone.is_none() {
             let Some(receiver) = microphone_recv.take() else {
+                if *microphone_retries >= MAX_MICROPHONE_RETRIES {
+                    error!(
+                        "Microphone acquisition failed after {MAX_MICROPHONE_RETRIES} retries, giving up"
+                    );
+                    return None;
+                }
                 let (sender, receiver) = oneshot::channel();
                 self.audio_events.push(AudioEvent::AddAudioInput(sender));
                 microphone_recv.set(Some(receiver));
                 return Some(());
             };
-            // TODO: Handle oneshot channel error (sender dropped)
-            *microphone = Some(receiver.await.unwrap());
+            match receiver.await {
+                Ok(consumer) => {
+                    *microphone = Some(consumer);
+                    *microphone_retries = 0;
+                }
+                Err(_) => {
+                    *microphone_retries += 1;
+                    warn!(
+                        "Microphone input sender was dropped (attempt {}/{})",
+                        *microphone_retries, MAX_MICROPHONE_RETRIES
+                    );
+                    return Some(());
+                }
+            }
         };
         let microphone_input = microphone.as_mut().unwrap();
 
@@ -175,15 +196,23 @@ impl<T: UnitStruct> InnerDiscord<T> {
                                 let mut channel = channel_entry.get().lock().unwrap();
                                 match &mut *channel {
                                     voice::AudioChannel::Initializing(receiver) => {
-                                        // TODO: Handle oneshot channel error (sender dropped)
-                                        let producer = match receiver.try_recv().unwrap() {
-                                            Some(producer) => producer,
-                                            None => continue,
-                                        };
-                                        drop(channel);
-                                        channel_entry.insert(
-                                            voice::AudioChannel::Connected(producer).into(),
-                                        );
+                                        match receiver.try_recv() {
+                                            Ok(Some(producer)) => {
+                                                drop(channel);
+                                                channel_entry.insert(
+                                                    voice::AudioChannel::Connected(producer).into(),
+                                                );
+                                            }
+                                            Ok(None) => continue,
+                                            Err(_) => {
+                                                // Sender dropped without providing a SampleProducer.
+                                                // Remove entry so it gets re-requested on the next packet.
+                                                drop(channel);
+                                                channel_entry.remove();
+                                                warn!("Audio source sender dropped for SSRC {ssrc}, will re-request");
+                                                break;
+                                            }
+                                        }
                                     }
                                     voice::AudioChannel::Connected(producer) => {
                                         let samples_pushed = producer.push_iter(
