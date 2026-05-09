@@ -42,3 +42,5 @@ davey = "0.1.3"
 messenger_interface = { path = "../../crate/messenger_interface" }
 # enums
 num_enum = "0.7.6"
+# Bitflags
+bitflags = { workspace = true }

@@ -11,6 +11,8 @@ members = [
 [workspace.dependencies]
 # Logs
 tracing = "0.1.44"
+# Bitflags
+bitflags = "2.11.1"
 # Serilization/Deserilization
 facet = "0.46.0"
 # facet = { git = "https://github.com/facet-rs/facet", branch = "main" }

@@ -7,6 +7,7 @@ use std::{
 
 use arc_swap::ArcSwapOption;
 use asyncs_sync::Notify;
+use bitflags::bitflags;
 use crossbeam::queue::SegQueue;
 use futures::{channel::oneshot, lock::Mutex as AsyncMutex};
 use futures_locks::RwLock as RwLockAwait;
@@ -29,40 +30,28 @@ mod query;
 
 pub(crate) const DISCORD_API: &str = "https://discord.com/api/v10";
 
-/// <https://discord.com/developers/docs/events/gateway#list-of-intents>
-mod intents {
-    pub const GUILDS: u32 = 1 << 0;
-    pub const GUILD_MODERATION: u32 = 1 << 2;
-    pub const GUILD_EXPRESSIONS: u32 = 1 << 3;
-    pub const GUILD_INTEGRATIONS: u32 = 1 << 4;
-    pub const GUILD_WEBHOOKS: u32 = 1 << 5;
-    pub const GUILD_INVITES: u32 = 1 << 6;
-    pub const GUILD_VOICE_STATES: u32 = 1 << 7;
-    pub const GUILD_PRESENCES: u32 = 1 << 8;
-    pub const GUILD_MESSAGES: u32 = 1 << 9;
-    pub const GUILD_MESSAGE_REACTIONS: u32 = 1 << 10;
-    pub const DIRECT_MESSAGES: u32 = 1 << 12;
-    pub const DIRECT_MESSAGE_REACTIONS: u32 = 1 << 13;
-    pub const DIRECT_MESSAGE_TYPING: u32 = 1 << 14;
-    pub const MESSAGE_CONTENT: u32 = 1 << 15;
-    pub const AUTO_MODERATION_CONFIGURATION: u32 = 1 << 17;
+bitflags! {
+    /// <https://discord.com/developers/docs/events/gateway#list-of-intents>
+    struct Intents: u32 {
+        const GUILDS                    = 1 << 0;
+        const GUILD_MODERATION          = 1 << 2;
+        const GUILD_EXPRESSIONS         = 1 << 3;
+        const GUILD_INTEGRATIONS        = 1 << 4;
+        const GUILD_WEBHOOKS            = 1 << 5;
+        const GUILD_INVITES             = 1 << 6;
+        const GUILD_VOICE_STATES        = 1 << 7;
+        const GUILD_PRESENCES           = 1 << 8;
+        const GUILD_MESSAGES            = 1 << 9;
+        const GUILD_MESSAGE_REACTIONS   = 1 << 10;
+        const DIRECT_MESSAGES           = 1 << 12;
+        const DIRECT_MESSAGE_REACTIONS  = 1 << 13;
+        const DIRECT_MESSAGE_TYPING     = 1 << 14;
+        const MESSAGE_CONTENT           = 1 << 15;
+        const AUTO_MODERATION_CONFIGURATION = 1 << 17;
+    }
 }
 
-const DEFAULT_INTENTS: u32 = intents::GUILDS
-    | intents::GUILD_MODERATION
-    | intents::GUILD_EXPRESSIONS
-    | intents::GUILD_INTEGRATIONS
-    | intents::GUILD_WEBHOOKS
-    | intents::GUILD_INVITES
-    | intents::GUILD_VOICE_STATES
-    | intents::GUILD_PRESENCES
-    | intents::GUILD_MESSAGES
-    | intents::GUILD_MESSAGE_REACTIONS
-    | intents::DIRECT_MESSAGES
-    | intents::DIRECT_MESSAGE_REACTIONS
-    | intents::DIRECT_MESSAGE_TYPING
-    | intents::MESSAGE_CONTENT
-    | intents::AUTO_MODERATION_CONFIGURATION;
+const DEFAULT_INTENTS: Intents = Intents::all();
 
 #[derive(Clone)]
 struct ChannelID {
@@ -121,7 +110,7 @@ struct AudioManager {
 struct InnerDiscord<T: UnitStruct> {
     // Metadata
     token: SecureString,
-    intents: u32,
+    intents: Intents,
     // Microphone
     audio_manager: AsyncMutex<AudioManager>,
     // socket related

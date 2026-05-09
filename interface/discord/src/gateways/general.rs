@@ -132,7 +132,7 @@ impl Gateway<General> {
                     "op": Opcode::Identify as u8,
                     "d": {
                         "token": token,
-                        "intents": discord.intents,
+                        "intents": discord.intents.bits(),
                         "properties": {
                             "$os": "Linux",
                             "$browser": "Firefox",
