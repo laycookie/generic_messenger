@@ -8,7 +8,10 @@ use std::{
 
 use async_trait::async_trait;
 use futures::{
-    FutureExt as _, StreamExt, channel::oneshot, future::select, pending, select, stream,
+    FutureExt as _, Stream, StreamExt,
+    channel::oneshot,
+    future::{Either, select},
+    pending, select, stream,
 };
 use messenger_interface::{
     interface::{AudioEvent, CallStatus, Voice as VoiceTrait, VoiceEvent},
@@ -24,7 +27,9 @@ use super::{
     parse_gateway_event,
     voice::{self, VoiceOpcode, connection::VOICE_FRAME_SAMPLES},
 };
-use crate::{AudioManager, InnerDiscord, Owned, UnitStruct, VoiceDiscord};
+use crate::{
+    AudioManager, InnerDiscord, Owned, UnitStruct, VoiceDiscord, gateways::GatewayStreamReciver,
+};
 
 fn speaking_payload(ssrc: u32, speaking: bool) -> String {
     json!({
@@ -252,55 +257,49 @@ impl<T: UnitStruct> InnerDiscord<T> {
             self.pulled_notification.notified().await;
             return;
         };
+        let mut gateway_receiver = pin!(gateway_receiver.filter_payload::<Opcode>());
 
         let voice_gateway = ref_gateway.voice.full_load_gateway();
-        let voice_gateway_event_fut = {
-            let voice_gateway = voice_gateway.clone();
-            async {
-                match voice_gateway {
-                    Some(voice_gateway) => voice_gateway.websocket.next().await,
-                    None => futures::future::pending().await,
-                }
+        let voice_gateway_clone = voice_gateway.clone();
+
+        let mut websocket_reciver_guard;
+        let mut voice_gateway_reciver = pin!(match voice_gateway.as_ref() {
+            Some(voice_gateway) => {
+                websocket_reciver_guard = voice_gateway.websocket.receiver.lock().await;
+                Either::Right(websocket_reciver_guard.filter_payload::<VoiceOpcode>())
             }
-        };
+            // Eternally hang this
+            None => Either::Left(stream::empty()),
+        });
 
         // TODO: Investigate using Websocket::next_payload() diractly
         select! {
         // Main gateway
         event = gateway_receiver.next() => {
-            let parsed = match event {
-                Some(Ok(msg)) => parse_gateway_event::<Opcode>(msg),
-                Some(Err(err)) => { error!("Stream error: {err}"); None }
-                None => None,
+            let Some(event) = event else {
+                error!("Gateway closed?");
+                return;
             };
-            if let Some(event) = parsed
-                && let Err(err) = event.exec(self).await
-            {
-                warn!("Failed to execute gateway event: {err}")
+            if let Err(err) = event.exec(self).await {
+                warn!("Failed to execute gateway event: {err}");
             }
         }
         // voice gateway
-        event = voice_gateway_event_fut.fuse() => {
-            let parsed = match event {
-                Some(Ok(msg)) => parse_gateway_event::<VoiceOpcode>(msg),
-                Some(Err(err)) => { error!("Stream error: {err}"); None }
-                None => {
-                    warn!("Stream closed");
-                    ref_gateway.voice.disconnect().await;
-                    None
-                }
+        event = voice_gateway_reciver.next() => {
+            let Some(event) = event else {
+                error!("Gateway closed?");
+                return;
             };
-            if let Some(event) = parsed
-                && let Err(err) = event.exec(self).await
+            if  let Err(err) = event.exec(self).await
             {
-                warn!("Failed to execute gateway event: {err}")
+                warn!("Failed to execute voice gateway event: {err}")
             }
         }
         // heartbeat over main gateway
         _ = ref_gateway.heartbeat().fuse() => {}
         // voice heartbeat over main gateway
         _ = async {
-                match voice_gateway {
+                match voice_gateway_clone {
                     Some(voice_gateway) => voice_gateway.heartbeat().await,
                     None => futures::future::pending().await,
                 }

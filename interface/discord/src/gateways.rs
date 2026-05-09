@@ -1,11 +1,8 @@
 use std::{
     iter,
     ops::Deref,
-    pin::Pin,
-    sync::{
-        OnceLock,
-        atomic::AtomicUsize,
-    },
+    pin::{Pin, pin},
+    sync::{OnceLock, atomic::AtomicUsize},
     time::Duration,
 };
 
@@ -15,15 +12,15 @@ use async_tungstenite::{
     tungstenite::{Bytes, Message as WebsocketMessage},
 };
 use facet::Facet;
-use futures::{StreamExt, lock::Mutex as AsyncMutex};
+use futures::{Stream, StreamExt, lock::Mutex as AsyncMutex, stream::FusedStream};
 use futures_timer::Delay;
 use tracing::warn;
 
 use crate::gateways::general::GatewayEvent;
 
 pub mod general;
-pub mod voice;
 mod polling;
+pub mod voice;
 
 struct Websocket {
     sender: AsyncMutex<WebSocketSender<ConnectStream>>,
@@ -56,25 +53,31 @@ impl Websocket {
             )))
             .await
     }
-    async fn next(
-        &self,
-    ) -> Option<Result<WebsocketMessage, async_tungstenite::tungstenite::Error>> {
-        let mut receiver = self.receiver.lock().await;
-        receiver.next().await
-    }
-    async fn next_payload<Op: Facet<'static> + TryFrom<u8>>(&self) -> Option<GatewayPayload<Op>> {
-        loop {
-            match self.next().await? {
-                Ok(msg) => {
-                    if let Some(payload) = parse_gateway_event(msg) {
-                        return Some(payload);
+}
+trait GatewayStreamReciver: FusedStream {
+    fn filter_payload<Op: Facet<'static> + TryFrom<u8>>(
+        &mut self,
+    ) -> impl FusedStream<Item = GatewayPayload<Op>> + '_;
+}
+impl GatewayStreamReciver for WebSocketReceiver<ConnectStream> {
+    fn filter_payload<Op: Facet<'static> + TryFrom<u8>>(
+        &mut self,
+    ) -> impl FusedStream<Item = GatewayPayload<Op>> + '_ {
+        self.filter_map(async |msg| -> Option<GatewayPayload<Op>> {
+            match msg {
+                Ok(msg) => match parse_gateway_event::<Op>(msg) {
+                    Some(payload) => Some(payload),
+                    None => {
+                        warn!("Something went wrong parsing the event payload");
+                        None
                     }
-                }
+                },
                 Err(err) => {
                     warn!("Gateway websocket error while waiting for payload: {err:#?}");
+                    None
                 }
             }
-        }
+        })
     }
 }
 

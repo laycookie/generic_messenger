@@ -1,21 +1,19 @@
-use std::{
-    error::Error,
-    io,
-    sync::OnceLock,
-    time::Duration,
-};
+use std::{error::Error, io, pin::pin, sync::OnceLock, time::Duration};
 
 use async_tungstenite::{async_std::connect_async, tungstenite::Message as WebsocketMessage};
 use facet::Facet;
+use futures::StreamExt;
 use num_enum::TryFromPrimitive;
 use surf::http::convert::json;
 use tracing::debug;
 
+use self::payloads::HelloPayload;
 use crate::{
     InnerDiscord, UnitStruct,
-    gateways::{Gateway, HeartBeatingData, Websocket, voice::VoiceGateway},
+    gateways::{
+        Gateway, GatewayStreamReciver as _, HeartBeatingData, Websocket, voice::VoiceGateway,
+    },
 };
-use self::payloads::HelloPayload;
 
 mod events;
 mod payloads;
@@ -103,8 +101,16 @@ impl Gateway<General> {
 
         // First event send by discord has to be Hello event according to
         // https://docs.discord.food/topics/gateway#connections
-        let hello_event = websocket.next_payload().await
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "gateway closed before receiving hello"))?;
+        let hello_event = {
+            let mut receiver = websocket.receiver.lock().await;
+            pin!(receiver.filter_payload()).next().await
+        }
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "gateway closed before receiving hello",
+            )
+        })?;
 
         let Opcode::Hello = hello_event.op else {
             return Err(Box::new(io::Error::new(

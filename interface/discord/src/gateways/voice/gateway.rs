@@ -1,6 +1,7 @@
 use std::{
     io,
     num::NonZeroU16,
+    pin::pin,
     sync::{OnceLock, atomic::AtomicBool},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -10,7 +11,10 @@ use async_tungstenite::async_std::connect_async;
 use dashmap::DashMap;
 use davey::{DAVE_PROTOCOL_VERSION, DaveSession};
 use facet_pretty::FacetPretty;
-use futures::lock::{Mutex as AsyncMutex, MutexGuard};
+use futures::{
+    StreamExt as _,
+    lock::{Mutex as AsyncMutex, MutexGuard},
+};
 use surf::http::convert::json;
 use tracing::{debug, info};
 
@@ -19,8 +23,8 @@ use super::{
     connection::{Connection, Ssrc},
     payloads::HelloPayload,
 };
-use crate::api_types::SNOWFLAKE;
 use crate::gateways::{Gateway, HeartBeatingData, Websocket};
+use crate::{api_types::SNOWFLAKE, gateways::GatewayStreamReciver as _};
 
 pub struct Voice {
     heartbeat_version: u8,
@@ -91,12 +95,18 @@ impl Gateway<Voice> {
           }
         });
         debug!("{identify_payload:#?}");
-        websocket
-            .send(identify_payload.to_string().into())
-            .await?;
+        websocket.send(identify_payload.to_string().into()).await?;
 
-        let hello_event = websocket.next_payload().await
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "voice gateway closed before receiving hello"))?;
+        let hello_event = {
+            let mut receiver = websocket.receiver.lock().await;
+            pin!(receiver.filter_payload()).next().await
+        }
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "voice gateway closed before receiving hello",
+            )
+        })?;
 
         let VoiceOpcode::Hello = hello_event.op else {
             return Err(io::Error::new(
