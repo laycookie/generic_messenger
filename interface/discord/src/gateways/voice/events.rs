@@ -20,7 +20,7 @@ use async_tungstenite::tungstenite::Message;
 use super::{
     VoiceOpcode,
     connection::{Connection, EncryptionMode, SessionDescription},
-    payloads::{DAVEPrepareEpoch, ReadyPayload, SpeakingPayload},
+    payloads::{DAVEPrepareEpoch, MlsProposalsPayload, MlsTransitionPayload, ReadyPayload, SpeakingPayload},
 };
 use crate::api_types::SNOWFLAKE;
 use crate::gateways::{GatewayPayload, Websocket};
@@ -67,6 +67,7 @@ struct IpDiscovery {
     address_ascii: [u8; 64],
     port: u16be,
 }
+const _: () = assert!(mem::size_of::<IpDiscovery>() == 74);
 
 impl GatewayPayload<VoiceOpcode> {
     pub async fn exec<T: UnitStruct>(
@@ -201,11 +202,7 @@ impl GatewayPayload<VoiceOpcode> {
                     .await?;
             }
             VoiceOpcode::DAVEProtocolPrepareTransition => {
-                let mut dave_session = voice_gateway.dave_session.lock().await;
-                let dave_session = match dave_session.as_mut() {
-                    Some(dave_session) => dave_session,
-                    None => return Err(io::Error::new(io::ErrorKind::InvalidData, "DAVE session not initialized").into()),
-                };
+                let mut dave_session = voice_gateway.require_dave_session().await?;
 
                 let packet = facet_value::from_value::<DAVEPrepareEpoch>(self.d)?;
 
@@ -217,7 +214,7 @@ impl GatewayPayload<VoiceOpcode> {
 
                 if transition_id == 0 {
                     execute_pending_transition(
-                        dave_session,
+                        &mut *dave_session,
                         &voice_gateway.dave_pending_transitions,
                         transition_id,
                     );
@@ -228,16 +225,12 @@ impl GatewayPayload<VoiceOpcode> {
                 }
             }
             VoiceOpcode::DAVEProtocolExecuteTransition => {
-                let mut dave_session = voice_gateway.dave_session.lock().await;
-                let dave_session = match dave_session.as_mut() {
-                    Some(dave_session) => dave_session,
-                    None => return Err(io::Error::new(io::ErrorKind::InvalidData, "DAVE session not initialized").into()),
-                };
+                let mut dave_session = voice_gateway.require_dave_session().await?;
 
                 let packet = facet_value::from_value::<DAVEPrepareEpoch>(self.d)?;
                 let transition_id = packet.transition_id;
                 execute_pending_transition(
-                    dave_session,
+                    &mut *dave_session,
                     &voice_gateway.dave_pending_transitions,
                     transition_id,
                 );
@@ -262,34 +255,22 @@ impl GatewayPayload<VoiceOpcode> {
                 }
             }
             VoiceOpcode::MLSExternalSenderPackage => {
-                let mut dave_session = voice_gateway.dave_session.lock().await;
-                let dave_session = match dave_session.as_mut() {
-                    Some(dave_session) => dave_session,
-                    None => return Err(io::Error::new(io::ErrorKind::InvalidData, "DAVE session not initialized").into()),
-                };
+                let mut dave_session = voice_gateway.require_dave_session().await?;
 
                 let bytes = facet_value::from_value::<Vec<u8>>(self.d)?;
-                if let Err(err) = dave_session.set_external_sender(&bytes[1..]) {
+                if let Err(err) = dave_session.set_external_sender(&bytes) {
                     error!("{err}");
                     return Err(err.into());
                 };
             }
             VoiceOpcode::MLSProposals => {
-                let mut dave_session = voice_gateway.dave_session.lock().await;
-                let dave_session = match dave_session.as_mut() {
-                    Some(dave_session) => dave_session,
-                    None => return Err(io::Error::new(io::ErrorKind::InvalidData, "DAVE session not initialized").into()),
-                };
+                let mut dave_session = voice_gateway.require_dave_session().await?;
                 let bytes = facet_value::from_value::<Vec<u8>>(self.d)?;
+                let proposals = MlsProposalsPayload::try_from(bytes)?;
 
-                let optype = if bytes[1] == 0 {
-                    davey::ProposalsOperationType::APPEND
-                } else {
-                    davey::ProposalsOperationType::REVOKE
-                };
                 let commit_welcome = match dave_session.process_proposals(
-                    optype,
-                    &bytes[2..],
+                    proposals.operation_type,
+                    &proposals.data,
                     // TODO: Add this for security purposes, should be received from CLIENTS_CONNECT
                     None,
                 ) {
@@ -326,97 +307,37 @@ impl GatewayPayload<VoiceOpcode> {
                 }
             }
             VoiceOpcode::MLSAnnounceCommitTransition => {
-                let mut dave_session = voice_gateway.dave_session.lock().await;
-                let dave_session = match dave_session.as_mut() {
-                    Some(dave_session) => dave_session,
-                    None => return Err(io::Error::new(io::ErrorKind::InvalidData, "DAVE session not initialized").into()),
-                };
+                let mut dave_session = voice_gateway.require_dave_session().await?;
                 let bytes = facet_value::from_value::<Vec<u8>>(self.d)?;
+                let payload = MlsTransitionPayload::try_from(bytes)?;
 
-                let transition_id = u16::from_be_bytes(bytes[1..3].try_into().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "transition_id slice too short"))?);
-                if let Err(err) = dave_session.process_commit(&bytes[3..]) {
-                    error!("{err:?}");
-                    voice_gateway
-                        .websocket
-                        .send(async_tungstenite::tungstenite::Message::Text(
-                            json!({
-                                "op": VoiceOpcode::MLSInvalidCommitWelcome as u8,
-                                "d": {
-                                  "transition_id": transition_id
-                                }
-                            })
-                            .to_string()
-                            .into(),
-                        ))
-                        .await?
-                } else {
-                    if transition_id != 0 {
-                        voice_gateway
-                            .dave_pending_transitions
-                            .insert(transition_id, dave_session.protocol_version());
-                        //TODO
-                        voice_gateway
-                            .websocket
-                            .send(async_tungstenite::tungstenite::Message::Text(
-                                json!({
-                                    "op": VoiceOpcode::DAVEProtocolTransitionReady as u8,
-                                    "d": {
-                                      "transition_id": transition_id
-                                    }
-                                })
-                                .to_string()
-                                .into(),
-                            ))
-                            .await?
-                    }
-                }
+                let result = dave_session.process_commit(&payload.data);
+                respond_to_mls_transition(
+                    &voice_gateway.websocket,
+                    &voice_gateway.dave_pending_transitions,
+                    dave_session.protocol_version(),
+                    payload.transition_id,
+                    result,
+                )
+                .await?;
             }
             VoiceOpcode::MLSWelcome => {
-                let mut dave_session = voice_gateway.dave_session.lock().await;
-                let dave_session = match dave_session.as_mut() {
-                    Some(dave_session) => dave_session,
-                    None => return Err(io::Error::new(io::ErrorKind::InvalidData, "DAVE session not initialized").into()),
-                };
+                let mut dave_session = voice_gateway.require_dave_session().await?;
                 let bytes = facet_value::from_value::<Vec<u8>>(self.d)?;
+                let payload = MlsTransitionPayload::try_from(bytes)?;
 
-                let transition_id = u16::from_be_bytes(bytes[1..3].try_into().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "transition_id slice too short"))?);
-                if let Err(err) = dave_session.process_welcome(&bytes[3..]) {
-                    error!("{err:?}");
-                    voice_gateway
-                        .websocket
-                        .send(async_tungstenite::tungstenite::Message::Text(
-                            json!({
-                                "op": VoiceOpcode::MLSInvalidCommitWelcome as u8,
-                                "d": {
-                                  "transition_id": transition_id
-                                }
-                            })
-                            .to_string()
-                            .into(),
-                        ))
-                        .await?
-                } else {
+                let result = dave_session.process_welcome(&payload.data);
+                if result.is_ok() {
                     debug!("{:?}", dave_session.get_user_ids());
-                    if transition_id != 0 {
-                        voice_gateway
-                            .dave_pending_transitions
-                            .insert(transition_id, dave_session.protocol_version());
-                        //TODO
-                        voice_gateway
-                            .websocket
-                            .send(async_tungstenite::tungstenite::Message::Text(
-                                json!({
-                                    "op": VoiceOpcode::DAVEProtocolTransitionReady as u8,
-                                    "d": {
-                                      "transition_id": transition_id
-                                    }
-                                })
-                                .to_string()
-                                .into(),
-                            ))
-                            .await?
-                    }
                 }
+                respond_to_mls_transition(
+                    &voice_gateway.websocket,
+                    &voice_gateway.dave_pending_transitions,
+                    dave_session.protocol_version(),
+                    payload.transition_id,
+                    result,
+                )
+                .await?;
             }
             _ => {
                 warn!("Unknown voice-opcode received: {:?}", self.op);
@@ -446,6 +367,45 @@ fn execute_pending_transition(
         // version is acknowledged (removed from pending) but never applied to the session.
         error!("DAVE protocol version mismatch: old={old_version:?}, new={new_version:?}. Transition not applied");
     }
+}
+
+async fn respond_to_mls_transition<E: std::fmt::Debug>(
+    websocket: &Websocket,
+    dave_pending_transitions: &DashMap<u16, NonZeroU16>,
+    protocol_version: NonZeroU16,
+    transition_id: u16,
+    process_result: Result<(), E>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match process_result {
+        Err(err) => {
+            error!("{err:?}");
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "op": VoiceOpcode::MLSInvalidCommitWelcome as u8,
+                        "d": { "transition_id": transition_id }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await?;
+        }
+        Ok(()) if transition_id != 0 => {
+            dave_pending_transitions.insert(transition_id, protocol_version);
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "op": VoiceOpcode::DAVEProtocolTransitionReady as u8,
+                        "d": { "transition_id": transition_id }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await?;
+        }
+        Ok(()) => {}
+    }
+    Ok(())
 }
 
 async fn reinit_dave_session(

@@ -26,6 +26,10 @@ pub trait ArcStream: Send + Sync {
 /// A stream adapter that wraps a Weak reference to an [`ArcStream`] and
 /// automatically stops when the underlying Arc is dropped.
 ///
+/// Note that next_future holds Arc ref to ArcStream data, this means that
+/// before the underlying Arc gets dropped we need to finish polling the 
+/// current next_future.
+///
 /// Yields `Event` items directly. Implements [`Stream`] for use with `StreamExt`, iced, etc.
 pub struct WeakSocketStream<Event> {
     socket: Weak<dyn ArcStream<Item = Event> + Send + Sync>,

@@ -31,6 +31,41 @@ mod query;
 
 pub(crate) const DISCORD_API: &str = "https://discord.com/api/v10";
 
+/// <https://discord.com/developers/docs/events/gateway#list-of-intents>
+mod intents {
+    pub const GUILDS: u32 = 1 << 0;
+    pub const GUILD_MODERATION: u32 = 1 << 2;
+    pub const GUILD_EXPRESSIONS: u32 = 1 << 3;
+    pub const GUILD_INTEGRATIONS: u32 = 1 << 4;
+    pub const GUILD_WEBHOOKS: u32 = 1 << 5;
+    pub const GUILD_INVITES: u32 = 1 << 6;
+    pub const GUILD_VOICE_STATES: u32 = 1 << 7;
+    pub const GUILD_PRESENCES: u32 = 1 << 8;
+    pub const GUILD_MESSAGES: u32 = 1 << 9;
+    pub const GUILD_MESSAGE_REACTIONS: u32 = 1 << 10;
+    pub const DIRECT_MESSAGES: u32 = 1 << 12;
+    pub const DIRECT_MESSAGE_REACTIONS: u32 = 1 << 13;
+    pub const DIRECT_MESSAGE_TYPING: u32 = 1 << 14;
+    pub const MESSAGE_CONTENT: u32 = 1 << 15;
+    pub const AUTO_MODERATION_CONFIGURATION: u32 = 1 << 17;
+}
+
+const DEFAULT_INTENTS: u32 = intents::GUILDS
+    | intents::GUILD_MODERATION
+    | intents::GUILD_EXPRESSIONS
+    | intents::GUILD_INTEGRATIONS
+    | intents::GUILD_WEBHOOKS
+    | intents::GUILD_INVITES
+    | intents::GUILD_VOICE_STATES
+    | intents::GUILD_PRESENCES
+    | intents::GUILD_MESSAGES
+    | intents::GUILD_MESSAGE_REACTIONS
+    | intents::DIRECT_MESSAGES
+    | intents::DIRECT_MESSAGE_REACTIONS
+    | intents::DIRECT_MESSAGE_TYPING
+    | intents::MESSAGE_CONTENT
+    | intents::AUTO_MODERATION_CONFIGURATION;
+
 #[derive(Clone)]
 struct ChannelID {
     guild_id: Option<SNOWFLAKE>,
@@ -45,7 +80,7 @@ impl Discord {
     pub fn new_messenger(token: &str) -> Arc<dyn Messenger> {
         Arc::new(InnerDiscord {
             token: token.into(),
-            intents: 194557,
+            intents: DEFAULT_INTENTS,
             audio_manager: Default::default(),
             gateway: Default::default(),
             pulled_notification: Default::default(),

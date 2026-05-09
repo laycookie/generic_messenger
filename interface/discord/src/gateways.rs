@@ -59,11 +59,53 @@ impl Websocket {
     async fn next(
         &self,
     ) -> Option<Result<WebsocketMessage, async_tungstenite::tungstenite::Error>> {
-        if let Some(mut receiver) = self.receiver.try_lock() {
-            return receiver.next().await;
-        }
         let mut receiver = self.receiver.lock().await;
         receiver.next().await
+    }
+    async fn next_payload<Op: Facet<'static> + TryFrom<u8>>(&self) -> Option<GatewayPayload<Op>> {
+        loop {
+            match self.next().await? {
+                Ok(msg) => {
+                    if let Some(payload) = parse_gateway_event(msg) {
+                        return Some(payload);
+                    }
+                }
+                Err(err) => {
+                    warn!("Gateway websocket error while waiting for payload: {err:#?}");
+                }
+            }
+        }
+    }
+}
+
+/// Parse a text websocket message into a `GatewayPayload`.
+/// Returns `None` for non-text frames (binary, ping, close, etc.).
+fn parse_gateway_event<Op: Facet<'static> + TryFrom<u8>>(
+    msg: WebsocketMessage,
+) -> Option<GatewayPayload<Op>> {
+    match msg {
+        WebsocketMessage::Text(utf8) => match facet_json::from_str::<GatewayPayload<Op>>(&utf8) {
+            Ok(payload) => Some(payload),
+            Err(err) => {
+                warn!("Failed to parse gateway payload: {err}");
+                None
+            }
+        },
+        WebsocketMessage::Binary(bytes) => match voice::VoiceBinaryFrame::parse(&bytes) {
+            Ok(frame) => {
+                let op = Op::try_from(frame.opcode as u8).ok()?;
+                Some(GatewayPayload::new_binary(
+                    op,
+                    frame.sequence.map(|s| s as usize),
+                    frame.payload,
+                ))
+            }
+            Err(err) => {
+                warn!("Failed to parse binary frame: {err}");
+                None
+            }
+        },
+        _ => None,
     }
 }
 
@@ -96,6 +138,10 @@ pub struct GatewayPayload<Op> {
 }
 
 impl<Op> GatewayPayload<Op> {
+    /// Construct a `GatewayPayload` from a binary websocket frame.
+    ///
+    /// `d` must be the payload bytes **without** the leading opcode byte
+    /// (the opcode is already captured in `op`).
     pub fn new_binary(op: Op, s: Option<usize>, d: Vec<u8>) -> Self {
         Self {
             op,
@@ -103,42 +149,6 @@ impl<Op> GatewayPayload<Op> {
             s,
             d: facet_value::to_value(&d).unwrap(),
         }
-    }
-}
-
-#[deprecated]
-trait GatewayStream {
-    async fn next_gateway_payload<Op: Facet<'static>>(&mut self) -> Option<GatewayPayload<Op>>;
-}
-impl GatewayStream for WebSocketStream<ConnectStream> {
-    async fn next_gateway_payload<Op: Facet<'static>>(&mut self) -> Option<GatewayPayload<Op>> {
-        // NOTE: this trait can't return a Result, so we "best-effort" skip frames until a valid
-        // text payload arrives.
-        //
-        // TODO(discord-migration): change this API to return `Result<GatewayPayload<_>, _>` so
-        // callers can handle socket closure/errors explicitly.
-        while let Some(next) = self.next().await {
-            match next {
-                Ok(WebsocketMessage::Text(utf8)) => {
-                    return Some(facet_json::from_str::<GatewayPayload<Op>>(&utf8).unwrap());
-                }
-                Ok(WebsocketMessage::Ping(_)) | Ok(WebsocketMessage::Pong(_)) => {
-                    // ignore
-                }
-                Ok(WebsocketMessage::Binary(_)) => {
-                    // Discord can optionally send compressed/binary frames.
-                    // TODO(discord-migration): support compressed/binary gateway frames.
-                }
-                Ok(WebsocketMessage::Close(_)) => break,
-                Ok(WebsocketMessage::Frame(_)) => {
-                    // ignore
-                }
-                Err(err) => {
-                    warn!("Gateway websocket error while waiting for payload: {err:#?}");
-                }
-            }
-        }
-        None
     }
 }
 

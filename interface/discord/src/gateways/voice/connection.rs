@@ -96,20 +96,20 @@ impl RecvAudioFuture<'_> {
 
         // <https://datatracker.ietf.org/doc/html/rfc6464>
         let (potentially, voice_data) = decrypted_payload.split_at(8);
-        let unkown_const = &potentially[..1]; // CONST 55
+        let unknown_const = &potentially[..1]; // CONST 55
         // let timecode = &potentially[1..4]; // Timecode
-        let unkown_const_2 = &potentially[4..5]; // CONST 16
-        // let avrage_volume = &potentially[5..6]; // Avrage volume of the frame?
-        let unkown_const_3 = &potentially[6..7]; // CONST 144
+        let unknown_const_2 = &potentially[4..5]; // CONST 16
+        // let average_volume = &potentially[5..6]; // Average volume of the frame?
+        let unknown_const_3 = &potentially[6..7]; // CONST 144
         let channels = &potentially[7]; // Channels?
-        if unkown_const != [50] {
-            trace!("RTP extension byte 0 unexpected: {:?}", unkown_const);
+        if unknown_const != [50] {
+            trace!("RTP extension byte 0 unexpected: {:?}", unknown_const);
         }
-        if unkown_const_2 != [16] {
-            trace!("RTP extension byte 4 unexpected: {:?}", unkown_const_2);
+        if unknown_const_2 != [16] {
+            trace!("RTP extension byte 4 unexpected: {:?}", unknown_const_2);
         }
-        if unkown_const_3 != [144] {
-            trace!("RTP extension byte 6 unexpected: {:?}", unkown_const_3);
+        if unknown_const_3 != [144] {
+            trace!("RTP extension byte 6 unexpected: {:?}", unknown_const_3);
         }
 
         let voice_data = if rtp_packet.get_padding() == 1
@@ -173,7 +173,7 @@ impl SendAudioFuture<'_> {
         samples: &[AudioSampleType],
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         if samples.is_empty() {
-            warn!("Noting to send");
+            warn!("Nothing to send");
             return Ok(());
         }
         if !samples.len().is_multiple_of(2) {

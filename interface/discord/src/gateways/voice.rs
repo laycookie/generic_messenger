@@ -16,6 +16,9 @@ mod events;
 mod gateway;
 mod payloads;
 
+/// Voice gateway protocol version.
+pub(crate) const VOICE_GATEWAY_VERSION: usize = 9;
+
 pub type SessionId = String;
 pub struct Endpoint {
     pub wss: String,
@@ -31,7 +34,7 @@ impl Endpoint {
 /// <https://docs.discord.food/topics/opcodes-and-status-codes#voice-opcodes>
 #[repr(u8)]
 #[non_exhaustive]
-#[derive(Debug, Facet, TryFromPrimitive)]
+#[derive(Debug, Clone, Copy, Facet, TryFromPrimitive)]
 #[facet(is_numeric)]
 pub enum VoiceOpcode {
     Identify = 0,
@@ -64,6 +67,59 @@ pub enum VoiceOpcode {
     MLSAnnounceCommitTransition = 29,
     MLSWelcome = 30,
     MLSInvalidCommitWelcome = 31,
+}
+
+/// Parsed binary frame from Discord's voice gateway.
+///
+/// v7 wire format:  `[opcode: u8][payload: ...]`
+/// v8+ wire format: `[sequence: u16 BE][opcode: u8][payload: ...]`
+/// <https://docs.discord.food/topics/voice-connections#binary-websocket-messages>
+pub struct VoiceBinaryFrame {
+    pub(crate) sequence: Option<u16>,
+    pub(crate) opcode: VoiceOpcode,
+    pub(crate) payload: Vec<u8>,
+}
+
+impl VoiceBinaryFrame {
+    pub fn parse(bytes: &[u8]) -> Result<Self, io::Error> {
+        if VOICE_GATEWAY_VERSION > 7 {
+            // v8+: [sequence: u16 BE][opcode: u8][payload: ...]
+            if bytes.len() < 3 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "binary frame too short for v8+ format",
+                ));
+            }
+            let sequence = u16::from_be_bytes([bytes[0], bytes[1]]);
+            let opcode = VoiceOpcode::try_from(bytes[2]).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown voice opcode {}: {err}", bytes[2]),
+                )
+            })?;
+            Ok(Self {
+                sequence: Some(sequence),
+                opcode,
+                payload: bytes[3..].to_vec(),
+            })
+        } else {
+            // v7: [opcode: u8][payload: ...]
+            let (&opcode_byte, payload) = bytes
+                .split_first()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty binary frame"))?;
+            let opcode = VoiceOpcode::try_from(opcode_byte).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown voice opcode {opcode_byte}: {err}"),
+                )
+            })?;
+            Ok(Self {
+                sequence: None,
+                opcode,
+                payload: payload.to_vec(),
+            })
+        }
+    }
 }
 
 #[derive(Default)]
@@ -188,7 +244,9 @@ impl VoiceGateway {
                 channel_id,
             } => (endpoint, session_id, channel_id),
             _ => {
-                return Err(io::Error::new(io::ErrorKind::NotConnected, "voice gateway not ready").into());
+                return Err(
+                    io::Error::new(io::ErrorKind::NotConnected, "voice gateway not ready").into(),
+                );
             }
         };
 

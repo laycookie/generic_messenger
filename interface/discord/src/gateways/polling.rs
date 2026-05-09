@@ -7,7 +7,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use async_tungstenite::tungstenite::Message as WebsocketMessage;
 use futures::{
     FutureExt as _, StreamExt, channel::oneshot, future::select, pending, select, stream,
 };
@@ -21,11 +20,23 @@ use surf::http::convert::json;
 use tracing::{debug, error, warn};
 
 use super::{
-    GatewayPayload,
     general::Opcode,
+    parse_gateway_event,
     voice::{self, VoiceOpcode, connection::VOICE_FRAME_SAMPLES},
 };
 use crate::{AudioManager, InnerDiscord, Owned, UnitStruct, VoiceDiscord};
+
+fn speaking_payload(ssrc: u32, speaking: bool) -> String {
+    json!({
+        "op": VoiceOpcode::Speaking as u8,
+        "d": {
+            "speaking": speaking as u8,
+            "delay": 0,
+            "ssrc": ssrc,
+        }
+    })
+    .to_string()
+}
 
 impl<T: UnitStruct> InnerDiscord<T> {
     pub async fn poll_voice(&self) -> Option<()> {
@@ -85,10 +96,7 @@ impl<T: UnitStruct> InnerDiscord<T> {
         debug!("udp initialized.");
 
         let (mut audio_receiver, mut audio_sender) = connection
-            .init_audio(
-                &voice_gateway.dave_session,
-                &voice_gateway.ssrc_to_user_id,
-            )
+            .init_audio(&voice_gateway.dave_session, &voice_gateway.ssrc_to_user_id)
             .ok()?;
         debug!("initialized audio receiver, and sender.");
 
@@ -114,15 +122,7 @@ impl<T: UnitStruct> InnerDiscord<T> {
                     if received_audio {
                         if !voice_gateway.is_speaking.load(Ordering::Relaxed) {
                             debug!("Send speaking packet");
-                            let speaking_payload = json!({
-                                "op": voice::VoiceOpcode::Speaking as u8,
-                                "d": {
-                                    "speaking": 1,
-                                    "delay": 0,
-                                    "ssrc": audio_sender.ssrc(),
-                                }
-                            })
-                            .to_string();
+                            let speaking_payload = speaking_payload(audio_sender.ssrc(), true);
 
                             match voice_gateway
                                 .websocket
@@ -148,18 +148,9 @@ impl<T: UnitStruct> InnerDiscord<T> {
                             .map(|last_time| last_time.elapsed() > Duration::from_millis(200))
                             .unwrap_or(false);
 
-                        if should_stop && voice_gateway.is_speaking.swap(false, Ordering::Relaxed)
-                        {
+                        if should_stop && voice_gateway.is_speaking.swap(false, Ordering::Relaxed) {
                             debug!("Send stop speaking packet");
-                            let speaking_payload = json!({
-                                "op": voice::VoiceOpcode::Speaking as u8,
-                                "d": {
-                                    "speaking": 0,
-                                    "delay": 0,
-                                    "ssrc": audio_sender.ssrc(),
-                                }
-                            })
-                            .to_string();
+                            let speaking_payload = speaking_payload(audio_sender.ssrc(), false);
 
                             if let Err(err) =
                                 voice_gateway.websocket.send(speaking_payload.into()).await
@@ -209,7 +200,9 @@ impl<T: UnitStruct> InnerDiscord<T> {
                                                 // Remove entry so it gets re-requested on the next packet.
                                                 drop(channel);
                                                 channel_entry.remove();
-                                                warn!("Audio source sender dropped for SSRC {ssrc}, will re-request");
+                                                warn!(
+                                                    "Audio source sender dropped for SSRC {ssrc}, will re-request"
+                                                );
                                                 break;
                                             }
                                         }
@@ -271,74 +264,41 @@ impl<T: UnitStruct> InnerDiscord<T> {
             }
         };
 
+        // TODO: Investigate using Websocket::next_payload() diractly
         select! {
+        // Main gateway
         event = gateway_receiver.next() => {
-            if let Some(deserialized_event) = match event {
-                Some(Ok(event)) => match event {
-                    WebsocketMessage::Text(utf8_bytes) => {
-                        match facet_json::from_str::<GatewayPayload<Opcode>>(&utf8_bytes) {
-                            Ok(event) => {
-                                debug!("Parsed gateway event OK: op={:?} t={:?}", event.op, event.t);
-                                Some(event)
-                            },
-                            Err(err) => {
-                                error!("Failed to parse gateway payload: {err}");
-                                None
-                            },
-                        }
-                    }
-                    msg => {
-                        error!("{msg:?}");
-                        None
-                    },
-                },
-                Some(Err(err)) => {
-                    error!("Stream error: {err}");
-                    None
-                }
+            let parsed = match event {
+                Some(Ok(msg)) => parse_gateway_event::<Opcode>(msg),
+                Some(Err(err)) => { error!("Stream error: {err}"); None }
                 None => None,
-            } && let Err(err) = deserialized_event.exec(self).await
+            };
+            if let Some(event) = parsed
+                && let Err(err) = event.exec(self).await
             {
                 warn!("Failed to execute gateway event: {err}")
             }
         }
+        // voice gateway
         event = voice_gateway_event_fut.fuse() => {
-            if let Some(deserialized_event) = match event {
-                Some(Ok(event)) => match event {
-                    WebsocketMessage::Text(utf8_bytes) => match facet_json::from_str::<GatewayPayload<VoiceOpcode>>(&utf8_bytes) {
-                        Ok(event) => Some(event),
-                        Err(err) => {
-                            error!("Failed to parse: {err}");
-                            None
-                        },
-                    }
-                    WebsocketMessage::Binary(bytes) => match VoiceOpcode::try_from(bytes[0]) {
-                        Ok(opcode) => Some(GatewayPayload::<VoiceOpcode>::new_binary(opcode, None, bytes[0..].to_vec())),
-                        Err(err) => {
-                            warn!("Unknown voice binary opcode {}: {err}", bytes[0]);
-                            None
-                        }
-                    }
-                    msg => {
-                        error!("Failed: {msg:?}");
-                        None
-                    },
-                },
-                Some(Err(err)) => {
-                    error!("Stream error: {err}");
-                    None
-                }
+            let parsed = match event {
+                Some(Ok(msg)) => parse_gateway_event::<VoiceOpcode>(msg),
+                Some(Err(err)) => { error!("Stream error: {err}"); None }
                 None => {
                     warn!("Stream closed");
                     ref_gateway.voice.disconnect().await;
                     None
                 }
-            } && let Err(err) = deserialized_event.exec(self).await
+            };
+            if let Some(event) = parsed
+                && let Err(err) = event.exec(self).await
             {
                 warn!("Failed to execute gateway event: {err}")
             }
         }
+        // heartbeat over main gateway
         _ = ref_gateway.heartbeat().fuse() => {}
+        // voice heartbeat over main gateway
         _ = async {
                 match voice_gateway {
                     Some(voice_gateway) => voice_gateway.heartbeat().await,
@@ -358,7 +318,9 @@ impl VoiceTrait for InnerDiscord<Owned> {
     ) -> Result<CallStatus, Box<dyn Error + Sync + Send>> {
         let load_gateway = self.gateway.load();
         let Some(gateway) = load_gateway.as_ref() else {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "gateway not connected").into());
+            return Err(
+                io::Error::new(io::ErrorKind::NotConnected, "gateway not connected").into(),
+            );
         };
 
         let channels_map = self.channel_id_mappings.read().await;
@@ -368,9 +330,11 @@ impl VoiceTrait for InnerDiscord<Owned> {
                 // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
                 // and support guild voice channels too.
                 warn!("Tried to connect voice for a Room without a discord channel mapping");
-                return Err(
-                    io::Error::new(io::ErrorKind::NotFound, "no channel mapping for this room").into(),
-                );
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no channel mapping for this room",
+                )
+                .into());
             }
         };
 

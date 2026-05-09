@@ -122,13 +122,6 @@ pub struct Channel {
     pub permission_overwrites: Option<Vec<OverwriteObject>>,
 }
 impl Channel {
-    // TODO: This method is deprecated - use to_room_data() instead
-    // Kept for backward compatibility during migration
-    #[deprecated]
-    pub async fn to_room(&self) -> Place<Room> {
-        self.to_room_data().await
-    }
-
     /// Extract room data, name, and icon from a channel.
     /// Returns (name, icon, room_data).
     pub async fn to_room_data(&self) -> Place<Room> {

@@ -7,12 +7,13 @@ use std::{
 
 use async_tungstenite::{async_std::connect_async, tungstenite::Message as WebsocketMessage};
 use facet::Facet;
+use num_enum::TryFromPrimitive;
 use surf::http::convert::json;
 use tracing::debug;
 
 use crate::{
     InnerDiscord, UnitStruct,
-    gateways::{Gateway, GatewayStream, HeartBeatingData, voice::VoiceGateway},
+    gateways::{Gateway, HeartBeatingData, Websocket, voice::VoiceGateway},
 };
 use self::payloads::HelloPayload;
 
@@ -24,7 +25,7 @@ mod payloads;
 
 /// <https://discord.com/developers/docs/topics/opcodes-and-status-codes#gateway-gateway-opcodes>
 /// <https://docs.discord.food/topics/opcodes-and-status-codes#gateway-opcodes>
-#[derive(Debug, Facet)]
+#[derive(Debug, Facet, TryFromPrimitive)]
 #[facet(is_numeric)]
 #[non_exhaustive]
 #[repr(u8)]
@@ -97,11 +98,12 @@ impl Gateway<General> {
     pub async fn new<T: UnitStruct>(
         discord: &InnerDiscord<T>,
     ) -> Result<Self, Box<dyn Error + Sync + Send>> {
-        let (mut gateway_websocket, _) = connect_async(Self::GATEWAY_URL).await?;
+        let (gateway_websocket, _) = connect_async(Self::GATEWAY_URL).await?;
+        let websocket = Websocket::new(gateway_websocket);
 
         // First event send by discord has to be Hello event according to
         // https://docs.discord.food/topics/gateway#connections
-        let hello_event = gateway_websocket.next_gateway_payload().await
+        let hello_event = websocket.next_payload().await
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "gateway closed before receiving hello"))?;
 
         let Opcode::Hello = hello_event.op else {
@@ -118,7 +120,7 @@ impl Gateway<General> {
         // the REST_API already filters for them on Discords end anyways (presumably or at least
         // the ones trailing at the end)
         let token = discord.token.unsecure();
-        gateway_websocket
+        websocket
             .send(WebsocketMessage::Text(
                 json!({
                     "op": Opcode::Identify as u8,
@@ -139,7 +141,7 @@ impl Gateway<General> {
         debug!("Identify payload sent");
 
         Ok(Self {
-            websocket: crate::gateways::Websocket::new(gateway_websocket),
+            websocket,
             heart_beating: HeartBeatingData::new(heart_beating_duration).into(),
             last_sequence_number: OnceLock::new(),
             type_specific_data: General {
