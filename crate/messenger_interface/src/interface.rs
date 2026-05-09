@@ -152,14 +152,14 @@ pub trait Query: Send + Sync {
     /// Fetch detailed information about a specific room/channel.
     async fn room_details(
         &self,
-        room: Identifier<Place<Room>>,
+        _room: Identifier<Place<Room>>,
     ) -> Result<Room, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
     }
     /// Fetch detailed information about a specific house/server/guild.
     async fn house_details(
         &self,
-        house: Identifier<Place<House>>,
+        _house: Identifier<Place<House>>,
     ) -> Result<House, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
     }

@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures::{
-    FutureExt as _, Stream, StreamExt,
+    FutureExt as _, StreamExt,
     channel::oneshot,
     future::{Either, select},
     pending, select, stream,
@@ -24,7 +24,6 @@ use tracing::{debug, error, warn};
 
 use super::{
     general::Opcode,
-    parse_gateway_event,
     voice::{self, VoiceOpcode, connection::VOICE_FRAME_SAMPLES},
 };
 use crate::{

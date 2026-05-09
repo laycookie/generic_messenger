@@ -230,14 +230,7 @@ impl Messenger {
                             }
                         })
                         .then(
-                            |t: Result<
-                                (
-                                    MessengerHandle,
-                                    Identifier<Place<Room>>,
-                                    Vec<Identifier<InterfaceMessage>>,
-                                ),
-                                Box<dyn Error + Send + Sync>,
-                            >| match t {
+                            |t: Result<_, Box<dyn Error + Send + Sync>>| match t {
                                 Ok((handle, conversation, msgs)) => {
                                     Task::done(Message::UpdateChat {
                                         handle,

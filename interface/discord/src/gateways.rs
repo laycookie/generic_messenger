@@ -1,7 +1,7 @@
 use std::{
     iter,
     ops::Deref,
-    pin::{Pin, pin},
+    pin::Pin,
     sync::{OnceLock, atomic::AtomicUsize},
     time::Duration,
 };
@@ -12,7 +12,7 @@ use async_tungstenite::{
     tungstenite::{Bytes, Message as WebsocketMessage},
 };
 use facet::Facet;
-use futures::{Stream, StreamExt, lock::Mutex as AsyncMutex, stream::FusedStream};
+use futures::{StreamExt, lock::Mutex as AsyncMutex, stream::FusedStream};
 use futures_timer::Delay;
 use tracing::warn;
 
@@ -127,6 +127,7 @@ impl<T> Deref for Gateway<T> {
     }
 }
 
+// TODO: Port VoiceBinaryFrame to just be this under the hood
 /// <https://discord.com/developers/docs/events/gateway-events#payload-structure>
 #[derive(Debug, Facet)]
 pub struct GatewayPayload<Op> {

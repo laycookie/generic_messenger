@@ -16,7 +16,7 @@ use futures::{
     lock::{Mutex as AsyncMutex, MutexGuard},
 };
 use surf::http::convert::json;
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::{
     Endpoint, SessionId, VoiceOpcode,

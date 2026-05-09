@@ -5,7 +5,7 @@ use messenger_interface::{
     interface::{QueryEvent, TextEvent},
     types::{Identifier, Message as GlobalMessage, User as GlobalUser},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use super::{
     GatewayEvent, Opcode,

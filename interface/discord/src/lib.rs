@@ -1,5 +1,3 @@
-#![feature(never_type)]
-
 use std::{
     cell::Cell,
     collections::HashMap,

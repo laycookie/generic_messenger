@@ -87,10 +87,10 @@ pub struct Message {
     pub author: Option<Identifier<User>>,
 }
 
-/// Bitflags representing the capabilities supported by a room/channel.
-///
-/// Rooms can support text chat, voice chat, or both.
 bitflags! {
+    /// Bitflags representing the capabilities supported by a room/channel.
+    ///
+    /// Rooms can support text chat, voice chat, or both.
     #[derive(Debug, Clone)]
     pub struct RoomCapabilities: u8 {
         /// Room supports text messaging.

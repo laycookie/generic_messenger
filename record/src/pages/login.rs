@@ -113,7 +113,7 @@ impl Login {
             &self.platform,
             "Platform",
             Some(&self.selected_platform),
-            |platform| Message::PlatformInput(platform),
+            Message::PlatformInput,
         );
 
         let auth_input = self
@@ -121,10 +121,9 @@ impl Login {
             .get_login_methods()
             .iter()
             .filter_map(|method| match method {
-                LoginMethods::Token => Some(
-                    TextInput::new("Token", self.token.as_str())
-                        .on_input(|text| Message::TokenInput(text)),
-                ),
+                LoginMethods::Token => {
+                    Some(TextInput::new("Token", self.token.as_str()).on_input(Message::TokenInput))
+                }
                 LoginMethods::Unknown => None,
             })
             .fold(Column::new(), |column, widget| column.push(widget));

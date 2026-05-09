@@ -7,7 +7,7 @@ use std::{
 
 use facet::Facet;
 use surf::{RequestBuilder, StatusCode};
-use tracing::{debug, error};
+use tracing::error;
 
 pub async fn http_request<T: for<'a> Facet<'a>>(
     mut req: RequestBuilder,

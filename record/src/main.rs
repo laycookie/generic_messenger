@@ -458,7 +458,7 @@ impl App {
                     pages::login::Action::None => Task::none(),
                     pages::login::Action::Login(messenger) => {
                         let handle = self.messengers.add_messenger(messenger);
-                        let interface = self.messengers.interface_from_handle(handle).unwrap();
+                        let _interface = self.messengers.interface_from_handle(handle).unwrap();
                         Task::done(AppMessage::StartUp)
                         // let mut sender = self.socket_sender.clone().unwrap();
                         // Task::perform(

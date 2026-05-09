@@ -5,7 +5,7 @@ use facet::Facet;
 use futures::channel::oneshot;
 use futures::lock::Mutex as AsyncMutex;
 use num_enum::TryFromPrimitive;
-use simple_audio_channels::{input::SampleConsumer, output::SampleProducer};
+use simple_audio_channels::output::SampleProducer;
 
 use self::gateway::Voice;
 use crate::gateways::Gateway;
@@ -273,12 +273,4 @@ impl VoiceGateway {
 pub enum AudioChannel {
     Initializing(oneshot::Receiver<SampleProducer>),
     Connected(SampleProducer),
-}
-
-#[derive(Default)]
-pub enum InputChannel {
-    #[default]
-    None,
-    Initializing(oneshot::Receiver<SampleConsumer>),
-    Connected(SampleConsumer),
 }

@@ -11,7 +11,7 @@ use messenger_interface::{
     stream::{ArcStream, WeakSocketStream},
     types::{House, Identifier, Message, Place, Reaction, Room, RoomCapabilities, User},
 };
-use tracing::{error, info};
+use tracing::error;
 
 use std::{error::Error, sync::Arc};
 

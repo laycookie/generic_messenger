@@ -1,8 +1,8 @@
 use facet::Facet;
-use messenger_interface::types::{Identifier, Place, Room, RoomCapabilities};
+use messenger_interface::types::{Place, Room, RoomCapabilities};
 use tracing::error;
 
-use crate::{Discord, downloaders::cache_download};
+use crate::downloaders::cache_download;
 
 pub type SNOWFLAKE = u64;
 

@@ -3,7 +3,7 @@
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use messenger_interface::{
-    interface::{CallStatus, Messenger},
+    interface::Messenger,
     types::{House, ID, Identifier, Message, Place, Room, User},
 };
 

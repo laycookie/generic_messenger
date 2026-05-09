@@ -101,7 +101,7 @@ impl RecvAudioFuture<'_> {
         let unknown_const_2 = &potentially[4..5]; // CONST 16
         // let average_volume = &potentially[5..6]; // Average volume of the frame?
         let unknown_const_3 = &potentially[6..7]; // CONST 144
-        let channels = &potentially[7]; // Channels?
+        let _channels = &potentially[7]; // Channels?
         if unknown_const != [50] {
             trace!("RTP extension byte 0 unexpected: {:?}", unknown_const);
         }
