@@ -3,7 +3,7 @@ use std::{io, sync::atomic::Ordering};
 use facet_pretty::FacetPretty;
 use messenger_interface::{
     interface::{QueryEvent, TextEvent},
-    types::{Identifier, Message as GlobalMessage, User as GlobalUser},
+    types::{CacheCategory, Identifier, Message as GlobalMessage, User as GlobalUser},
 };
 use tracing::{debug, error, trace, warn};
 
@@ -12,8 +12,9 @@ use super::{
     payloads::{SessionObjectPayload, VoiceServerUpdatePayload, VoiceStatePayload},
 };
 use crate::{
-    Discord, InnerDiscord, UnitStruct,
+    ChannelID, Discord, InnerDiscord, UnitStruct,
     api_types::{self, Message},
+    downloaders::cache_cdn_image,
     gateways::{GatewayPayload, voice::Endpoint},
 };
 
@@ -79,13 +80,18 @@ impl GatewayPayload<Opcode> {
                             ))
                             .await;
 
-                        let profile = discord.profile.read().await;
-                        let profile = profile.as_ref();
-                        let user_id = profile
-                            .ok_or_else(|| {
-                                io::Error::new(io::ErrorKind::NotFound, "user profile not loaded")
-                            })?
-                            .id;
+                        let user_id = {
+                            let profile = discord.profile.read().await;
+                            profile
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::NotFound,
+                                        "user profile not loaded",
+                                    )
+                                })?
+                                .id
+                        };
 
                         match gateway.voice.connect(user_id).await {
                             Ok(_) => (),
@@ -104,23 +110,37 @@ impl GatewayPayload<Opcode> {
                             "MessageCreate: channel={} msg={} text={:?}",
                             channel_id_hash, msg_id_hash, &message.content
                         );
+                        let icon = match &message.author.avatar {
+                            Some(hash) => {
+                                cache_cdn_image("avatars", CacheCategory::Users, message.author.id, hash)
+                                    .await
+                                    .ok()
+                            }
+                            None => None,
+                        };
                         let author = Identifier::new(
                             message.author.id,
                             GlobalUser {
                                 name: message.author.username,
-                                icon: None,
+                                icon,
                             },
                         );
+                        let msg_identifier = Identifier::new(
+                            msg_id_hash,
+                            GlobalMessage {
+                                text: message.content,
+                                reactions: Vec::new(),
+                                author: Some(author),
+                            },
+                        );
+
+                        let mut msg_data = discord.msg_data.write().await;
+                        msg_data.insert(*msg_identifier.id(), msg_id_hash);
+                        drop(msg_data);
+
                         discord.text_events.push(TextEvent::MessageCreated {
                             room: Identifier::new(channel_id_hash, ()),
-                            message: Identifier::new(
-                                msg_id_hash,
-                                GlobalMessage {
-                                    text: message.content,
-                                    reactions: Vec::new(),
-                                    author: Some(author),
-                                },
-                            ),
+                            message: msg_identifier,
                         });
                         debug!(
                             "text_events queue length after push: {}",
@@ -131,11 +151,23 @@ impl GatewayPayload<Opcode> {
                         let channel = facet_value::from_value::<api_types::Channel>(self.d)?;
 
                         let place_room = channel.to_room_data().await;
+                        let room = Discord::identifier_generator(channel.id, place_room);
+
+                        let mut channel_data = discord.channel_id_mappings.write().await;
+                        channel_data.insert(
+                            *room.id(),
+                            ChannelID {
+                                guild_id: channel.guild_id,
+                                id: channel.id,
+                            },
+                        );
+                        drop(channel_data);
+
                         discord.query_events.push(QueryEvent::ChannelCreated {
                             r#where: channel
                                 .guild_id
                                 .map(|guild_id| Discord::identifier_generator(guild_id, ())),
-                            room: Discord::identifier_generator(channel.id, place_room),
+                            room,
                         });
                     }
                     _ => warn!("Unknown event_name received: {event_name:?}"),

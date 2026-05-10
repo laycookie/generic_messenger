@@ -5,6 +5,31 @@ use std::{
     path::PathBuf,
 };
 
+/// Base directory for cached images (avatars, icons, etc.).
+///
+/// Each messenger implementation should store images under
+/// `{CACHE_IMGS_DIR}/{category}/{platform}/{id}/` where category
+/// is a [`CacheCategory`].
+pub const CACHE_IMGS_DIR: &str = "./cache/imgs";
+
+/// Logical grouping for cached images.
+pub enum CacheCategory {
+    Users,
+    Servers,
+    Channels,
+    Custom(&'static str),
+}
+impl CacheCategory {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Users => "users",
+            Self::Servers => "servers",
+            Self::Channels => "channels",
+            Self::Custom(s) => s,
+        }
+    }
+}
+
 /// Unique identifier type used throughout the messenger interface.
 pub type ID = u64;
 

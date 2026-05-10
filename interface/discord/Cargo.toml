@@ -44,3 +44,4 @@ messenger_interface = { path = "../../crate/messenger_interface" }
 num_enum = "0.7.6"
 # Bitflags
 bitflags = { workspace = true }
+async-fs = "2.2.0"

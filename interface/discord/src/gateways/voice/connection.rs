@@ -44,6 +44,9 @@ pub struct RecvAudioFuture<'a> {
 impl RecvAudioFuture<'_> {
     pub async fn recv(&mut self) -> Result<UdpPacket<'_>, Box<dyn Error>> {
         let n_bytes_received = self.udp.recv(&mut self.rtp_packet_buf).await?;
+        if n_bytes_received < 2 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "UDP packet too short").into());
+        }
         let rtp_packet_buf = &self.rtp_packet_buf[..n_bytes_received];
 
         match PacketClass::classify(rtp_packet_buf[1]) {
@@ -102,6 +105,9 @@ impl RecvAudioFuture<'_> {
         };
 
         // <https://datatracker.ietf.org/doc/html/rfc6464>
+        if decrypted_payload.len() < 8 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "decrypted payload too short for RTP extension header").into());
+        }
         let (potentially, voice_data) = decrypted_payload.split_at(8);
         let unknown_const = &potentially[..1]; // CONST 55
         // let timecode = &potentially[1..4]; // Timecode

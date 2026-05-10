@@ -2,14 +2,16 @@ use crate::{
     AudioDiscord, DISCORD_API, Discord, InnerDiscord, Owned, QueryDiscord, TextDiscord,
     VoiceDiscord,
     api_types::{self, SNOWFLAKE},
-    downloaders::{cache_download, http_request},
+    downloaders::{cache_cdn_image, http_request},
 };
 use async_trait::async_trait;
 use futures::future::join_all;
 use messenger_interface::{
     interface::{AudioEvent, Query, QueryEvent, Text, TextEvent, VoiceEvent},
     stream::{ArcStream, WeakSocketStream},
-    types::{House, Identifier, Message, Place, Reaction, Room, RoomCapabilities, User},
+    types::{
+        CacheCategory, House, Identifier, Message, Place, Reaction, Room, RoomCapabilities, User,
+    },
 };
 use tracing::error;
 
@@ -19,9 +21,7 @@ impl InnerDiscord<Owned> {
     fn get_auth_header(&self) -> Vec<(&str, String)> {
         vec![("Authorization", self.token.unsecure().to_string())]
     }
-}
 
-impl InnerDiscord<Owned> {
     async fn fetch_dms(
         &self,
     ) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
@@ -69,16 +69,7 @@ impl InnerDiscord<Owned> {
 
         let house_producer = guilds.iter().map(async move |guild| {
             let icon = guild.icon.as_ref().map(async move |hash| {
-                let icon = cache_download(
-                    format!(
-                        "https://cdn.discordapp.com/icons/{}/{}.webp?size=80&quality=lossless",
-                        guild.id, hash
-                    ),
-                    format!("./cache/imgs/guilds/discord/{}", guild.id).into(),
-                    format!("{hash}.webp"),
-                )
-                .await;
-                match icon {
+                match cache_cdn_image("icons", CacheCategory::Servers, guild.id, hash).await {
                     Ok(path) => Some(path),
                     Err(e) => {
                         error!("Failed to download icon for guild: {}\n{}", guild.name, e);
@@ -129,7 +120,7 @@ impl InnerDiscord<Owned> {
                 if channel
                     .permission_overwrites
                     .as_ref()
-                    .map_or(false, |overwrites| {
+                    .is_some_and(|overwrites| {
                         overwrites
                             .iter()
                             // TODO: Rewrite
@@ -177,11 +168,18 @@ impl Query for InnerDiscord<Owned> {
         )
         .await?;
 
+        let icon = match &profile.avatar {
+            Some(hash) => cache_cdn_image("avatars", CacheCategory::Users, profile.id, hash)
+                .await
+                .ok(),
+            None => None,
+        };
+
         let prof = Discord::identifier_generator(
             profile.id,
             User {
                 name: profile.username.clone(),
-                icon: None,
+                icon,
             },
         );
 
@@ -202,17 +200,9 @@ impl Query for InnerDiscord<Owned> {
             .iter()
             .map(async move |friend| {
                 let hash = match &friend.user.avatar {
-                    Some(hash) => {
-                        let url = format!(
-                            "https://cdn.discordapp.com/avatars/{}/{}.webp?size=80&quality=lossless",
-                            friend.id, hash
-                        );
-                        let dir = format!("./cache/imgs/users/discord/{}", friend.id);
-
-                        let filename = format!("{hash}.webp");
-
-                        cache_download(url, dir.into(), filename).await.ok()
-                    }
+                    Some(hash) => cache_cdn_image("avatars", CacheCategory::Users, friend.id, hash)
+                        .await
+                        .ok(),
                     None => None,
                 };
 
@@ -269,65 +259,80 @@ impl Text for InnerDiscord<Owned> {
         location: &Identifier<Place<Room>>,
         load_messages_before: Option<Identifier<Message>>,
     ) -> Result<Vec<Identifier<Message>>, Box<dyn Error + Sync + Send>> {
-        let t = self.channel_id_mappings.read().await;
-        let channel_id = t
-            .get(location.id())
-            .ok_or("No discord channel id mapping for this room")?;
+        let channel_id = {
+            let map = self.channel_id_mappings.read().await;
+            map.get(location.id())
+                .ok_or("No discord channel id mapping for this room")?
+                .clone()
+        };
 
         let before = match load_messages_before {
             Some(msg) => {
-                let t2 = self.msg_data.read().await;
-                let msg_id = t2
+                let map = self.msg_data.read().await;
+                let msg_id = *map
                     .get(msg.id())
                     .ok_or("No discord message id mapping for before-pagination")?;
-                format!("?before={}", msg_id)
+                format!("?before={msg_id}")
             }
-            None => "".to_string(),
+            None => String::new(),
         };
 
         let messages = http_request::<Vec<api_types::Message>>(
             surf::get(format!(
-                "{DISCORD_API}/channels/{}/messages{}",
-                channel_id.id, before,
+                "{DISCORD_API}/channels/{}/messages{before}",
+                channel_id.id,
             )),
             self.get_auth_header(),
         )
         .await?;
 
+        let identifiers = join_all(messages.into_iter().rev().map(async |message| {
+            let reactions = message
+                .reactions
+                .unwrap_or(Vec::new())
+                .iter()
+                .map(|reaction| Reaction {
+                    // NOTE: Discord reactions can be custom emojis (name may not be a unicode emoji).
+                    // TODO(discord-migration): represent custom emojis (needs richer type than `char`).
+                    emoji: reaction.emoji.name.chars().next().unwrap_or('�'),
+                    count: reaction.count,
+                })
+                .collect();
+
+            let icon = match &message.author.avatar {
+                Some(hash) => {
+                    cache_cdn_image("avatars", CacheCategory::Users, message.author.id, hash)
+                        .await
+                        .ok()
+                }
+                None => None,
+            };
+
+            let author = messenger_interface::types::Identifier::new(
+                message.author.id,
+                messenger_interface::types::User {
+                    name: message.author.username,
+                    icon,
+                },
+            );
+            let identifier = Discord::identifier_generator(
+                message.id,
+                Message {
+                    text: message.content,
+                    reactions,
+                    author: Some(author),
+                },
+            );
+
+            (identifier, message.id)
+        }))
+        .await;
+
         let mut msg_data = self.msg_data.write().await;
-        Ok(messages
+        Ok(identifiers
             .into_iter()
-            .rev()
-            .map(|message| {
-                let reactions = message
-                    .reactions
-                    .unwrap_or(Vec::new())
-                    .iter()
-                    .map(|reaction| Reaction {
-                        // NOTE: Discord reactions can be custom emojis (name may not be a unicode emoji).
-                        // TODO(discord-migration): represent custom emojis (needs richer type than `char`).
-                        emoji: reaction.emoji.name.chars().next().unwrap_or('�'),
-                        count: reaction.count,
-                    })
-                    .collect();
-
-                let author = messenger_interface::types::Identifier::new(
-                    message.author.id,
-                    messenger_interface::types::User {
-                        name: message.author.username,
-                        icon: None,
-                    },
-                );
-                let identifier = Discord::identifier_generator(
-                    message.id,
-                    Message {
-                        text: message.content,
-                        reactions,
-                        author: Some(author),
-                    },
-                );
-
-                msg_data.insert(*identifier.id(), message.id);
+            .map(|(identifier, discord_msg_id)| {
+                msg_data.insert(*identifier.id(), discord_msg_id);
                 identifier
             })
             .collect())
@@ -339,10 +344,12 @@ impl Text for InnerDiscord<Owned> {
         location: &Identifier<Place<Room>>,
         contents: Message,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let channel_to_id = self.channel_id_mappings.read().await;
-        let channel_id = channel_to_id
-            .get(location.id())
-            .ok_or("No discord channel id mapping for this room")?;
+        let channel_id = {
+            let map = self.channel_id_mappings.read().await;
+            map.get(location.id())
+                .ok_or("No discord channel id mapping for this room")?
+                .clone()
+        };
 
         let message = api_types::CreateMessage {
             content: Some(contents.text),
@@ -351,7 +358,7 @@ impl Text for InnerDiscord<Owned> {
             tts: Some(false),
             flags: Some(0),
         };
-        let msg_string = facet_json::to_vec(&message).unwrap();
+        let msg_string = facet_json::to_vec(&message)?;
 
         let _msg = http_request::<api_types::Message>(
             surf::post(format!("{DISCORD_API}/channels/{}/messages", channel_id.id,))

@@ -109,7 +109,6 @@ impl Voice {
                             .iter()
                             .map(|sample| *sample as f32 / i16::MAX as f32),
                     );
-                    info!("Samples: {samples_pushed}");
                     if samples.len() != samples_pushed {
                         error!(
                             "Audio buffer overflow. Pushed: {}, Succeeded: {}",

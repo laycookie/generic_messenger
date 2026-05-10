@@ -131,6 +131,8 @@ struct InnerDiscord<T: UnitStruct> {
     _marker: PhantomData<T>,
 }
 impl<T: UnitStruct> InnerDiscord<T> {
+    // TODO: TOCTOU race — two concurrent `listen()` calls can both see `is_none()`,
+    // both create a gateway, and the second `store()` silently drops the first connection.
     async fn ensure_gateway(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.gateway.load().is_none() {
             self.gateway

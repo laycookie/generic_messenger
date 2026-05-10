@@ -1,8 +1,8 @@
 use facet::Facet;
-use messenger_interface::types::{Place, Room, RoomCapabilities};
+use messenger_interface::types::{CacheCategory, Place, Room, RoomCapabilities};
 use tracing::error;
 
-use crate::downloaders::cache_download;
+use crate::downloaders::cache_cdn_image;
 
 pub type SNOWFLAKE = u64;
 
@@ -11,7 +11,7 @@ pub type SNOWFLAKE = u64;
 pub struct Profile {
     // accent_color: Option<String>,
     // authenticator_types: Vec<String>,
-    // avatar: Option<String>,
+    pub avatar: Option<String>,
     // avatar_decoration_data: Option<String>,
     // banner: Option<String>,
     // banner_color: Option<String>,
@@ -142,16 +142,7 @@ impl Channel {
 
         // If channel has icon, use that
         if let Some(hash) = &self.icon {
-            let downloaded_icon = cache_download(
-                format!(
-                    "https://cdn.discordapp.com/channel-icons/{}/{}.webp?size=80&quality=lossless",
-                    self.id, hash
-                ),
-                format!("./cache/imgs/channels/discord/{}", self.id).into(),
-                format!("{hash}.webp"),
-            )
-            .await;
-            match downloaded_icon {
+            match cache_cdn_image("channel-icons", CacheCategory::Channels, self.id, hash).await {
                 Ok(path) => icon = Some(path),
                 Err(e) => {
                     error!("Failed to download icon for channel: {}\n{}", name, e);
@@ -161,16 +152,7 @@ impl Channel {
             // If any recipient has an avatar, use that as room icon
             for recipient in recipients {
                 if let Some(hash) = &recipient.avatar {
-                    let downloaded_icon = cache_download(
-                        format!(
-                            "https://cdn.discordapp.com/avatars/{}/{}.webp?size=80&quality=lossless",
-                            recipient.id, hash
-                        ),
-                        format!("./cache/imgs/users/discord/{}", recipient.id).into(),
-                        format!("{hash}.webp"),
-                    )
-                    .await;
-                    match downloaded_icon {
+                    match cache_cdn_image("avatars", CacheCategory::Users, recipient.id, hash).await {
                         Ok(path) => {
                             icon = Some(path);
                             break;

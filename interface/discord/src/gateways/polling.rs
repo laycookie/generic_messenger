@@ -185,7 +185,6 @@ impl<T: UnitStruct> InnerDiscord<T> {
         let gateway = self.gateway.load();
         let Some(ref_gateway) = gateway.as_ref() else {
             warn!("Stream has not started, or has been killed");
-            pending!();
             return;
         };
         // If someone else is already pulling we just wait until they finish by looking at
@@ -235,14 +234,22 @@ impl<T: UnitStruct> InnerDiscord<T> {
             }
         }
         // heartbeat over main gateway
-        _ = ref_gateway.heartbeat().fuse() => {}
+        result = ref_gateway.heartbeat().fuse() => {
+            if let Err(err) = result {
+                error!("Gateway heartbeat failed: {err}");
+            }
+        }
         // voice heartbeat over main gateway
-        _ = async {
+        result = async {
                 match voice_gateway_clone {
                     Some(voice_gateway) => voice_gateway.heartbeat().await,
                     None => futures::future::pending().await,
                 }
-            }.fuse() => {}
+            }.fuse() => {
+            if let Err(err) = result {
+                error!("Voice gateway heartbeat failed: {err}");
+            }
+        }
         };
         self.pulled_notification.notify_all();
     }
@@ -261,22 +268,24 @@ impl VoiceTrait for InnerDiscord<Owned> {
             );
         };
 
-        let channels_map = self.channel_id_mappings.read().await;
-        let channel = match channels_map.get(location.id()) {
-            Some(c) => c,
-            None => {
-                // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
-                // and support guild voice channels too.
-                warn!("Tried to connect voice for a Room without a discord channel mapping");
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "no channel mapping for this room",
-                )
-                .into());
+        let channel = {
+            let map = self.channel_id_mappings.read().await;
+            match map.get(location.id()) {
+                Some(c) => c.clone(),
+                None => {
+                    // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
+                    // and support guild voice channels too.
+                    warn!("Tried to connect voice for a Room without a discord channel mapping");
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "no channel mapping for this room",
+                    )
+                    .into());
+                }
             }
         };
 
-        gateway.voice.initiate_connection(channel.to_owned()).await;
+        gateway.voice.initiate_connection(channel.clone()).await;
 
         let payload = json!({
             "op": Opcode::VoiceStateUpdate as u8,
@@ -303,14 +312,18 @@ impl VoiceTrait for InnerDiscord<Owned> {
         };
         gateway.voice.disconnect().await;
 
-        let channels_map = self.channel_id_mappings.read().await;
-        let channel = match channels_map.get(location.id()) {
-            Some(c) => c,
-            None => {
-                // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
-                // and support guild voice channels too.
-                warn!("Tried to disconnect voice for a Room without a discord channel mapping");
-                return;
+        let channel = {
+            let map = self.channel_id_mappings.read().await;
+            match map.get(location.id()) {
+                Some(c) => c.clone(),
+                None => {
+                    // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
+                    // and support guild voice channels too.
+                    warn!(
+                        "Tried to disconnect voice for a Room without a discord channel mapping"
+                    );
+                    return;
+                }
             }
         };
 
