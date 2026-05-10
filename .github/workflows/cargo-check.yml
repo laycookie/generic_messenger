@@ -6,38 +6,41 @@ on:
 
 jobs:
   cargo-check:
-    name: cargo check (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: cargo check (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
 
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
+        include:
+          - platform: nixos
+            runner: ubuntu-latest
+          - platform: windows
+            runner: windows-latest
+          - platform: macos
+            runner: macos-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Nix
-        if: runner.os == 'Linux'
+        if: matrix.platform == 'nixos'
         uses: cachix/install-nix-action@v31
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
       - name: Install macOS dependencies
-        if: runner.os == 'macOS'
+        if: matrix.platform == 'macos'
         run: brew install opus pkg-config
 
       - name: Install Rust toolchain
         run: rustup toolchain install nightly-2026-04-17 --profile minimal
 
-      - name: Cargo check (Ubuntu)
-        if: runner.os == 'Linux'
+      - name: Cargo check (NixOS)
+        if: matrix.platform == 'nixos'
         run: nix-shell -I nixpkgs=channel:nixos-unstable -p alsa-lib opus pkg-config --run "cargo check"
 
       - name: Cargo check
-        if: runner.os != 'Linux'
+        if: matrix.platform != 'nixos'
         run: cargo check
