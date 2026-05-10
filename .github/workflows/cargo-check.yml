@@ -24,6 +24,8 @@ jobs:
       - name: Install Nix
         if: runner.os == 'Linux'
         uses: cachix/install-nix-action@v31
+        with:
+          extra-nix-shell-args: --extra-experimental-features "nix-command flakes"
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
@@ -32,9 +34,9 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install nightly-2026-04-17 --profile minimal
 
-      - name: Cargo check (Ubuntu)
+      - name: Cargo check (Ubuntu with Nix)
         if: runner.os == 'Linux'
-        run: nix-shell -p alsa-lib opus pkg-config --run "cargo check"
+        run: nix develop -c cargo check
 
       - name: Cargo check
         if: runner.os != 'Linux'
