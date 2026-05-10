@@ -13,6 +13,7 @@ use futures::{channel::oneshot, lock::Mutex as AsyncMutex};
 use futures_locks::RwLock as RwLockAwait;
 use messenger_interface::{
     interface::{AudioEvent, Messenger, QueryEvent, TextEvent, VoiceEvent},
+    stream::{ArcStream, WeakSocketStream},
     types::{ID, Identifier},
 };
 use secure_string::SecureString;
@@ -130,16 +131,32 @@ struct InnerDiscord<T: UnitStruct> {
     _marker: PhantomData<T>,
 }
 impl<T: UnitStruct> InnerDiscord<T> {
-    async unsafe fn cast_and_downgrade<C: UnitStruct>(self: Arc<Self>) -> Weak<InnerDiscord<C>> {
+    async fn ensure_gateway(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.gateway.load().is_none() {
-            self.gateway.store(Some(Arc::new(
-                Gateway::<General>::new(&self).await.unwrap(),
-            )));
+            self.gateway
+                .store(Some(Arc::new(Gateway::<General>::new(&self).await?)));
         }
+        Ok(())
+    }
 
+    /// Creates a [`WeakSocketStream`] by reinterpreting this `InnerDiscord<T>`
+    /// as `InnerDiscord<C>` to select the matching [`ArcStream`] implementation.
+    ///
+    /// # Safety
+    /// `InnerDiscord<T>` and `InnerDiscord<C>` must have identical memory layouts.
+    /// This holds as long as `T` and `C` are both zero-sized `UnitStruct` markers.
+    async fn listen_as<C, E>(
+        self: Arc<Self>,
+    ) -> Result<WeakSocketStream<E>, Box<dyn std::error::Error + Send + Sync>>
+    where
+        C: UnitStruct + 'static,
+        InnerDiscord<C>: ArcStream<Item = E> + Send + Sync,
+        E: Send + 'static,
+    {
+        self.ensure_gateway().await?;
         let weak = Arc::downgrade(&self);
         let ptr = Weak::into_raw(weak) as *const InnerDiscord<C>;
-        unsafe { Weak::from_raw(ptr) }
+        Ok(WeakSocketStream::new(unsafe { Weak::from_raw(ptr) }))
     }
 }
 

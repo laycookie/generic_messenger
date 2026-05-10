@@ -392,8 +392,6 @@ impl VoiceTrait for InnerDiscord<Owned> {
     async fn listen(
         self: Arc<Self>,
     ) -> Result<WeakSocketStream<VoiceEvent>, Box<dyn Error + Sync + Send>> {
-        Ok(WeakSocketStream::new(unsafe {
-            self.cast_and_downgrade::<VoiceDiscord>().await
-        }))
+        self.listen_as::<VoiceDiscord, _>().await
     }
 }

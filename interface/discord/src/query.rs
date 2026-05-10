@@ -1,5 +1,5 @@
 use crate::{
-    DISCORD_API, AudioDiscord, Discord, InnerDiscord, Owned, QueryDiscord, TextDiscord,
+    AudioDiscord, DISCORD_API, Discord, InnerDiscord, Owned, QueryDiscord, TextDiscord,
     VoiceDiscord,
     api_types::{self, SNOWFLAKE},
     downloaders::{cache_download, http_request},
@@ -126,12 +126,16 @@ impl InnerDiscord<Owned> {
         Ok(channels
             .into_iter()
             .filter_map(|channel| {
-                if channel.permission_overwrites.as_ref().map_or(false, |overwrites| {
-                    overwrites
-                        .iter()
-                        // TODO: Rewrite
-                        .any(|a| a.deny.parse::<u64>().unwrap_or(0) & (1 << 10) != 0)
-                }) {
+                if channel
+                    .permission_overwrites
+                    .as_ref()
+                    .map_or(false, |overwrites| {
+                        overwrites
+                            .iter()
+                            // TODO: Rewrite
+                            .any(|a| a.deny.parse::<u64>().unwrap_or(0) & (1 << 10) != 0)
+                    })
+                {
                     return None;
                 };
 
@@ -254,9 +258,7 @@ impl Query for InnerDiscord<Owned> {
     async fn listen(
         self: Arc<Self>,
     ) -> Result<WeakSocketStream<QueryEvent>, Box<dyn Error + Sync + Send>> {
-        Ok(WeakSocketStream::new(unsafe {
-            self.cast_and_downgrade::<QueryDiscord>().await
-        }))
+        self.listen_as::<QueryDiscord, _>().await
     }
 }
 
@@ -352,12 +354,9 @@ impl Text for InnerDiscord<Owned> {
         let msg_string = facet_json::to_vec(&message).unwrap();
 
         let _msg = http_request::<api_types::Message>(
-            surf::post(format!(
-                "{DISCORD_API}/channels/{}/messages",
-                channel_id.id,
-            ))
-            .body(msg_string)
-            .content_type("application/json"),
+            surf::post(format!("{DISCORD_API}/channels/{}/messages", channel_id.id,))
+                .body(msg_string)
+                .content_type("application/json"),
             self.get_auth_header(),
         )
         .await?;
@@ -367,9 +366,7 @@ impl Text for InnerDiscord<Owned> {
     async fn listen(
         self: Arc<Self>,
     ) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
-        Ok(WeakSocketStream::new(unsafe {
-            self.cast_and_downgrade::<TextDiscord>().await
-        }))
+        self.listen_as::<TextDiscord, _>().await
     }
 }
 

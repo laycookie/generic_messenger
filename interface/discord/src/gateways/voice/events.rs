@@ -1,16 +1,12 @@
 use std::{
-    io,
-    mem,
+    io, mem,
     num::NonZeroU16,
     sync::{Arc, atomic::Ordering},
 };
 
 use dashmap::DashMap;
 use davey::DaveSession;
-use messenger_interface::{
-    interface::{CallStatus, VoiceEvent},
-    stream::WeakSocketStream,
-};
+use messenger_interface::interface::{CallStatus, VoiceEvent};
 use smol::net::UdpSocket;
 use surf::http::convert::json;
 use tracing::{debug, error, warn};
@@ -20,7 +16,9 @@ use async_tungstenite::tungstenite::Message;
 use super::{
     VoiceOpcode,
     connection::{Connection, EncryptionMode, SessionDescription},
-    payloads::{DAVEPrepareEpoch, MlsProposalsPayload, MlsTransitionPayload, ReadyPayload, SpeakingPayload},
+    payloads::{
+        DAVEPrepareEpoch, MlsProposalsPayload, MlsTransitionPayload, ReadyPayload, SpeakingPayload,
+    },
 };
 use crate::api_types::SNOWFLAKE;
 use crate::gateways::{GatewayPayload, Websocket};
@@ -76,10 +74,14 @@ impl GatewayPayload<VoiceOpcode> {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let gateway = discord.gateway.load();
         let Some(gateway) = gateway.as_ref() else {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "gateway not connected").into());
+            return Err(
+                io::Error::new(io::ErrorKind::NotConnected, "gateway not connected").into(),
+            );
         };
         let Some(voice_gateway) = gateway.voice.full_load_gateway() else {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "voice gateway not connected").into());
+            return Err(
+                io::Error::new(io::ErrorKind::NotConnected, "voice gateway not connected").into(),
+            );
         };
 
         if let Some(s) = self.s {
@@ -97,7 +99,9 @@ impl GatewayPayload<VoiceOpcode> {
                 // Init DAVE
                 let mut dave_session = voice_gateway.dave_session.lock().await;
                 let profile = discord.profile.read().await;
-                let profile = profile.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "user profile not loaded"))?;
+                let profile = profile.as_ref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "user profile not loaded")
+                })?;
                 reinit_dave_session(
                     &voice_gateway.websocket,
                     &mut dave_session,
@@ -109,19 +113,24 @@ impl GatewayPayload<VoiceOpcode> {
 
                 // Commit description to connection
                 if let Some(connection) = voice_gateway.connection.load().as_ref() {
-                    connection.set_description(session_description).map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "session description already set"))?;
+                    connection
+                        .set_description(session_description)
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                "session description already set",
+                            )
+                        })?;
                 };
 
+                let stream = discord
+                    .clone()
+                    .listen_as::<AudioDiscord, _>()
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
                 discord
                     .voice_events
-                    .push(VoiceEvent::CallStatusUpdate(CallStatus::Connected(
-                        WeakSocketStream::new(unsafe {
-                            discord
-                                .to_owned()
-                                .cast_and_downgrade::<AudioDiscord>()
-                                .await
-                        }),
-                    )));
+                    .push(VoiceEvent::CallStatusUpdate(CallStatus::Connected(stream)));
             }
             VoiceOpcode::Speaking => {
                 let speaking = facet_value::from_value::<SpeakingPayload>(self.d)?;
@@ -138,7 +147,11 @@ impl GatewayPayload<VoiceOpcode> {
                     .modes
                     .contains(&EncryptionMode::aead_xchacha20_poly1305_rtpsize)
                 {
-                    return Err(io::Error::new(io::ErrorKind::Unsupported, "required encryption mode not available").into());
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "required encryption mode not available",
+                    )
+                    .into());
                 }
 
                 let mut address_ascii = [0; 64];
@@ -243,7 +256,9 @@ impl GatewayPayload<VoiceOpcode> {
                     // TODO: Investigate if this should be properly added
                     // this.daveProtocolVersion = packet.protocol_version;
                     let profile = discord.profile.read().await;
-                    let profile = profile.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "user profile not loaded"))?;
+                    let profile = profile.as_ref().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "user profile not loaded")
+                    })?;
                     reinit_dave_session(
                         &voice_gateway.websocket,
                         &mut dave_session,
@@ -365,7 +380,9 @@ fn execute_pending_transition(
     if old_version != new_version {
         // TODO: Actually apply the version transition here. Currently the new protocol
         // version is acknowledged (removed from pending) but never applied to the session.
-        error!("DAVE protocol version mismatch: old={old_version:?}, new={new_version:?}. Transition not applied");
+        error!(
+            "DAVE protocol version mismatch: old={old_version:?}, new={new_version:?}. Transition not applied"
+        );
     }
 }
 
@@ -415,12 +432,12 @@ async fn reinit_dave_session(
     channel_id: SNOWFLAKE,
     user_id: SNOWFLAKE,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let dave_ver = NonZeroU16::new(dave_protocol_version)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "DAVE protocol version is zero"))?;
+    let dave_ver = NonZeroU16::new(dave_protocol_version).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "DAVE protocol version is zero")
+    })?;
 
     let key_package = if let Some(dave_session) = dave_session {
-        dave_session
-            .reinit(dave_ver, user_id, channel_id, None)?;
+        dave_session.reinit(dave_ver, user_id, channel_id, None)?;
         dave_session.create_key_package()
     } else {
         let mut new_dave_session = DaveSession::new(dave_ver, user_id, channel_id, None)?;
@@ -430,10 +447,7 @@ async fn reinit_dave_session(
     };
 
     voice_websocket
-        .send_binary(
-            VoiceOpcode::MLSKeyPackage as u8,
-            key_package?.into_iter(),
-        )
+        .send_binary(VoiceOpcode::MLSKeyPackage as u8, key_package?.into_iter())
         .await?;
 
     Ok(())
