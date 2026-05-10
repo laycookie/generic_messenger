@@ -10,13 +10,23 @@ use smol::net::UdpSocket;
 use tracing::{debug, trace, warn};
 
 use crate::api_types::SNOWFLAKE;
-use rtp::{DiscordPacketType, RtpPacket, WrapU16, WrapU32};
+use rtp::{OPUS_PAYLOAD_TYPE, PacketClass, RtpPacket, WrapU16, WrapU32};
 
 pub mod encryption;
 pub mod rtp;
 
 pub use encryption::{EncryptionMode, SessionDescription};
-pub use rtp::Ssrc;
+pub use rtp::{RtcpType, Ssrc};
+
+/// A classified and (for voice) decoded UDP packet.
+pub enum UdpPacket<'a> {
+    /// Decoded Opus audio frame.
+    Voice { ssrc: Ssrc, samples: &'a [i16] },
+    /// RTCP control packet.
+    Rtcp(RtcpType),
+    /// RTP packet with an unhandled payload type (e.g., video).
+    UnhandledRtp { ssrc: Ssrc, payload_type: u8 },
+}
 
 pub const VOICE_FREQUENCY: usize = 48_000;
 pub const VOICE_CHANNELS: usize = 2; // Stereo
@@ -32,24 +42,21 @@ pub struct RecvAudioFuture<'a> {
     decoded_audio_buf: [i16; 8048],
 }
 impl RecvAudioFuture<'_> {
-    pub async fn recv_audio(&mut self) -> Result<(Ssrc, &[i16]), Box<dyn Error>> {
+    pub async fn recv(&mut self) -> Result<UdpPacket<'_>, Box<dyn Error>> {
         let n_bytes_received = self.udp.recv(&mut self.rtp_packet_buf).await?;
         let rtp_packet_buf = &self.rtp_packet_buf[..n_bytes_received];
 
-        let packet_type = DiscordPacketType::try_from(rtp_packet_buf[1]);
-
-        match packet_type {
-            Ok(DiscordPacketType::Voice) => {
-                // Continue processing voice packet below
+        match PacketClass::classify(rtp_packet_buf[1]) {
+            PacketClass::Rtcp(rtcp_type) => return Ok(UdpPacket::Rtcp(rtcp_type)),
+            PacketClass::Rtp { payload_type, .. } if payload_type != OPUS_PAYLOAD_TYPE => {
+                let ssrc = if rtp_packet_buf.len() >= 12 {
+                    u32::from_be_bytes(rtp_packet_buf[8..12].try_into().unwrap())
+                } else {
+                    0
+                };
+                return Ok(UdpPacket::UnhandledRtp { ssrc, payload_type });
             }
-            Ok(DiscordPacketType::RtcpSenderReport | DiscordPacketType::RtcpReceiverReport) => {
-                // RTCP control packets - ignore silently
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "expected voice packet, got RTCP").into());
-            }
-            _ => {
-                trace!("Unknown packet type on UDP: {:?}", rtp_packet_buf[1]);
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "expected voice packet, got unknown type").into());
-            }
+            PacketClass::Rtp { .. } => {} // Opus voice — decode below
         }
 
         let rtp_packet = RtpPacket::new(rtp_packet_buf).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "failed to parse RTP packet"))?;
@@ -141,10 +148,10 @@ impl RecvAudioFuture<'_> {
             self.decoder
                 .decode(voice_data, &mut self.decoded_audio_buf, false)?;
 
-        Ok((
-            rtp_packet.get_ssrc(),
-            &self.decoded_audio_buf[..n_decoded_samples * VOICE_CHANNELS],
-        ))
+        Ok(UdpPacket::Voice {
+            ssrc: rtp_packet.get_ssrc(),
+            samples: &self.decoded_audio_buf[..n_decoded_samples * VOICE_CHANNELS],
+        })
     }
 }
 
@@ -220,7 +227,7 @@ impl SendAudioFuture<'_> {
         const RTP_HEADER_LEN: usize = 12;
         let rtp_header = &mut self.rtp_packet_buf[0..12];
         rtp_header[0] = 0x80;
-        rtp_header[1] = DiscordPacketType::Voice as u8;
+        rtp_header[1] = OPUS_PAYLOAD_TYPE;
         rtp_header[2..4].copy_from_slice(&u16::from(sequence).to_be_bytes());
         rtp_header[4..8].copy_from_slice(&u32::from(timestamp).to_be_bytes());
         rtp_header[8..12].copy_from_slice(&self.ssrc.to_be_bytes());

@@ -5,7 +5,7 @@ use messenger_interface::{
     interface::{QueryEvent, TextEvent},
     types::{Identifier, Message as GlobalMessage, User as GlobalUser},
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 use super::{
     GatewayEvent, Opcode,
@@ -24,7 +24,9 @@ impl GatewayPayload<Opcode> {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let gateway = discord.gateway.load();
         let Some(gateway) = gateway.as_ref() else {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "gateway not connected").into());
+            return Err(
+                io::Error::new(io::ErrorKind::NotConnected, "gateway not connected").into(),
+            );
         };
 
         if let Some(s) = self.s {
@@ -67,14 +69,23 @@ impl GatewayPayload<Opcode> {
                         gateway
                             .voice
                             .insert_endpoint(Endpoint::new(
-                                server_update.endpoint.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing voice server endpoint"))?,
+                                server_update.endpoint.ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "missing voice server endpoint",
+                                    )
+                                })?,
                                 server_update.token,
                             ))
                             .await;
 
                         let profile = discord.profile.read().await;
                         let profile = profile.as_ref();
-                        let user_id = profile.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "user profile not loaded"))?.id;
+                        let user_id = profile
+                            .ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::NotFound, "user profile not loaded")
+                            })?
+                            .id;
 
                         match gateway.voice.connect(user_id).await {
                             Ok(_) => (),
@@ -131,7 +142,7 @@ impl GatewayPayload<Opcode> {
                 }
             }
             Opcode::HeartbeatAck => {
-                debug!("HeartbeatAck");
+                trace!("HeartbeatAck");
             }
             _ => {
                 warn!("Unknown opcode received: {:?}", self.op)

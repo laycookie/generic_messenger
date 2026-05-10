@@ -7,12 +7,14 @@ use std::{
 };
 
 use async_trait::async_trait;
+use async_tungstenite::tungstenite::Message as WebsocketMessage;
 use futures::{
     FutureExt as _, StreamExt,
     channel::oneshot,
-    future::{Either, select},
+    future::{self, Either, select},
     pending, select, stream,
 };
+use futures_timer::Delay;
 use messenger_interface::{
     interface::{AudioEvent, CallStatus, Voice as VoiceTrait, VoiceEvent},
     stream::WeakSocketStream,
@@ -20,17 +22,17 @@ use messenger_interface::{
 };
 use smol::future::yield_now;
 use surf::http::convert::json;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{
     general::Opcode,
-    voice::{self, VoiceOpcode, connection::VOICE_FRAME_SAMPLES},
+    voice::{VoiceOpcode, connection::VOICE_FRAME_SAMPLES},
 };
 use crate::{
     AudioManager, InnerDiscord, Owned, UnitStruct, VoiceDiscord, gateways::GatewayStreamReciver,
 };
 
-fn speaking_payload(ssrc: u32, speaking: bool) -> String {
+fn speaking_payload(ssrc: u32, speaking: bool) -> WebsocketMessage {
     json!({
         "op": VoiceOpcode::Speaking as u8,
         "d": {
@@ -40,10 +42,11 @@ fn speaking_payload(ssrc: u32, speaking: bool) -> String {
         }
     })
     .to_string()
+    .into()
 }
 
 impl<T: UnitStruct> InnerDiscord<T> {
-    pub async fn poll_voice(&self) -> Option<()> {
+    pub async fn poll_audio(&self) -> Option<()> {
         const MAX_MICROPHONE_RETRIES: u8 = 3;
 
         let AudioManager {
@@ -105,139 +108,76 @@ impl<T: UnitStruct> InnerDiscord<T> {
         debug!("initialized audio receiver, and sender.");
 
         let mut frame = [0.0; VOICE_FRAME_SAMPLES];
+        let mut stop_speaking_delay = None;
         let mut microphone_input_stream = pin!(stream::unfold::<_, _, _, ()>(
-            (microphone_input, &mut audio_sender, &mut frame),
-            async |(microphone_input, audio_sender, frame)| {
+            (
+                microphone_input,
+                &mut audio_sender,
+                &mut frame,
+                &mut stop_speaking_delay
+            ),
+            async |(microphone_input, audio_sender, frame, stop_speaking_delay)| {
                 loop {
-                    let received_audio = {
-                        let microphone_sample_iter = microphone_input.pop_iter().await;
-                        if microphone_sample_iter.len() >= VOICE_FRAME_SAMPLES {
-                            for (i, s) in
-                                microphone_sample_iter.take(VOICE_FRAME_SAMPLES).enumerate()
-                            {
-                                frame[i] = s;
+                    let received_audio_fut = async {
+                        loop {
+                            let microphone_sample_iter = microphone_input.pop_iter().await;
+                            if microphone_sample_iter.len() >= VOICE_FRAME_SAMPLES {
+                                for (i, s) in
+                                    microphone_sample_iter.take(VOICE_FRAME_SAMPLES).enumerate()
+                                {
+                                    frame[i] = s;
+                                }
+                                return;
                             }
-                            true
-                        } else {
-                            false
                         }
                     };
+                    match select(
+                        pin!(received_audio_fut),
+                        stop_speaking_delay
+                            .take()
+                            .unwrap_or_else(|| future::pending().boxed()),
+                    )
+                    .await
+                    {
+                        Either::Right((_, _)) => {
+                            info!("NO AUDIO");
+                            if voice_gateway.is_speaking.swap(false, Ordering::Relaxed) {
+                                debug!("Send stop speaking packet");
+                                let speaking_payload = speaking_payload(audio_sender.ssrc(), false);
 
-                    if received_audio {
-                        if !voice_gateway.is_speaking.load(Ordering::Relaxed) {
-                            debug!("Send speaking packet");
-                            let speaking_payload = speaking_payload(audio_sender.ssrc(), true);
-
-                            match voice_gateway
-                                .websocket
-                                .send(speaking_payload.clone().into())
-                                .await
-                            {
-                                Ok(_) => {
-                                    debug!("Speaking: {}", speaking_payload);
-                                    voice_gateway.is_speaking.store(true, Ordering::Relaxed)
-                                }
-                                Err(err) => {
+                                if let Err(err) =
+                                    voice_gateway.websocket.send(speaking_payload).await
+                                {
                                     error!("Failed to send speaking update: {err}");
-                                    return None;
                                 }
-                            };
-                        }
-                        if let Err(err) = audio_sender.send_audio_frame(frame.as_slice()).await {
-                            warn!("Failed to send voice audio frame: {err}");
-                        }
-                    } else {
-                        let should_stop = audio_sender
-                            .last_send_time()
-                            .map(|last_time| last_time.elapsed() > Duration::from_millis(200))
-                            .unwrap_or(false);
-
-                        if should_stop && voice_gateway.is_speaking.swap(false, Ordering::Relaxed) {
-                            debug!("Send stop speaking packet");
-                            let speaking_payload = speaking_payload(audio_sender.ssrc(), false);
-
-                            if let Err(err) =
-                                voice_gateway.websocket.send(speaking_payload.into()).await
-                            {
-                                error!("Failed to send speaking update: {err}");
                             }
+                            continue;
                         }
+                        Either::Left((_, _)) => {}
+                    };
+
+                    *stop_speaking_delay = Some(Box::pin(Delay::new(Duration::from_secs(2))));
+                    if !voice_gateway.is_speaking.load(Ordering::Relaxed) {
+                        debug!("Send speaking packet");
+                        let speaking_payload = speaking_payload(audio_sender.ssrc(), true);
+                        match voice_gateway.websocket.send(speaking_payload).await {
+                            Ok(_) => voice_gateway.is_speaking.store(true, Ordering::Relaxed),
+                            Err(err) => {
+                                error!("Failed to send speaking update: {err}");
+                                return None;
+                            }
+                        };
+                    }
+                    if let Err(err) = audio_sender.send_audio_frame(frame.as_slice()).await {
+                        warn!("Failed to send voice audio frame: {err}");
                     }
                 }
             }
         ));
 
-        let mut audio_recv_stream = pin!(stream::unfold::<_, _, _, ()>(
-            &mut audio_receiver,
-            async |audio_receiver| {
-                loop {
-                    match audio_receiver.recv_audio().await {
-                        Ok((ssrc, incoming_audio_frame)) => {
-                            let mut channel_entry =
-                                match voice_gateway.ssrc_to_audio_channel.entry(ssrc) {
-                                    dashmap::Entry::Occupied(channel) => channel,
-                                    dashmap::Entry::Vacant(vacant_entry) => {
-                                        let (sender, receiver) = oneshot::channel();
-                                        vacant_entry.insert(
-                                            voice::AudioChannel::Initializing(receiver).into(),
-                                        );
-                                        self.audio_events.push(AudioEvent::AddAudioSource(sender));
-                                        // TODO: Save incoming_audio_frame
-                                        return Some(((), audio_receiver));
-                                    }
-                                };
-                            loop {
-                                // TODO: Handle mutex poison error
-                                let mut channel = channel_entry.get().lock().unwrap();
-                                match &mut *channel {
-                                    voice::AudioChannel::Initializing(receiver) => {
-                                        match receiver.try_recv() {
-                                            Ok(Some(producer)) => {
-                                                drop(channel);
-                                                channel_entry.insert(
-                                                    voice::AudioChannel::Connected(producer).into(),
-                                                );
-                                            }
-                                            Ok(None) => continue,
-                                            Err(_) => {
-                                                // Sender dropped without providing a SampleProducer.
-                                                // Remove entry so it gets re-requested on the next packet.
-                                                drop(channel);
-                                                channel_entry.remove();
-                                                warn!(
-                                                    "Audio source sender dropped for SSRC {ssrc}, will re-request"
-                                                );
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    voice::AudioChannel::Connected(producer) => {
-                                        let samples_pushed = producer.push_iter(
-                                            incoming_audio_frame
-                                                .iter()
-                                                .map(|sample| *sample as f32 / i16::MAX as f32),
-                                        );
-                                        if incoming_audio_frame.len() != samples_pushed {
-                                            error!(
-                                                "Audio buffer overflow. Pushed: {}, Succeeded: {}",
-                                                incoming_audio_frame.len(),
-                                                samples_pushed
-                                            );
-                                        }
-                                    }
-                                };
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            error!("{err}");
-                        }
-                    };
-                }
-            }
-        ));
-
-        select(microphone_input_stream.next(), audio_recv_stream.next()).await;
+        let poll_udp = pin!(voice_gateway.poll_udp(&self.audio_events, &mut audio_receiver));
+        select(microphone_input_stream.next(), poll_udp).await;
+        warn!("Restarting audio loop");
         Some(())
     }
 

@@ -3,7 +3,6 @@ use std::{
     ops::{Add, AddAssign, Sub, SubAssign},
 };
 
-use num_enum::TryFromPrimitive;
 use pnet_macros::packet;
 use pnet_macros_support::{
     packet::PrimitiveValues,
@@ -12,14 +11,52 @@ use pnet_macros_support::{
 
 pub type Ssrc = u32;
 
-#[derive(Debug, PartialEq, TryFromPrimitive)]
+/// Discord uses dynamic RTP payload type 120 for Opus audio.
+pub const OPUS_PAYLOAD_TYPE: u8 = 120;
+
+/// RTCP packet types per RFC 3550 and extensions.
+/// <https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-4>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub(super) enum DiscordPacketType {
-    Voice = 0x78,
-    /// RTCP Sender Report
-    RtcpSenderReport = 200,
-    /// RTCP Receiver Report
-    RtcpReceiverReport = 201,
+pub enum RtcpType {
+    SenderReport = 200,
+    ReceiverReport = 201,
+    SourceDescription = 202,
+    Goodbye = 203,
+    ApplicationDefined = 204,
+    TransportFeedback = 205,
+    PayloadFeedback = 206,
+    ExtendedReport = 207,
+}
+
+/// Classification of a raw UDP packet per RFC 5761.
+///
+/// Byte 1 of the packet determines the type:
+/// - 200..=207 → RTCP (the byte is the RTCP packet type)
+/// - Anything else → RTP (marker = bit 7, payload type = bits 0..6)
+#[derive(Debug, Clone, Copy)]
+pub enum PacketClass {
+    Rtp { marker: bool, payload_type: u8 },
+    Rtcp(RtcpType),
+}
+
+impl PacketClass {
+    pub fn classify(second_byte: u8) -> Self {
+        match second_byte {
+            200 => Self::Rtcp(RtcpType::SenderReport),
+            201 => Self::Rtcp(RtcpType::ReceiverReport),
+            202 => Self::Rtcp(RtcpType::SourceDescription),
+            203 => Self::Rtcp(RtcpType::Goodbye),
+            204 => Self::Rtcp(RtcpType::ApplicationDefined),
+            205 => Self::Rtcp(RtcpType::TransportFeedback),
+            206 => Self::Rtcp(RtcpType::PayloadFeedback),
+            207 => Self::Rtcp(RtcpType::ExtendedReport),
+            other => Self::Rtp {
+                marker: other & 0x80 != 0,
+                payload_type: other & 0x7F,
+            },
+        }
+    }
 }
 
 // === RTP definitions ===

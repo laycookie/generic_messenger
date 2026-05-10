@@ -8,7 +8,7 @@ use ringbuf::{
     CachingCons, CachingProd, StaticRb,
     traits::{Consumer as _, Observer as _, Producer, Split},
 };
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::{
     AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, Channel, ChannelType, Notify, SampleConsum,
@@ -68,7 +68,9 @@ impl AudioMixer {
             stream
                 .to_audio_thread
                 .try_push(OutputRxEvent::AddOutputChannel(sample_consumer))
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("failed to push output channel event: {err:?}")))?;
+                .map_err(|err| {
+                    io::Error::other(format!("failed to push output channel event: {err:?}"))
+                })?;
         }
         self.output_channels.push(channel);
 
@@ -96,36 +98,34 @@ impl AudioMixer {
         let (prod, mut cons) = StaticRb::default().split();
         let stream_close_notification = Notify::new();
         let send_stream_close_notification = stream_close_notification.clone();
-        let stream = output
-            .device
-            .build_output_stream(
-                &stream_config,
-                move |data: &mut [AudioSampleType], _| {
-                    for event in cons.pop_iter() {
-                        match event {
-                            OutputRxEvent::AddOutputChannel(cons) => {
-                                sample_consumers.push(cons);
-                            }
-                        };
-                    }
-                    sample_consumers.retain(|consumer| consumer.write_is_held());
-                    if sample_consumers.is_empty() {
-                        send_stream_close_notification.notify();
-                    }
-                    // Mix audio from all channels
-                    for stream_sample in data.iter_mut() {
-                        *stream_sample = sample_consumers
-                            .iter_mut()
-                            .map(|consumer| consumer.try_pop().unwrap_or(0.0))
-                            .sum::<AudioSampleType>()
-                            .clamp(-1.0, 1.0);
-                    }
-                },
-                move |err| {
-                    error!("Audio stream error: {err:?}");
-                },
-                None,
-            )?;
+        let stream = output.device.build_output_stream(
+            &stream_config,
+            move |data: &mut [AudioSampleType], _| {
+                for event in cons.pop_iter() {
+                    match event {
+                        OutputRxEvent::AddOutputChannel(cons) => {
+                            sample_consumers.push(cons);
+                        }
+                    };
+                }
+                sample_consumers.retain(|consumer| consumer.write_is_held());
+                if sample_consumers.is_empty() {
+                    send_stream_close_notification.notify();
+                }
+                // Mix audio from all channels
+                for stream_sample in data.iter_mut() {
+                    *stream_sample = sample_consumers
+                        .iter_mut()
+                        .map(|consumer| consumer.try_pop().unwrap_or(0.0))
+                        .sum::<AudioSampleType>()
+                        .clamp(-1.0, 1.0);
+                }
+            },
+            move |err| {
+                error!("Audio stream error: {err:?}");
+            },
+            None,
+        )?;
 
         stream.play()?;
         output.stream = Some(crate::OutputStream {

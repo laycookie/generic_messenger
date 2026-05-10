@@ -7,7 +7,7 @@ use futures::lock::Mutex as AsyncMutex;
 use num_enum::TryFromPrimitive;
 use simple_audio_channels::output::SampleProducer;
 
-use self::gateway::Voice;
+pub(super) use self::gateway::Voice;
 use crate::gateways::Gateway;
 use crate::{ChannelID, api_types::SNOWFLAKE};
 

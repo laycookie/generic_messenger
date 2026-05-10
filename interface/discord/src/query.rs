@@ -419,7 +419,7 @@ impl ArcStream for InnerDiscord<AudioDiscord> {
             if let Some(event) = self.audio_events.pop() {
                 return Some(event);
             }
-            self.poll_voice().await?;
+            self.poll_audio().await?;
         }
     }
 }

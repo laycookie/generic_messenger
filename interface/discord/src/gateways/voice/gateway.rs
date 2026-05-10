@@ -8,19 +8,22 @@ use std::{
 
 use arc_swap::ArcSwapOption;
 use async_tungstenite::async_std::connect_async;
+use crossbeam::queue::SegQueue;
 use dashmap::DashMap;
 use davey::{DAVE_PROTOCOL_VERSION, DaveSession};
 use facet_pretty::FacetPretty;
 use futures::{
     StreamExt as _,
+    channel::oneshot,
     lock::{Mutex as AsyncMutex, MutexGuard},
 };
+use messenger_interface::interface::AudioEvent;
 use surf::http::convert::json;
-use tracing::debug;
+use tracing::{debug, error, info, trace, warn};
 
 use super::{
-    Endpoint, SessionId, VoiceOpcode,
-    connection::{Connection, Ssrc},
+    AudioChannel, Endpoint, SessionId, VoiceOpcode,
+    connection::{Connection, RecvAudioFuture, Ssrc, UdpPacket},
     payloads::HelloPayload,
 };
 use crate::gateways::{Gateway, HeartBeatingData, Websocket};
@@ -63,6 +66,90 @@ impl Voice {
             ));
         }
         Ok(DaveSessionGuard(guard))
+    }
+
+    /// Dispatch a decoded audio frame to the appropriate playback channel.
+    ///
+    /// Returns `false` if a new channel is being initialized and the caller should yield.
+    pub(crate) fn dispatch_incoming_audio(
+        &self,
+        audio_events: &SegQueue<AudioEvent>,
+        ssrc: Ssrc,
+        samples: &[i16],
+    ) -> bool {
+        let mut channel_entry = match self.ssrc_to_audio_channel.entry(ssrc) {
+            dashmap::Entry::Occupied(channel) => channel,
+            dashmap::Entry::Vacant(vacant_entry) => {
+                let (sender, receiver) = oneshot::channel();
+                vacant_entry.insert(AudioChannel::Initializing(receiver).into());
+                audio_events.push(AudioEvent::AddAudioSource(sender));
+                // TODO: Save samples for when channel is ready
+                return false;
+            }
+        };
+        loop {
+            let mut channel = channel_entry.get().lock().unwrap();
+            match &mut *channel {
+                AudioChannel::Initializing(receiver) => match receiver.try_recv() {
+                    Ok(Some(producer)) => {
+                        drop(channel);
+                        channel_entry.insert(AudioChannel::Connected(producer).into());
+                    }
+                    Ok(None) => continue,
+                    Err(_) => {
+                        drop(channel);
+                        channel_entry.remove();
+                        warn!("Audio source sender dropped for SSRC {ssrc}, will re-request");
+                        break;
+                    }
+                },
+                AudioChannel::Connected(producer) => {
+                    let samples_pushed = producer.push_iter(
+                        samples
+                            .iter()
+                            .map(|sample| *sample as f32 / i16::MAX as f32),
+                    );
+                    info!("Samples: {samples_pushed}");
+                    if samples.len() != samples_pushed {
+                        error!(
+                            "Audio buffer overflow. Pushed: {}, Succeeded: {}",
+                            samples.len(),
+                            samples_pushed
+                        );
+                    }
+                }
+            };
+            break;
+        }
+        true
+    }
+
+    /// Receive and classify UDP packets, dispatching audio to playback channels.
+    ///
+    /// Returns when a new audio channel is initializing (caller should re-enter).
+    pub(crate) async fn poll_udp(
+        &self,
+        audio_events: &SegQueue<AudioEvent>,
+        receiver: &mut RecvAudioFuture<'_>,
+    ) {
+        loop {
+            match receiver.recv().await {
+                Ok(UdpPacket::Voice { ssrc, samples }) => {
+                    if !self.dispatch_incoming_audio(audio_events, ssrc, samples) {
+                        return;
+                    }
+                }
+                Ok(UdpPacket::Rtcp(rtcp_type)) => {
+                    trace!("RTCP: {rtcp_type:?}");
+                }
+                Ok(UdpPacket::UnhandledRtp { ssrc, payload_type }) => {
+                    debug!("Unhandled RTP payload type {payload_type} from SSRC {ssrc}");
+                }
+                Err(err) => {
+                    error!("{err}");
+                }
+            }
+        }
     }
 }
 
