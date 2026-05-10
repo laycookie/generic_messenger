@@ -39,7 +39,7 @@ jobs:
 
       - name: Cargo check (NixOS)
         if: matrix.platform == 'nixos'
-        run: nix-shell -I nixpkgs=channel:nixos-unstable -p alsa-lib openssl opus pkg-config --run "cargo check"
+        run: nix-shell -I nixpkgs=channel:nixos-unstable -p alsa-lib fontconfig openssl opus pkg-config --run "cargo check"
 
       - name: Cargo check
         if: matrix.platform != 'nixos'
