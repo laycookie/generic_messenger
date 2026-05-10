@@ -21,11 +21,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Ubuntu dependencies
+      - name: Install Nix
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libopus-dev pkg-config
+        uses: cachix/install-nix-action@v31
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
@@ -34,5 +32,10 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install nightly-2026-04-17 --profile minimal
 
+      - name: Cargo check (Ubuntu)
+        if: runner.os == 'Linux'
+        run: nix-shell -p alsa-lib opus pkg-config --run "cargo check"
+
       - name: Cargo check
+        if: runner.os != 'Linux'
         run: cargo check
