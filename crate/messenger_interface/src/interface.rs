@@ -13,7 +13,7 @@ use std::fmt::Debug;
 use std::{error::Error, sync::Arc};
 
 // QueryPlace is kept for reference in the commented-out legacy code below
-use crate::types::{House, Identifier, Message, Place, Room, User};
+use crate::types::{House, ID, Identifier, Message, Place, Room, User};
 
 pub use crate::stream::{ArcStream, WeakSocketStream};
 
@@ -181,12 +181,34 @@ pub trait Text: Send + Sync {
         load_messages_before: Option<Identifier<Message>>,
     ) -> Result<Vec<Identifier<Message>>, Box<dyn Error + Sync + Send>>;
 
+    /// Add a reaction to a message.
+    async fn add_reaction(
+        &self,
+        _location: &Identifier<Place<Room>>,
+        _message: &Identifier<Message>,
+        _emoji: &str,
+    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+        Err(Box::new(MessengerError::NotImplemented))
+    }
+
+    /// Remove own reaction from a message.
+    async fn remove_reaction(
+        &self,
+        _location: &Identifier<Place<Room>>,
+        _message: &Identifier<Message>,
+        _emoji: &str,
+    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+        Err(Box::new(MessengerError::NotImplemented))
+    }
+
     /// Send a new message into `location`.
+    ///
+    /// Returns the confirmed message (with server-assigned ID) on success.
     async fn send_message(
         &self,
         location: &Identifier<Place<Room>>,
         contents: Message,
-    ) -> Result<(), Box<dyn Error + Sync + Send>>;
+    ) -> Result<Identifier<Message>, Box<dyn Error + Sync + Send>>;
     async fn listen(
         self: Arc<Self>,
     ) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
@@ -240,6 +262,30 @@ pub enum SocketEvent {
         room: Identifier<()>,
         message: Identifier<Message>,
     },
+    /// A message was edited/updated in a channel.
+    MessageUpdated {
+        room: Identifier<()>,
+        message: Identifier<Message>,
+    },
+    /// A message was deleted in a channel.
+    MessageDeleted {
+        room: Identifier<()>,
+        message_id: ID,
+    },
+    /// A reaction was added to a message.
+    ReactionAdded {
+        room: Identifier<()>,
+        message_id: ID,
+        user_id: ID,
+        emoji: String,
+    },
+    /// A reaction was removed from a message.
+    ReactionRemoved {
+        room: Identifier<()>,
+        message_id: ID,
+        user_id: ID,
+        emoji: String,
+    },
     /// A channel/room was created (optionally within a server/place).
     ChannelCreated {
         r#where: Option<Identifier<()>>,
@@ -247,12 +293,8 @@ pub enum SocketEvent {
     },
     CallStatusUpdate(CallStatus),
     /// Request to attach an audio source into the audio graph.
-    ///
-    /// The receiver receives a `SampleProducer` used to push samples into the system.
     AddAudioSource(oneshot::Sender<SampleProducer>),
     /// Request to attach a local audio input (microphone) for sending to voice.
-    ///
-    /// The receiver receives a `SampleConsumer` used to pull samples from the input stream.
     AddAudioInput(oneshot::Sender<SampleConsumer>),
     /// Socket disconnected (cleanly or due to error).
     Disconnected,
@@ -275,6 +317,34 @@ impl From<TextEvent> for SocketEvent {
             TextEvent::MessageCreated { room, message } => {
                 SocketEvent::MessageCreated { room, message }
             }
+            TextEvent::MessageUpdated { room, message } => {
+                SocketEvent::MessageUpdated { room, message }
+            }
+            TextEvent::MessageDeleted { room, message_id } => {
+                SocketEvent::MessageDeleted { room, message_id }
+            }
+            TextEvent::ReactionAdded {
+                room,
+                message_id,
+                user_id,
+                emoji,
+            } => SocketEvent::ReactionAdded {
+                room,
+                message_id,
+                user_id,
+                emoji,
+            },
+            TextEvent::ReactionRemoved {
+                room,
+                message_id,
+                user_id,
+                emoji,
+            } => SocketEvent::ReactionRemoved {
+                room,
+                message_id,
+                user_id,
+                emoji,
+            },
         }
     }
 }
@@ -306,8 +376,31 @@ pub enum TextEvent {
     /// A message was created in a channel.
     MessageCreated {
         room: Identifier<()>,
-        // room: Identifier<Place<Room>>,
         message: Identifier<Message>,
+    },
+    /// A message was edited/updated in a channel.
+    MessageUpdated {
+        room: Identifier<()>,
+        message: Identifier<Message>,
+    },
+    /// A message was deleted in a channel.
+    MessageDeleted {
+        room: Identifier<()>,
+        message_id: ID,
+    },
+    /// A reaction was added to a message.
+    ReactionAdded {
+        room: Identifier<()>,
+        message_id: ID,
+        user_id: ID,
+        emoji: String,
+    },
+    /// A reaction was removed from a message.
+    ReactionRemoved {
+        room: Identifier<()>,
+        message_id: ID,
+        user_id: ID,
+        emoji: String,
     },
 }
 

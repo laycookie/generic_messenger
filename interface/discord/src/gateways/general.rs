@@ -23,7 +23,7 @@ mod payloads;
 
 /// <https://discord.com/developers/docs/topics/opcodes-and-status-codes#gateway-gateway-opcodes>
 /// <https://docs.discord.food/topics/opcodes-and-status-codes#gateway-opcodes>
-#[derive(Debug, Facet, TryFromPrimitive)]
+#[derive(Facet, TryFromPrimitive)]
 #[facet(is_numeric)]
 #[non_exhaustive]
 #[repr(u8)]
@@ -39,7 +39,7 @@ pub enum Opcode {
 }
 
 /// <https://discord.com/developers/docs/events/gateway-events#receive-events>
-#[derive(Debug, Facet)]
+#[derive(Facet)]
 #[facet(rename_all = "SCREAMING_SNAKE_CASE")]
 #[non_exhaustive]
 #[repr(u8)]
@@ -85,6 +85,10 @@ pub enum GatewayEvent {
     VoiceStateUpdate,
     VoiceServerUpdate,
     MessageCreate,
+    MessageUpdate,
+    MessageDelete,
+    MessageReactionAdd,
+    MessageReactionRemove,
 }
 
 pub struct General {

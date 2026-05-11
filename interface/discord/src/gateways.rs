@@ -65,10 +65,10 @@ impl GatewayStreamReciver for WebSocketReceiver<ConnectStream> {
     ) -> impl FusedStream<Item = GatewayPayload<Op>> + '_ {
         self.filter_map(async |msg| -> Option<GatewayPayload<Op>> {
             match msg {
-                Ok(msg) => match parse_gateway_event::<Op>(msg) {
+                Ok(msg) => match parse_gateway_event::<Op>(&msg) {
                     Some(payload) => Some(payload),
                     None => {
-                        warn!("Something went wrong parsing the event payload");
+                        warn!("Something went wrong parsing the event payload: {}", msg);
                         None
                     }
                 },
@@ -84,17 +84,17 @@ impl GatewayStreamReciver for WebSocketReceiver<ConnectStream> {
 /// Parse a text websocket message into a `GatewayPayload`.
 /// Returns `None` for non-text frames (binary, ping, close, etc.).
 fn parse_gateway_event<Op: Facet<'static> + TryFrom<u8>>(
-    msg: WebsocketMessage,
+    msg: &WebsocketMessage,
 ) -> Option<GatewayPayload<Op>> {
     match msg {
-        WebsocketMessage::Text(utf8) => match facet_json::from_str::<GatewayPayload<Op>>(&utf8) {
+        WebsocketMessage::Text(utf8) => match facet_json::from_str::<GatewayPayload<Op>>(utf8) {
             Ok(payload) => Some(payload),
             Err(err) => {
                 warn!("Failed to parse gateway payload: {err}");
                 None
             }
         },
-        WebsocketMessage::Binary(bytes) => match voice::VoiceBinaryFrame::parse(&bytes) {
+        WebsocketMessage::Binary(bytes) => match voice::VoiceBinaryFrame::parse(bytes) {
             Ok(frame) => {
                 let op = Op::try_from(frame.opcode as u8).ok()?;
                 Some(GatewayPayload::new_binary(
@@ -129,7 +129,7 @@ impl<T> Deref for Gateway<T> {
 
 // TODO: Port VoiceBinaryFrame to just be this under the hood
 /// <https://discord.com/developers/docs/events/gateway-events#payload-structure>
-#[derive(Debug, Facet)]
+#[derive(Facet)]
 pub struct GatewayPayload<Op> {
     // Opcode
     op: Op,

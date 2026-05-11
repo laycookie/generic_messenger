@@ -34,7 +34,7 @@ pub enum RtcpType {
 /// Byte 1 of the packet determines the type:
 /// - 200..=207 → RTCP (the byte is the RTCP packet type)
 /// - Anything else → RTP (marker = bit 7, payload type = bits 0..6)
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub enum PacketClass {
     Rtp { marker: bool, payload_type: u8 },
     Rtcp(RtcpType),

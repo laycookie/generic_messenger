@@ -22,6 +22,7 @@ dashmap = "6.1.0"
 crossbeam = "0.8.4"
 # Fetch
 surf = "2.3.2"
+percent-encoding = "2"
 # Serialize/Deserialize
 facet = { workspace = true }
 facet-value = { workspace = true }

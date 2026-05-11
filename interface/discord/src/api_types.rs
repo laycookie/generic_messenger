@@ -116,7 +116,7 @@ pub struct Channel {
     pub position: Option<i32>,
     pub parent_id: Option<String>,
     pub icon: Option<String>,
-    // pub(crate) last_message_id: Option<String>,
+    pub last_message_id: Option<SNOWFLAKE>,
     pub name: Option<String>,
     pub recipients: Option<Vec<Recipient>>,
     pub permission_overwrites: Option<Vec<OverwriteObject>>,
@@ -200,7 +200,7 @@ pub struct Reaction {
     pub count: u32,
     // count_details: CountDetails,
     pub emoji: Emoji,
-    // me: bool,
+    pub me: bool,
     // me_burst: bool,
 }
 
@@ -244,6 +244,24 @@ pub struct CreateMessage {
     //
     pub flags: Option<u32>, // Bitfield (only certain flags allowed)
                             // poll: Option<Poll>, // Poll object
+}
+
+// https://discord.com/developers/docs/events/gateway-events#message-delete
+#[derive(Facet)]
+pub struct MessageDelete {
+    pub id: SNOWFLAKE,
+    pub channel_id: SNOWFLAKE,
+    // guild_id: Option<SNOWFLAKE>,
+}
+
+// https://discord.com/developers/docs/events/gateway-events#message-reaction-add
+#[derive(Facet)]
+pub struct MessageReactionChange {
+    pub user_id: SNOWFLAKE,
+    pub channel_id: SNOWFLAKE,
+    pub message_id: SNOWFLAKE,
+    // guild_id: Option<SNOWFLAKE>,
+    pub emoji: Emoji,
 }
 
 // https://discord.com/developers/docs/resources/guild#guild-object

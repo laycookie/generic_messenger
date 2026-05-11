@@ -44,7 +44,7 @@ impl GatewayPayload<Opcode> {
                     warn!("Dispatch opcode received without an event type (t)");
                     return Ok(());
                 };
-                debug!("Dispatch event: {event_name:?}");
+                debug!("Dispatch event: {}", event_name.pretty());
                 // https://discord.com/developers/docs/events/gateway-events#receive-events
                 match event_name {
                     GatewayEvent::Ready => {
@@ -106,16 +106,16 @@ impl GatewayPayload<Opcode> {
                         let channel_id_hash = message.channel_id;
                         let msg_id_hash = message.id;
 
-                        debug!(
-                            "MessageCreate: channel={} msg={} text={:?}",
-                            channel_id_hash, msg_id_hash, &message.content
-                        );
+                        trace!("MessageCreate: {}", message.pretty());
                         let icon = match &message.author.avatar {
-                            Some(hash) => {
-                                cache_cdn_image("avatars", CacheCategory::Users, message.author.id, hash)
-                                    .await
-                                    .ok()
-                            }
+                            Some(hash) => cache_cdn_image(
+                                "avatars",
+                                CacheCategory::Users,
+                                message.author.id,
+                                hash,
+                            )
+                            .await
+                            .ok(),
                             None => None,
                         };
                         let author = Identifier::new(
@@ -142,10 +142,81 @@ impl GatewayPayload<Opcode> {
                             room: Identifier::new(channel_id_hash, ()),
                             message: msg_identifier,
                         });
-                        debug!(
-                            "text_events queue length after push: {}",
-                            discord.text_events.len()
+                    }
+                    GatewayEvent::MessageUpdate => {
+                        let message = facet_value::from_value::<Message>(self.d)?;
+
+                        let channel_id_hash = message.channel_id;
+                        let msg_id_hash = message.id;
+
+                        trace!("{}", message.pretty());
+                        let icon = match &message.author.avatar {
+                            Some(hash) => cache_cdn_image(
+                                "avatars",
+                                CacheCategory::Users,
+                                message.author.id,
+                                hash,
+                            )
+                            .await
+                            .ok(),
+                            None => None,
+                        };
+                        let author = Identifier::new(
+                            message.author.id,
+                            GlobalUser {
+                                name: message.author.username,
+                                icon,
+                            },
                         );
+                        let msg_identifier = Identifier::new(
+                            msg_id_hash,
+                            GlobalMessage {
+                                text: message.content,
+                                reactions: Vec::new(),
+                                author: Some(author),
+                            },
+                        );
+
+                        discord.text_events.push(TextEvent::MessageUpdated {
+                            room: Identifier::new(channel_id_hash, ()),
+                            message: msg_identifier,
+                        });
+                    }
+                    GatewayEvent::MessageDelete => {
+                        let payload = facet_value::from_value::<api_types::MessageDelete>(self.d)?;
+
+                        trace!("{}", payload.pretty());
+
+                        discord.text_events.push(TextEvent::MessageDeleted {
+                            room: Identifier::new(payload.channel_id, ()),
+                            message_id: payload.id,
+                        });
+                    }
+                    GatewayEvent::MessageReactionAdd => {
+                        let payload =
+                            facet_value::from_value::<api_types::MessageReactionChange>(self.d)?;
+
+                        trace!("{}", payload.pretty());
+
+                        discord.text_events.push(TextEvent::ReactionAdded {
+                            room: Identifier::new(payload.channel_id, ()),
+                            message_id: payload.message_id,
+                            user_id: payload.user_id,
+                            emoji: payload.emoji.name,
+                        });
+                    }
+                    GatewayEvent::MessageReactionRemove => {
+                        let payload =
+                            facet_value::from_value::<api_types::MessageReactionChange>(self.d)?;
+
+                        trace!("{}", payload.pretty());
+
+                        discord.text_events.push(TextEvent::ReactionRemoved {
+                            room: Identifier::new(payload.channel_id, ()),
+                            message_id: payload.message_id,
+                            user_id: payload.user_id,
+                            emoji: payload.emoji.name,
+                        });
                     }
                     GatewayEvent::ChannelCreate => {
                         let channel = facet_value::from_value::<api_types::Channel>(self.d)?;
@@ -170,14 +241,14 @@ impl GatewayPayload<Opcode> {
                             room,
                         });
                     }
-                    _ => warn!("Unknown event_name received: {event_name:?}"),
+                    _ => warn!("Unknown event_name received: {}", event_name.pretty()),
                 }
             }
             Opcode::HeartbeatAck => {
                 trace!("HeartbeatAck");
             }
             _ => {
-                warn!("Unknown opcode received: {:?}", self.op)
+                warn!("Unknown opcode received: {}", self.op.pretty())
             }
         };
         Ok(())

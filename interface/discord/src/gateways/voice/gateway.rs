@@ -172,7 +172,7 @@ impl Gateway<Voice> {
           "op": VoiceOpcode::Identify as u8,
           "d": {
             // The ID of the guild, private channel, stream, or lobby being connected to
-            "server_id": guild_id,
+            "server_id": guild_id.unwrap_or(channel_id),
             "channel_id": channel_id,
             "user_id": user_id,
             "session_id": session_id,

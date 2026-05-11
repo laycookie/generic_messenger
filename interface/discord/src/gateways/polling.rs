@@ -12,7 +12,7 @@ use futures::{
     FutureExt as _, StreamExt,
     channel::oneshot,
     future::{self, Either, select},
-    pending, select, stream,
+    select, stream,
 };
 use futures_timer::Delay;
 use messenger_interface::{
@@ -319,9 +319,7 @@ impl VoiceTrait for InnerDiscord<Owned> {
                 None => {
                     // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
                     // and support guild voice channels too.
-                    warn!(
-                        "Tried to disconnect voice for a Room without a discord channel mapping"
-                    );
+                    warn!("Tried to disconnect voice for a Room without a discord channel mapping");
                     return;
                 }
             }

@@ -13,6 +13,7 @@ use messenger_interface::{
         CacheCategory, House, Identifier, Message, Place, Reaction, Room, RoomCapabilities, User,
     },
 };
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use tracing::error;
 
 use std::{error::Error, sync::Arc};
@@ -26,11 +27,15 @@ impl InnerDiscord<Owned> {
         &self,
     ) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
         // DMs / group DMs
-        let channels = http_request::<Vec<api_types::Channel>>(
+        let mut channels = http_request::<Vec<api_types::Channel>>(
             surf::get(format!("{DISCORD_API}/users/@me/channels")),
             self.get_auth_header(),
         )
         .await?;
+
+        // Sort by last_message_id descending (most recent first).
+        // Discord snowflake IDs encode timestamps, so higher = newer.
+        channels.sort_by(|a, b| b.last_message_id.cmp(&a.last_message_id));
 
         let rooms_producer = channels
             .iter()
@@ -44,7 +49,7 @@ impl InnerDiscord<Owned> {
 
         // Cache mapping internal room id -> discord channel id
         let mut channel_data = self.channel_id_mappings.write().await;
-        for (identifier, channel) in places.iter().zip(channels) {
+        for (identifier, channel) in places.iter().zip(channels.iter()) {
             channel_data.insert(
                 *identifier.id(),
                 super::ChannelID {
@@ -107,11 +112,47 @@ impl InnerDiscord<Owned> {
         &self,
         guild_id: SNOWFLAKE,
     ) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
-        let channels = http_request::<Vec<api_types::Channel>>(
+        let mut channels = http_request::<Vec<api_types::Channel>>(
             surf::get(format!("{DISCORD_API}/guilds/{guild_id}/channels")),
             self.get_auth_header(),
         )
         .await?;
+
+        // Build category position lookup: category_id → position
+        let category_positions: std::collections::HashMap<SNOWFLAKE, i32> = channels
+            .iter()
+            .filter(|c| matches!(c.channel_type, api_types::ChannelTypes::GuildCategory))
+            .map(|c| (c.id, c.position.unwrap_or(0)))
+            .collect();
+
+        // Sort: categories first by position, then children grouped under
+        // their parent category and sorted by their own position.
+        // Channels without a parent sort to the top.
+        channels.sort_by_key(|channel| {
+            let own_pos = channel.position.unwrap_or(0);
+            let is_category =
+                matches!(channel.channel_type, api_types::ChannelTypes::GuildCategory);
+
+            match channel
+                .parent_id
+                .as_ref()
+                .and_then(|pid| pid.parse::<SNOWFLAKE>().ok())
+            {
+                // Child channel: sort after its parent category
+                Some(parent_id) => {
+                    let parent_pos = category_positions.get(&parent_id).copied().unwrap_or(0);
+                    (parent_pos, 1, own_pos)
+                }
+                // Category or top-level channel
+                None => {
+                    if is_category {
+                        (own_pos, 0, 0) // Category header comes first
+                    } else {
+                        (own_pos, 1, 0) // Uncategorized channel
+                    }
+                }
+            }
+        });
 
         let mut channel_data = self.channel_id_mappings.write().await;
         Ok(channels
@@ -292,10 +333,9 @@ impl Text for InnerDiscord<Owned> {
                 .unwrap_or(Vec::new())
                 .iter()
                 .map(|reaction| Reaction {
-                    // NOTE: Discord reactions can be custom emojis (name may not be a unicode emoji).
-                    // TODO(discord-migration): represent custom emojis (needs richer type than `char`).
-                    emoji: reaction.emoji.name.chars().next().unwrap_or('�'),
+                    emoji: reaction.emoji.name.clone(),
                     count: reaction.count,
+                    reacted: reaction.me,
                 })
                 .collect();
 
@@ -338,12 +378,80 @@ impl Text for InnerDiscord<Owned> {
             .collect())
     }
 
+    // Docs: https://discord.com/developers/docs/resources/message#create-reaction
+    async fn add_reaction(
+        &self,
+        location: &Identifier<Place<Room>>,
+        message: &Identifier<Message>,
+        emoji: &str,
+    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+        let channel_id = {
+            let map = self.channel_id_mappings.read().await;
+            map.get(location.id())
+                .ok_or("No discord channel id mapping for this room")?
+                .clone()
+        };
+        let msg_id = {
+            let map = self.msg_data.read().await;
+            *map.get(message.id())
+                .ok_or("No discord message id mapping")?
+        };
+        let encoded_emoji = utf8_percent_encode(emoji, NON_ALPHANUMERIC);
+        let url = format!(
+            "{DISCORD_API}/channels/{}/messages/{msg_id}/reactions/{encoded_emoji}/@me",
+            channel_id.id,
+        );
+        let mut req = surf::put(&url);
+        for (key, value) in self.get_auth_header() {
+            req = req.header(key, value);
+        }
+        let res = req.send().await?;
+        if !res.status().is_success() {
+            return Err(surf::Error::from_str(res.status(), "Failed to add reaction").into());
+        }
+        Ok(())
+    }
+
+    // Docs: https://discord.com/developers/docs/resources/message#delete-own-reaction
+    async fn remove_reaction(
+        &self,
+        location: &Identifier<Place<Room>>,
+        message: &Identifier<Message>,
+        emoji: &str,
+    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+        let channel_id = {
+            let map = self.channel_id_mappings.read().await;
+            map.get(location.id())
+                .ok_or("No discord channel id mapping for this room")?
+                .clone()
+        };
+        let msg_id = {
+            let map = self.msg_data.read().await;
+            *map.get(message.id())
+                .ok_or("No discord message id mapping")?
+        };
+        let encoded_emoji = utf8_percent_encode(emoji, NON_ALPHANUMERIC);
+        let url = format!(
+            "{DISCORD_API}/channels/{}/messages/{msg_id}/reactions/{encoded_emoji}/@me",
+            channel_id.id,
+        );
+        let mut req = surf::delete(&url);
+        for (key, value) in self.get_auth_header() {
+            req = req.header(key, value);
+        }
+        let res = req.send().await?;
+        if !res.status().is_success() {
+            return Err(surf::Error::from_str(res.status(), "Failed to remove reaction").into());
+        }
+        Ok(())
+    }
+
     // Docs: https://discord.com/developers/docs/resources/message#create-message
     async fn send_message(
         &self,
         location: &Identifier<Place<Room>>,
         contents: Message,
-    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+    ) -> Result<Identifier<Message>, Box<dyn Error + Sync + Send>> {
         let channel_id = {
             let map = self.channel_id_mappings.read().await;
             map.get(location.id())
@@ -360,7 +468,7 @@ impl Text for InnerDiscord<Owned> {
         };
         let msg_string = facet_json::to_vec(&message)?;
 
-        let _msg = http_request::<api_types::Message>(
+        let msg = http_request::<api_types::Message>(
             surf::post(format!("{DISCORD_API}/channels/{}/messages", channel_id.id,))
                 .body(msg_string)
                 .content_type("application/json"),
@@ -368,7 +476,30 @@ impl Text for InnerDiscord<Owned> {
         )
         .await?;
 
-        Ok(())
+        let icon = match &msg.author.avatar {
+            Some(hash) => {
+                cache_cdn_image("avatars", CacheCategory::Users, msg.author.id, hash)
+                    .await
+                    .ok()
+            }
+            None => None,
+        };
+        let author = Identifier::new(
+            msg.author.id,
+            User {
+                name: msg.author.username,
+                icon,
+            },
+        );
+
+        Ok(Identifier::new(
+            msg.id,
+            Message {
+                text: msg.content,
+                reactions: Vec::new(),
+                author: Some(author),
+            },
+        ))
     }
     async fn listen(
         self: Arc<Self>,

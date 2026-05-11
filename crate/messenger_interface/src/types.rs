@@ -95,10 +95,12 @@ pub struct User {
 /// Represents a reaction (emoji) on a message.
 #[derive(Debug, Clone)]
 pub struct Reaction {
-    /// The emoji character used for this reaction.
-    pub emoji: char,
+    /// The emoji — a Unicode character or custom emoji name.
+    pub emoji: String,
     /// Number of users who added this reaction.
     pub count: u32,
+    /// Whether the current (client) user has reacted with this emoji.
+    pub reacted: bool,
 }
 
 /// Represents a message in a chat room/channel.
