@@ -48,9 +48,8 @@ impl InnerDiscord<Owned> {
         let places = join_all(rooms_producer).await;
 
         // Cache mapping internal room id -> discord channel id
-        let mut channel_data = self.channel_id_mappings.write().await;
         for (identifier, channel) in places.iter().zip(channels.iter()) {
-            channel_data.insert(
+            self.channel_id_mappings.insert(
                 *identifier.id(),
                 super::ChannelID {
                     guild_id: channel.guild_id,
@@ -100,9 +99,8 @@ impl InnerDiscord<Owned> {
 
         let places = join_all(house_producer).await;
 
-        let mut guild_map = self.guild_id_mappings.write().await;
         for (identifier, guild) in places.iter().zip(guilds) {
-            guild_map.insert(*identifier.id(), guild.id);
+            self.guild_id_mappings.insert(*identifier.id(), guild.id);
         }
 
         Ok(places)
@@ -154,7 +152,6 @@ impl InnerDiscord<Owned> {
             }
         });
 
-        let mut channel_data = self.channel_id_mappings.write().await;
         Ok(channels
             .into_iter()
             .filter_map(|channel| {
@@ -187,7 +184,7 @@ impl InnerDiscord<Owned> {
                         ),
                     ),
                 );
-                channel_data.insert(
+                self.channel_id_mappings.insert(
                     *identifier.id(),
                     crate::ChannelID {
                         guild_id: channel.guild_id,
@@ -224,8 +221,7 @@ impl Query for InnerDiscord<Owned> {
             },
         );
 
-        let mut profile_cache = self.profile.write().await;
-        *profile_cache = Some(profile);
+        self.profile.store(Some(Arc::new(profile)));
 
         Ok(prof)
     }
@@ -275,15 +271,11 @@ impl Query for InnerDiscord<Owned> {
         &self,
         house: Identifier<Place<House>>,
     ) -> Result<House, Box<dyn Error + Sync + Send>> {
-        let rooms = {
-            let mapping = self.guild_id_mappings.read().await;
-            let guild_id = mapping
-                .get(house.id())
-                .ok_or("No discord guild id mapping for this house")?;
-            self.fetch_guild_channels(*guild_id)
-                .await
-                .unwrap_or_default()
-        };
+        let guild_id = *self
+            .guild_id_mappings
+            .get(house.id())
+            .ok_or("No discord guild id mapping for this house")?;
+        let rooms = self.fetch_guild_channels(guild_id).await.unwrap_or_default();
         Ok(House::new(Some(rooms)))
     }
     async fn listen(
@@ -300,17 +292,16 @@ impl Text for InnerDiscord<Owned> {
         location: &Identifier<Place<Room>>,
         load_messages_before: Option<Identifier<Message>>,
     ) -> Result<Vec<Identifier<Message>>, Box<dyn Error + Sync + Send>> {
-        let channel_id = {
-            let map = self.channel_id_mappings.read().await;
-            map.get(location.id())
-                .ok_or("No discord channel id mapping for this room")?
-                .clone()
-        };
+        let channel_id = self
+            .channel_id_mappings
+            .get(location.id())
+            .ok_or("No discord channel id mapping for this room")?
+            .clone();
 
         let before = match load_messages_before {
             Some(msg) => {
-                let map = self.msg_data.read().await;
-                let msg_id = *map
+                let msg_id = *self
+                    .message_id_mappings
                     .get(msg.id())
                     .ok_or("No discord message id mapping for before-pagination")?;
                 format!("?before={msg_id}")
@@ -368,11 +359,11 @@ impl Text for InnerDiscord<Owned> {
         }))
         .await;
 
-        let mut msg_data = self.msg_data.write().await;
         Ok(identifiers
             .into_iter()
             .map(|(identifier, discord_msg_id)| {
-                msg_data.insert(*identifier.id(), discord_msg_id);
+                self.message_id_mappings
+                    .insert(*identifier.id(), discord_msg_id);
                 identifier
             })
             .collect())
@@ -385,17 +376,15 @@ impl Text for InnerDiscord<Owned> {
         message: &Identifier<Message>,
         emoji: &str,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let channel_id = {
-            let map = self.channel_id_mappings.read().await;
-            map.get(location.id())
-                .ok_or("No discord channel id mapping for this room")?
-                .clone()
-        };
-        let msg_id = {
-            let map = self.msg_data.read().await;
-            *map.get(message.id())
-                .ok_or("No discord message id mapping")?
-        };
+        let channel_id = self
+            .channel_id_mappings
+            .get(location.id())
+            .ok_or("No discord channel id mapping for this room")?
+            .clone();
+        let msg_id = *self
+            .message_id_mappings
+            .get(message.id())
+            .ok_or("No discord message id mapping")?;
         let encoded_emoji = utf8_percent_encode(emoji, NON_ALPHANUMERIC);
         let url = format!(
             "{DISCORD_API}/channels/{}/messages/{msg_id}/reactions/{encoded_emoji}/@me",
@@ -419,17 +408,15 @@ impl Text for InnerDiscord<Owned> {
         message: &Identifier<Message>,
         emoji: &str,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let channel_id = {
-            let map = self.channel_id_mappings.read().await;
-            map.get(location.id())
-                .ok_or("No discord channel id mapping for this room")?
-                .clone()
-        };
-        let msg_id = {
-            let map = self.msg_data.read().await;
-            *map.get(message.id())
-                .ok_or("No discord message id mapping")?
-        };
+        let channel_id = self
+            .channel_id_mappings
+            .get(location.id())
+            .ok_or("No discord channel id mapping for this room")?
+            .clone();
+        let msg_id = *self
+            .message_id_mappings
+            .get(message.id())
+            .ok_or("No discord message id mapping")?;
         let encoded_emoji = utf8_percent_encode(emoji, NON_ALPHANUMERIC);
         let url = format!(
             "{DISCORD_API}/channels/{}/messages/{msg_id}/reactions/{encoded_emoji}/@me",
@@ -452,12 +439,11 @@ impl Text for InnerDiscord<Owned> {
         location: &Identifier<Place<Room>>,
         contents: Message,
     ) -> Result<Identifier<Message>, Box<dyn Error + Sync + Send>> {
-        let channel_id = {
-            let map = self.channel_id_mappings.read().await;
-            map.get(location.id())
-                .ok_or("No discord channel id mapping for this room")?
-                .clone()
-        };
+        let channel_id = self
+            .channel_id_mappings
+            .get(location.id())
+            .ok_or("No discord channel id mapping for this room")?
+            .clone();
 
         let message = api_types::CreateMessage {
             content: Some(contents.text),
@@ -477,11 +463,9 @@ impl Text for InnerDiscord<Owned> {
         .await?;
 
         let icon = match &msg.author.avatar {
-            Some(hash) => {
-                cache_cdn_image("avatars", CacheCategory::Users, msg.author.id, hash)
-                    .await
-                    .ok()
-            }
+            Some(hash) => cache_cdn_image("avatars", CacheCategory::Users, msg.author.id, hash)
+                .await
+                .ok(),
             None => None,
         };
         let author = Identifier::new(

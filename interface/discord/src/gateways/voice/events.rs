@@ -6,7 +6,7 @@ use std::{
 
 use dashmap::DashMap;
 use davey::DaveSession;
-use messenger_interface::interface::{CallStatus, VoiceEvent};
+use messenger_interface::interface::VoiceEvent;
 use smol::net::UdpSocket;
 use surf::http::convert::json;
 use tracing::{debug, error, warn};
@@ -98,7 +98,7 @@ impl GatewayPayload<VoiceOpcode> {
 
                 // Init DAVE
                 let mut dave_session = voice_gateway.dave_session.lock().await;
-                let profile = discord.profile.read().await;
+                let profile = discord.profile.load();
                 let profile = profile.as_ref().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "user profile not loaded")
                 })?;
@@ -130,7 +130,7 @@ impl GatewayPayload<VoiceOpcode> {
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
                 discord
                     .voice_events
-                    .push(VoiceEvent::CallStatusUpdate(CallStatus::Connected(stream)));
+                    .push(VoiceEvent::CallStreamReady(stream));
             }
             VoiceOpcode::Speaking => {
                 let speaking = facet_value::from_value::<SpeakingPayload>(self.d)?;
@@ -255,7 +255,7 @@ impl GatewayPayload<VoiceOpcode> {
                     let mut dave_session = voice_gateway.dave_session.lock().await;
                     // TODO: Investigate if this should be properly added
                     // this.daveProtocolVersion = packet.protocol_version;
-                    let profile = discord.profile.read().await;
+                    let profile = discord.profile.load();
                     let profile = profile.as_ref().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::NotFound, "user profile not loaded")
                     })?;

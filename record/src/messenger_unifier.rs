@@ -3,7 +3,7 @@
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use messenger_interface::{
-    interface::Messenger,
+    interface::{CallState, Messenger},
     types::{House, ID, Identifier, Message, Place, Room, User},
 };
 
@@ -11,13 +11,19 @@ use messenger_interface::{
 pub struct Call {
     messenger_handle: MessengerHandle,
     source: Identifier<Place<Room>>,
+    state: CallState,
 }
 
 impl Call {
-    pub fn new(messenger_handle: MessengerHandle, source: Identifier<Place<Room>>) -> Self {
+    pub fn new(
+        messenger_handle: MessengerHandle,
+        source: Identifier<Place<Room>>,
+        state: CallState,
+    ) -> Self {
         Self {
             messenger_handle,
             source,
+            state,
         }
     }
     pub fn handle(&self) -> MessengerHandle {
@@ -29,8 +35,11 @@ impl Call {
     pub fn id(&self) -> ID {
         *self.source.id()
     }
-    pub fn status_str(&self) -> &str {
-        "Sample"
+    pub fn state_str(&self) -> &str {
+        self.state.as_str()
+    }
+    pub fn set_state(&mut self, state: CallState) {
+        self.state = state;
     }
 }
 #[derive(Debug)]

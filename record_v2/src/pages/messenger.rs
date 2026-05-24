@@ -7,7 +7,7 @@ use crate::{
 
 use self::{
     chat::{Action as ChatAction, Chat, UpdateResult as ChatUpdateResult},
-    contacts::{Contacts, Message as ContactsAction},
+    contacts::{Action as ContactsAction, Contacts},
     navbar::{Action as NavbarAction, Navbar},
     sidebar::{Action as SidebarAction, Server, Sidebar},
 };
@@ -130,7 +130,9 @@ impl Messenger {
             Message::UpdateChat { id, kv } => Action::ModifyMessengerData {
                 id,
                 modify: Box::new(move |data| {
-                    data.chats.insert(kv.0, kv.1);
+                    if let Some(room) = data.room_mut(kv.0) {
+                        room.messages = Some(kv.1);
+                    }
                 }),
             },
             Message::GuildRoomsLoaded {
@@ -161,7 +163,9 @@ impl Messenger {
                             pending_id,
                             room_id,
                         });
-                        data.chats.entry(room_id).or_default().push(message);
+                        if let Some(room) = data.room_mut(room_id) {
+                            room.messages.get_or_insert_with(Vec::new).push(message);
+                        }
                     }),
                 }
             }
@@ -175,7 +179,8 @@ impl Messenger {
                 modify: Box::new(move |data| {
                     data.pending_sends.retain(|p| p.pending_id != pending_id);
 
-                    if let Some(msgs) = data.chats.get_mut(&room_id)
+                    if let Some(room) = data.room_mut(room_id)
+                        && let Some(msgs) = room.messages.as_mut()
                         && let Some(pending) = msgs.iter_mut().find(|m| *m.id() == pending_id)
                     {
                         // Pending message still exists — replace in-place with confirmed
@@ -192,7 +197,9 @@ impl Messenger {
                 id,
                 modify: Box::new(move |data| {
                     data.pending_sends.retain(|p| p.pending_id != pending_id);
-                    if let Some(msgs) = data.chats.get_mut(&room_id) {
+                    if let Some(room) = data.room_mut(room_id)
+                        && let Some(msgs) = room.messages.as_mut()
+                    {
                         msgs.retain(|m| *m.id() != pending_id);
                     }
                 }),
@@ -403,7 +410,9 @@ impl Messenger {
 
                     // Check cache
                     if let Some(data) = messengers.data(id)
-                        && data.chats.contains_key(conversation.id())
+                        && data
+                            .room(*conversation.id())
+                            .is_some_and(|room| room.messages.is_some())
                     {
                         return Action::Run(Task::done(Message::ChangeMain(Main::Chat(
                             Chat::new(interface.clone(), conversation),

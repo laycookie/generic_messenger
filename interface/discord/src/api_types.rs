@@ -1,5 +1,5 @@
 use facet::Facet;
-use messenger_interface::types::{CacheCategory, Place, Room, RoomCapabilities};
+use messenger_interface::types::{CacheCategory, Identifier, Place, Room, RoomCapabilities};
 use tracing::error;
 
 use crate::downloaders::cache_cdn_image;
@@ -139,6 +139,38 @@ impl Channel {
         });
 
         let mut icon = None;
+        let mut participants = Vec::new();
+
+        if let Some(recipients) = self.recipients.as_ref() {
+            for recipient in recipients {
+                let recipient_icon = match &recipient.avatar {
+                    Some(hash) => {
+                        match cache_cdn_image("avatars", CacheCategory::Users, recipient.id, hash)
+                            .await
+                        {
+                            Ok(path) => Some(path),
+                            Err(e) => {
+                                error!("Failed to download icon for channel: {}\n{}", name, e);
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+
+                if icon.is_none() {
+                    icon = recipient_icon.clone();
+                }
+
+                participants.push(Identifier::new(
+                    recipient.id,
+                    messenger_interface::types::User {
+                        name: recipient.username.clone(),
+                        icon: recipient_icon,
+                    },
+                ));
+            }
+        }
 
         // If channel has icon, use that
         if let Some(hash) = &self.icon {
@@ -148,27 +180,12 @@ impl Channel {
                     error!("Failed to download icon for channel: {}\n{}", name, e);
                 }
             };
-        } else if let Some(recipients) = self.recipients.as_ref() {
-            // If any recipient has an avatar, use that as room icon
-            for recipient in recipients {
-                if let Some(hash) = &recipient.avatar {
-                    match cache_cdn_image("avatars", CacheCategory::Users, recipient.id, hash).await {
-                        Ok(path) => {
-                            icon = Some(path);
-                            break;
-                        }
-                        Err(e) => {
-                            error!("Failed to download icon for channel: {}\n{}", name, e);
-                        }
-                    };
-                }
-            }
         }
 
         let room = Room::new(
             // NOTE: DMs can have voice calls; treat as both for now.
             RoomCapabilities::from(self.channel_type),
-            Some(Vec::new()),
+            Some(participants),
             None,
         );
 

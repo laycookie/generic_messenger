@@ -1,16 +1,10 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    task::Poll,
-};
+use std::sync::Arc;
 
 use cpal::{ChannelCount, traits::HostTrait};
 pub use cpal::{SampleFormat, SampleRate};
-use futures::task::AtomicWaker;
 use ringbuf::{StaticRb, wrap::caching::Caching};
 
+pub use asyncs_sync::Notify;
 pub use ringbuf::traits::{Consumer, Producer};
 
 use crate::{
@@ -58,55 +52,6 @@ impl<C: ChannelType> Channel<C> {
             effects: Vec::new(),
             interface: C::new(),
         }
-    }
-}
-
-#[derive(Default)]
-struct InnerNotify {
-    waker: AtomicWaker,
-    notified: AtomicBool,
-}
-
-pub struct Notified<'a>(&'a InnerNotify);
-impl Future for Notified<'_> {
-    type Output = ();
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        // Fast path: check first
-        if self.0.notified.swap(false, Ordering::Acquire) {
-            return Poll::Ready(());
-        }
-
-        // Register the waker
-        self.0.waker.register(cx.waker());
-
-        // Check AGAIN to avoid race condition:
-        if self.0.notified.swap(false, Ordering::Acquire) {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct Notify(Arc<InnerNotify>);
-impl Notify {
-    fn new() -> Self {
-        Self(Arc::new(InnerNotify {
-            waker: AtomicWaker::new(),
-            notified: AtomicBool::new(false),
-        }))
-    }
-    pub fn notified(&self) -> Notified<'_> {
-        Notified(&self.0)
-    }
-    fn notify(&self) {
-        self.0.notified.store(true, Ordering::Release);
-        self.0.waker.wake();
     }
 }
 

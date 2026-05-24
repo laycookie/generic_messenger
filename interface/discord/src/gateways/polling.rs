@@ -135,7 +135,7 @@ impl<T: UnitStruct> InnerDiscord<T> {
                         pin!(received_audio_fut),
                         stop_speaking_delay
                             .take()
-                            .unwrap_or_else(|| future::pending().boxed()),
+                            .unwrap_or_else(|| future::Either::Right(future::pending())),
                     )
                     .await
                     {
@@ -156,7 +156,8 @@ impl<T: UnitStruct> InnerDiscord<T> {
                         Either::Left((_, _)) => {}
                     };
 
-                    *stop_speaking_delay = Some(Box::pin(Delay::new(Duration::from_secs(2))));
+                    *stop_speaking_delay =
+                        Some(future::Either::Left(Delay::new(Duration::from_secs(2))));
                     if !voice_gateway.is_speaking.load(Ordering::Relaxed) {
                         debug!("Send speaking packet");
                         let speaking_payload = speaking_payload(audio_sender.ssrc(), true);
@@ -268,20 +269,17 @@ impl VoiceTrait for InnerDiscord<Owned> {
             );
         };
 
-        let channel = {
-            let map = self.channel_id_mappings.read().await;
-            match map.get(location.id()) {
-                Some(c) => c.clone(),
-                None => {
-                    // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
-                    // and support guild voice channels too.
-                    warn!("Tried to connect voice for a Room without a discord channel mapping");
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "no channel mapping for this room",
-                    )
-                    .into());
-                }
+        let channel = match self.channel_id_mappings.get(location.id()) {
+            Some(c) => c.clone(),
+            None => {
+                // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
+                // and support guild voice channels too.
+                warn!("Tried to connect voice for a Room without a discord channel mapping");
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no channel mapping for this room",
+                )
+                .into());
             }
         };
 
@@ -312,16 +310,13 @@ impl VoiceTrait for InnerDiscord<Owned> {
         };
         gateway.voice.disconnect().await;
 
-        let channel = {
-            let map = self.channel_id_mappings.read().await;
-            match map.get(location.id()) {
-                Some(c) => c.clone(),
-                None => {
-                    // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
-                    // and support guild voice channels too.
-                    warn!("Tried to disconnect voice for a Room without a discord channel mapping");
-                    return;
-                }
+        let channel = match self.channel_id_mappings.get(location.id()) {
+            Some(c) => c.clone(),
+            None => {
+                // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
+                // and support guild voice channels too.
+                warn!("Tried to disconnect voice for a Room without a discord channel mapping");
+                return;
             }
         };
 

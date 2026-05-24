@@ -4,6 +4,7 @@ use auth::MessengersGenerator;
 use font_kit::{family_name::FamilyName, source::SystemSource};
 use futures::{StreamExt, future::join_all, join};
 use iced::{Element, Subscription, Task, window};
+use messenger_interface::interface::{CallState, CallStatus};
 use pages::{AppMessage, StreamDirection, login, messenger};
 use simple_audio_channels::AudioMixer;
 use state::MessengerRegistry;
@@ -216,7 +217,9 @@ impl App {
             AppMessage::TextEvent((id, event)) => {
                 events::process_text_event(id, event, &mut self.messengers)
             }
-            AppMessage::VoiceEvent((id, event)) => events::process_voice_event(id, event),
+            AppMessage::VoiceEvent((id, event)) => {
+                events::process_voice_event(id, event, &mut self.messengers)
+            }
             AppMessage::AudioEvent((id, event)) => {
                 events::process_audio_event(id, event, &mut self.audio)
             }
@@ -275,12 +278,21 @@ impl App {
                             }
                         };
                         let room_id = channel.swap_data((*channel).clone());
-                        if let Err(err) = vc.connect(&room_id).await {
-                            error!("{err}");
-                        }
+                        let status = match vc.connect(&room_id).await {
+                            Ok(status) => status,
+                            Err(err) => {
+                                // TODO: Remove UI after a little while maybe?
+                                error!("{err}");
+                                CallStatus::Failed
+                            }
+                        };
 
                         Task::done(AppMessage::modify_data(messenger_id, move |data| {
-                            data.calls.push(state::Call::new(messenger_id, channel));
+                            data.calls.push(state::Call::new(
+                                messenger_id,
+                                channel,
+                                CallState::Pending(status),
+                            ));
                         }))
                     })
                     .then(|task| task)

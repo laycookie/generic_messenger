@@ -1,4 +1,4 @@
-use std::{error::Error, fmt::Debug, io};
+use std::{error::Error, fmt::Debug, io, sync::Arc};
 
 use cpal::{
     ChannelCount, SampleFormat, SampleRate,
@@ -8,7 +8,7 @@ use ringbuf::{
     CachingCons, CachingProd, StaticRb,
     traits::{Consumer as _, Observer as _, Producer, Split},
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::{
     AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, Channel, ChannelType, Notify, SampleConsum,
@@ -77,7 +77,7 @@ impl AudioMixer {
         Ok(producer)
     }
 
-    pub fn start_stream_output(&mut self) -> Result<Option<Notify>, Box<dyn Error>> {
+    pub fn start_stream_output(&mut self) -> Result<Option<Arc<Notify>>, Box<dyn Error>> {
         let Some(output) = &mut self.output else {
             return Ok(None);
         };
@@ -96,7 +96,7 @@ impl AudioMixer {
             .collect::<Vec<SampleConsum<CHANNEL_BUFFER_SIZE>>>();
 
         let (prod, mut cons) = StaticRb::default().split();
-        let stream_close_notification = Notify::new();
+        let stream_close_notification = Arc::new(Notify::new());
         let send_stream_close_notification = stream_close_notification.clone();
         let stream = output.device.build_output_stream(
             &stream_config,
@@ -110,7 +110,7 @@ impl AudioMixer {
                 }
                 sample_consumers.retain(|consumer| consumer.write_is_held());
                 if sample_consumers.is_empty() {
-                    send_stream_close_notification.notify();
+                    send_stream_close_notification.notify_one();
                 }
                 // Mix audio from all channels
                 for stream_sample in data.iter_mut() {

@@ -21,9 +21,14 @@ pub fn cdn_image_url(kind: &str, id: SNOWFLAKE, hash: &str) -> String {
 
 /// Build the local cache directory for a Discord image.
 pub fn cache_img_dir(category: CacheCategory, id: SNOWFLAKE) -> PathBuf {
-    [CACHE_IMGS_DIR, category.as_str(), DISCORD_CACHE, &id.to_string()]
-        .iter()
-        .collect()
+    [
+        CACHE_IMGS_DIR,
+        category.as_str(),
+        DISCORD_CACHE,
+        &id.to_string(),
+    ]
+    .iter()
+    .collect()
 }
 
 /// Download and cache a Discord CDN image, returning the local path.

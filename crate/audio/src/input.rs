@@ -1,4 +1,4 @@
-use std::{error::Error, fmt::Debug, io};
+use std::{error::Error, fmt::Debug, io, sync::Arc};
 
 use cpal::{
     ChannelCount, SampleFormat, SampleRate,
@@ -16,7 +16,7 @@ use crate::{
 };
 
 pub enum InputRxEvent {
-    AddInputChannel(SampleProd<CHANNEL_BUFFER_SIZE>, Notify),
+    AddInputChannel(SampleProd<CHANNEL_BUFFER_SIZE>, Arc<Notify>),
 }
 impl Debug for InputRxEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -28,7 +28,7 @@ impl Debug for InputRxEvent {
 
 const NOISE_FLOOR: AudioSampleType = 0.002;
 
-pub struct SampleConsumer(SampleConsum<CHANNEL_BUFFER_SIZE>, Notify);
+pub struct SampleConsumer(SampleConsum<CHANNEL_BUFFER_SIZE>, Arc<Notify>);
 impl SampleConsumer {
     pub async fn pop_iter(
         &mut self,
@@ -41,10 +41,10 @@ impl SampleConsumer {
     }
 }
 
-pub(super) struct Input(SampleRb<CHANNEL_BUFFER_SIZE>, Notify);
+pub(super) struct Input(SampleRb<CHANNEL_BUFFER_SIZE>, Arc<Notify>);
 impl ChannelType for Input {
     fn new() -> Self {
-        Self(SampleRb::default(), Notify::default())
+        Self(SampleRb::default(), Arc::new(Notify::new()))
     }
 }
 
@@ -69,14 +69,19 @@ impl AudioMixer {
                     sample_producer,
                     notify.clone(),
                 ))
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("failed to push input channel event: {err:?}")))?;
+                .map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("failed to push input channel event: {err:?}"),
+                    )
+                })?;
         }
         self.input_channels.push(channel);
 
         Ok(consumer)
     }
 
-    pub fn start_stream_input(&mut self) -> Result<Option<Notify>, Box<dyn Error>> {
+    pub fn start_stream_input(&mut self) -> Result<Option<Arc<Notify>>, Box<dyn Error>> {
         let Some(input) = &mut self.input else {
             return Ok(None);
         };
@@ -87,7 +92,7 @@ impl AudioMixer {
         stream_config.sample_rate = 48_000; // TODO: Determine by device preference in future
 
         let (event_prod, mut event_cons) = StaticRb::default().split();
-        let stream_close_notification = Notify::new();
+        let stream_close_notification = Arc::new(Notify::new());
         let send_stream_close_notification = stream_close_notification.clone();
 
         let mut sample_producers = self
@@ -98,50 +103,48 @@ impl AudioMixer {
                 (CachingProd::new(rb.clone()), notify.clone())
             })
             .collect::<Vec<_>>();
-        let stream = input
-            .device
-            .build_input_stream(
-                &stream_config,
-                move |data: &[AudioSampleType], &_| {
-                    for event in event_cons.pop_iter() {
-                        match event {
-                            InputRxEvent::AddInputChannel(prod, notify) => {
-                                sample_producers.push((prod, notify));
-                            }
-                        };
-                    }
-
-                    sample_producers.retain(|producers| producers.0.read_is_held());
-                    if sample_producers.is_empty() {
-                        debug!("Closing input audio stream");
-                        send_stream_close_notification.notify();
-                        return;
-                    }
-
-                    for sample_producer in sample_producers.iter_mut() {
-                        // TODO: Noise floor should be filtered out by afx with a gate
-                        // Compute the RMS (root mean square) of the frame to assess volume.
-                        let frame_rms = {
-                            let len = data.len() as f32;
-                            if len == 0.0 {
-                                0.0
-                            } else {
-                                let sum: f32 = data.iter().map(|sample| sample * sample).sum();
-                                (sum / len).sqrt()
-                            }
-                        };
-
-                        if frame_rms > NOISE_FLOOR {
-                            sample_producer.0.push_iter(data.iter().copied());
-                            sample_producer.1.notify();
+        let stream = input.device.build_input_stream(
+            &stream_config,
+            move |data: &[AudioSampleType], &_| {
+                for event in event_cons.pop_iter() {
+                    match event {
+                        InputRxEvent::AddInputChannel(prod, notify) => {
+                            sample_producers.push((prod, notify));
                         }
+                    };
+                }
+
+                sample_producers.retain(|producers| producers.0.read_is_held());
+                if sample_producers.is_empty() {
+                    debug!("Closing input audio stream");
+                    send_stream_close_notification.notify_one();
+                    return;
+                }
+
+                for sample_producer in sample_producers.iter_mut() {
+                    // TODO: Noise floor should be filtered out by afx with a gate
+                    // Compute the RMS (root mean square) of the frame to assess volume.
+                    let frame_rms = {
+                        let len = data.len() as f32;
+                        if len == 0.0 {
+                            0.0
+                        } else {
+                            let sum: f32 = data.iter().map(|sample| sample * sample).sum();
+                            (sum / len).sqrt()
+                        }
+                    };
+
+                    if frame_rms > NOISE_FLOOR {
+                        sample_producer.0.push_iter(data.iter().copied());
+                        sample_producer.1.notify_one();
                     }
-                },
-                move |err| {
-                    error!("Audio stream error: {err:?}");
-                },
-                None,
-            )?;
+                }
+            },
+            move |err| {
+                error!("Audio stream error: {err:?}");
+            },
+            None,
+        )?;
 
         stream.play()?;
         input.stream = Some(crate::InputStream {

@@ -52,7 +52,13 @@ impl MessengersGenerator {
         file.set_len(0).unwrap();
 
         for (_, entry) in registry.iter() {
-            writeln!(file, "{}:{}", entry.interface.name(), entry.interface.auth()).unwrap();
+            writeln!(
+                file,
+                "{}:{}",
+                entry.interface.name(),
+                entry.interface.auth()
+            )
+            .unwrap();
         }
     }
 }

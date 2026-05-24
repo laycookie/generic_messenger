@@ -1,7 +1,8 @@
 use iced::{
-    Color, Element, Length, Padding,
+    Color, ContentFit, Element, Length, Padding,
     widget::{
-        Button, Column, Scrollable, Text, button, column, container, image, row, text::Wrapping,
+        Button, Column, Row, Scrollable, Text, button, column, container, image, row,
+        text::Wrapping,
     },
 };
 use iced_palace::widget::ellipsized_text;
@@ -49,103 +50,163 @@ impl Sidebar {
         }
     }
 
-    pub fn view<'a>(&'a self, messengers: &'a MessengerRegistry) -> Element<'a, Action> {
-        let elements = match &self.server_selected {
-            Some(server) => {
-                let channels = messengers
-                    .data(server.messenger_id)
-                    .and_then(|d| d.guilds.iter().find(|g| *g.id() == server.guild_id))
-                    .and_then(|g| g.rooms.as_deref())
-                    .unwrap_or(&[]);
+    fn view_server_panel<'a>(
+        server: Server,
+        messengers: &'a MessengerRegistry,
+    ) -> Column<'a, Action> {
+        let guild = messengers
+            .data(server.messenger_id)
+            .and_then(|d| d.guilds.iter().find(|g| *g.id() == server.guild_id));
 
-                Column::from_iter(channels.iter().map(|chan| {
-                    if chan.room_capabilities.is_empty() {
-                        return container(Text::new(chan.name.as_str()))
-                            .padding(Padding::new(0.0).left(8.0).top(6.0).bottom(2.0))
-                            .into();
-                    }
+        let server_name = guild.map(|g| g.name.as_str()).unwrap_or("");
+        let channels = guild.and_then(|g| g.rooms.as_deref()).unwrap_or(&[]);
 
-                    if chan.room_capabilities.contains(RoomCapabilities::Voice)
-                        && !chan.room_capabilities.contains(RoomCapabilities::Text)
-                    {
-                        return Button::new(chan.name.as_str())
-                            .on_press(Action::Call(chan.clone()))
-                            .style(|_, _| button::Style {
-                                background: Some(iced::Background::Color(Color::from_rgb(
-                                    0.0, 1.0, 0.2,
-                                ))),
-                                ..Default::default()
-                            })
-                            .into();
-                    }
-                    Button::new(chan.name.as_str())
-                        .on_press(Action::OpenChat {
-                            id: server.messenger_id,
-                            conversation: chan.to_owned(),
-                        })
-                        .width(Length::Fill)
-                        .into()
-                }))
+        let header = container(Text::new(server_name).size(18))
+            .padding(Padding::new(0.0).left(8.0).top(6.0).bottom(6.0));
+
+        let rooms_list = Column::from_iter(channels.iter().map(move |chan| {
+            if chan.room_capabilities.is_empty() {
+                return container(Text::new(chan.name.as_str()))
+                    .padding(Padding::new(0.0).left(8.0).top(6.0).bottom(2.0))
+                    .into();
             }
-            None => Column::from_iter(
-                messengers
-                    .iter()
-                    .flat_map(|(_, entry)| {
-                        let id = entry.interface.id;
-                        entry.data.conversations.iter().map(move |conversation| {
-                            Button::new({
-                                let image = match &conversation.icon {
-                                    Some(icon) => image(icon),
-                                    None => image(PLACEHOLDER_PFP),
-                                };
+
+            if chan.room_capabilities.contains(RoomCapabilities::Voice)
+                && !chan.room_capabilities.contains(RoomCapabilities::Text)
+            {
+                let channel_button = Button::new(chan.name.as_str())
+                    .on_press(Action::Call(chan.clone()))
+                    .width(Length::Fill)
+                    .style(|_, _| button::Style {
+                        background: Some(iced::Background::Color(Color::from_rgb(0.0, 1.0, 0.2))),
+                        ..Default::default()
+                    });
+
+                let participants =
+                    Column::from_iter(chan.participants.as_deref().unwrap_or(&[]).iter().map(
+                        |participant| {
+                            let avatar = match participant.icon.as_ref() {
+                                Some(icon) => image(icon),
+                                None => image(PLACEHOLDER_PFP),
+                            };
+
+                            Element::from(
                                 row![
-                                    container(image.height(Length::Fixed(28.0)))
-                                        .padding(Padding::new(0.0).right(10.0)),
-                                    ellipsized_text(conversation.name.as_str())
-                                        .wrapping(Wrapping::None)
+                                    container(
+                                        avatar
+                                            .height(Length::Fixed(18.0))
+                                            .width(Length::Fixed(18.0))
+                                            .content_fit(ContentFit::Cover),
+                                    )
+                                    .padding(Padding::new(0.0).right(6.0).left(18.0)),
+                                    ellipsized_text(participant.name.as_str())
+                                        .wrapping(Wrapping::None),
                                 ]
-                            })
-                            .width(Length::Fill)
-                            .on_press(Action::OpenChat {
-                                id,
-                                conversation: conversation.to_owned(),
-                            })
-                            .into()
-                        })
-                    }),
-            ),
+                                .width(Length::Fill),
+                            )
+                        },
+                    ));
+
+                return column![channel_button, participants].into();
+            }
+            Button::new(chan.name.as_str())
+                .on_press(Action::OpenChat {
+                    id: server.messenger_id,
+                    conversation: chan.to_owned(),
+                })
+                .width(Length::Fill)
+                .into()
+        }));
+
+        column![header, rooms_list]
+    }
+
+    fn view_dm_panel<'a>(messengers: &'a MessengerRegistry) -> Column<'a, Action> {
+        column![Button::new("Contacts").on_press(Action::OpenContacts)].extend(
+            messengers.iter().flat_map(|(_, entry)| {
+                let id = entry.interface.id;
+                entry.data.conversations.iter().map(move |conversation| {
+                    Button::new({
+                        let image = match &conversation.icon {
+                            Some(icon) => image(icon),
+                            None => image(PLACEHOLDER_PFP),
+                        };
+                        row![
+                            container(image.height(Length::Fixed(28.0)))
+                                .padding(Padding::new(0.0).right(10.0)),
+                            ellipsized_text(conversation.name.as_str()).wrapping(Wrapping::None)
+                        ]
+                    })
+                    .width(Length::Fill)
+                    .on_press(Action::OpenChat {
+                        id,
+                        conversation: conversation.to_owned(),
+                    })
+                    .into()
+                })
+            }),
+        )
+    }
+
+    pub fn view<'a>(&'a self, messengers: &'a MessengerRegistry) -> Element<'a, Action> {
+        let room_list = match &self.server_selected {
+            Some(server) => Self::view_server_panel(*server, messengers),
+            None => Self::view_dm_panel(messengers),
         };
 
-        let mut active_calls = messengers
-            .iter()
-            .flat_map(|(_, entry)| &entry.data.calls)
-            .peekable();
+        // === New ===
+        let active_calls_panel = Element::from(Column::from_iter(messengers.iter().map(
+            |(_, messenger)| {
+                let active_call_panel = messenger.data.calls.iter().map(|call| {
+                    let client_user_id =
+                        messenger.data.profile.as_ref().map(|profile| profile.id());
 
-        let panel = if active_calls.peek().is_some() {
-            let active_calls = Column::from_iter(active_calls.map(|call| {
-                Element::from(row![
-                    Text::from(call.status_str()),
-                    Button::new("D").on_press(Action::Disconnect(call.clone()))
-                ])
-            }));
-            Some(column![
-                active_calls,
-                Button::new("Mute"),
-                Button::new("Deafen"),
-            ])
-        } else {
-            None
-        };
+                    // Excluding client
+                    let call_participents = call
+                        .source()
+                        .participants
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter(|participant| {
+                            client_user_id
+                                .is_none_or(|client_user_id| client_user_id != participant.id())
+                        });
 
-        column![
-            Scrollable::new(column![
-                Button::new("Contacts").on_press(Action::OpenContacts),
-                elements,
-            ])
-            .height(Length::Fill),
-        ]
-        .push(panel)
-        .width(self.width)
-        .into()
+                    let call_status =
+                        Element::from(Text::from(call.state_str()).width(Length::Fill));
+                    let disconnect_button =
+                        Element::from(Button::new("D").on_press(Action::Disconnect(call.clone())));
+                    let call_participents_icons =
+                        Element::from(Row::from_iter(call_participents.map(|participant| {
+                            let pfp_image = match participant.icon.as_ref() {
+                                Some(icon) => image(icon),
+                                None => image(PLACEHOLDER_PFP),
+                            };
+                            Element::from(
+                                container(
+                                    pfp_image
+                                        .height(Length::Fixed(24.0))
+                                        .width(Length::Fixed(24.0))
+                                        .content_fit(ContentFit::Cover),
+                                )
+                                .padding(Padding::new(0.0).right(4.0)),
+                            )
+                        })));
+
+                    Element::from(column![
+                        row![call_status, disconnect_button],
+                        call_participents_icons,
+                    ])
+                });
+
+                Element::from(Column::from_iter(active_call_panel))
+            },
+        )));
+
+        column![Scrollable::new(room_list).height(Length::Fill)]
+            .push(active_calls_panel)
+            .width(self.width)
+            .into()
     }
 }

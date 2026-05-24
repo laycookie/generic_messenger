@@ -8,7 +8,7 @@ publish = false
 # Logs
 tracing = "0.1.43"
 # Async
-asyncs-sync = "0.4.0"
+asyncs-sync = { workspace = true }
 async-trait = { workspace = true }
 async-tungstenite =  { version = "0.34.0", features = ["async-std-runtime", "async-tls"] }
 # Futures

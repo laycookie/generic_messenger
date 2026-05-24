@@ -1,11 +1,9 @@
 use std::{collections::BTreeMap, ops::Deref, sync::Arc};
 
 use messenger_interface::{
-    interface::Messenger,
-    types::{House, ID, Identifier, Message, Place, Room, User},
+    interface::{CallState, Messenger},
+    types::{House, ID, Identifier, Place, Room, User},
 };
-
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MessengerId(usize);
@@ -28,13 +26,19 @@ impl Deref for MessengerInterface {
 pub struct Call {
     messenger_id: MessengerId,
     source: Identifier<Place<Room>>,
+    state: CallState,
 }
 
 impl Call {
-    pub fn new(messenger_id: MessengerId, source: Identifier<Place<Room>>) -> Self {
+    pub fn new(
+        messenger_id: MessengerId,
+        source: Identifier<Place<Room>>,
+        state: CallState,
+    ) -> Self {
         Self {
             messenger_id,
             source,
+            state,
         }
     }
     pub fn messenger_id(&self) -> MessengerId {
@@ -43,11 +47,17 @@ impl Call {
     pub fn source(&self) -> &Identifier<Place<Room>> {
         &self.source
     }
+    pub fn source_mut(&mut self) -> &mut Identifier<Place<Room>> {
+        &mut self.source
+    }
     pub fn id(&self) -> ID {
         *self.source.id()
     }
-    pub fn status_str(&self) -> &str {
-        "Sample"
+    pub fn state_str(&self) -> &str {
+        self.state.as_str()
+    }
+    pub fn set_state(&mut self, state: CallState) {
+        self.state = state;
     }
 }
 
@@ -63,7 +73,6 @@ pub struct MessengerData {
     pub contacts: Vec<Identifier<User>>,
     pub conversations: Vec<Identifier<Place<Room>>>,
     pub guilds: Vec<Identifier<Place<House>>>,
-    pub chats: HashMap<ID, Vec<Identifier<Message>>>,
     pub calls: Vec<Call>,
     /// Tracks optimistic messages that haven't been confirmed by the server yet.
     pub pending_sends: Vec<PendingSend>,
@@ -76,10 +85,44 @@ impl MessengerData {
             contacts: Vec::new(),
             conversations: Vec::new(),
             guilds: Vec::new(),
-            chats: HashMap::new(),
             calls: Vec::new(),
             pending_sends: Vec::new(),
         }
+    }
+
+    pub fn room(&self, room_id: ID) -> Option<&Identifier<Place<Room>>> {
+        self.conversations
+            .iter()
+            .find(|room| *room.id() == room_id)
+            .or_else(|| {
+                self.guilds
+                    .iter()
+                    .filter_map(|guild| guild.rooms.as_deref())
+                    .flatten()
+                    .find(|room| *room.id() == room_id)
+            })
+    }
+
+    pub fn room_mut(&mut self, room_id: ID) -> Option<&mut Identifier<Place<Room>>> {
+        if let Some(pos) = self
+            .conversations
+            .iter()
+            .position(|room| *room.id() == room_id)
+        {
+            return self.conversations.get_mut(pos);
+        }
+
+        for guild in &mut self.guilds {
+            let Some(rooms) = guild.rooms.as_mut() else {
+                continue;
+            };
+
+            if let Some(pos) = rooms.iter().position(|room| *room.id() == room_id) {
+                return rooms.get_mut(pos);
+            }
+        }
+
+        None
     }
 }
 

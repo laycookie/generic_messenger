@@ -63,7 +63,7 @@ impl Chat {
         }
     }
 
-    pub fn get_element<'a>(&self, messengers: &'a MessengerRegistry) -> Element<'a, Action> {
+    pub fn get_element<'a>(&'a self, messengers: &'a MessengerRegistry) -> Element<'a, Action> {
         let channel_info = row![
             Text::new(self.room.name.clone()),
             Button::new("CALL").on_press(Action::Call {
@@ -72,9 +72,13 @@ impl Chat {
             })
         ];
 
+        // TODO: Either streamline this, or make it more intuituve
+        // to why we grab msgs from where we do.
         let messages = messengers
             .data(self.interface.id)
-            .and_then(|d| d.chats.get(self.room.id()));
+            .and_then(|d| d.room(*self.room.id()))
+            .and_then(|room| room.messages.as_ref())
+            .or_else(|| self.room.messages.as_ref());
 
         let chat = Scrollable::new(match messages {
             Some(messages) => messages

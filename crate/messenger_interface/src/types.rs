@@ -174,10 +174,10 @@ type Fetched<T> = Option<T>;
 pub struct Room {
     /// Capabilities supported by this room (text, voice, etc.).
     pub room_capabilities: RoomCapabilities,
-    /// List of participants, if fetched.
-    pub participants: Fetched<Vec<Identifier<User>>>,
     /// List of messages, if fetched.
     pub messages: Fetched<Vec<Identifier<Message>>>,
+    /// List of participants, if fetched.
+    pub participants: Fetched<Vec<Identifier<User>>>,
 }
 impl Room {
     /// Create a new Room with the given capabilities and optional data.

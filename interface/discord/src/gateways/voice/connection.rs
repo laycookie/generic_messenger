@@ -62,7 +62,9 @@ impl RecvAudioFuture<'_> {
             PacketClass::Rtp { .. } => {} // Opus voice — decode below
         }
 
-        let rtp_packet = RtpPacket::new(rtp_packet_buf).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "failed to parse RTP packet"))?;
+        let rtp_packet = RtpPacket::new(rtp_packet_buf).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "failed to parse RTP packet")
+        })?;
 
         let is_rtp_extended = rtp_packet.get_extension() != 0;
 
@@ -74,7 +76,10 @@ impl RecvAudioFuture<'_> {
         };
         let (rtp_header, rtp_body) = rtp_packet.packet().split_at(rtp_header_len);
 
-        let mode = self.description.mode().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing encryption mode"))?;
+        let mode = self
+            .description
+            .mode()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing encryption mode"))?;
         let decrypted_payload = match mode {
             EncryptionMode::aead_aes256_gcm_rtpsize => unimplemented!(),
             EncryptionMode::aead_xchacha20_poly1305_rtpsize => {
@@ -86,7 +91,9 @@ impl RecvAudioFuture<'_> {
                 let nonce = crypto_aead::xchacha20poly1305::Nonce::from_bytes(nonce);
 
                 let key = crypto_aead::xchacha20poly1305::Key::from_bytes(
-                    self.description.secret_key().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing secret key"))?,
+                    self.description.secret_key().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "missing secret key")
+                    })?,
                 )
                 .expect("Invalid key length");
 
@@ -106,7 +113,11 @@ impl RecvAudioFuture<'_> {
 
         // <https://datatracker.ietf.org/doc/html/rfc6464>
         if decrypted_payload.len() < 8 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "decrypted payload too short for RTP extension header").into());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decrypted payload too short for RTP extension header",
+            )
+            .into());
         }
         let (potentially, voice_data) = decrypted_payload.split_at(8);
         let unknown_const = &potentially[..1]; // CONST 55
@@ -140,7 +151,9 @@ impl RecvAudioFuture<'_> {
                 *self
                     .ssrc_to_user_id
                     .get(&rtp_packet.get_ssrc())
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no SSRC to user mapping"))?,
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "no SSRC to user mapping")
+                    })?,
                 MediaType::AUDIO,
                 voice_data,
             )?;
@@ -190,16 +203,31 @@ impl SendAudioFuture<'_> {
             return Ok(());
         }
         if !samples.len().is_multiple_of(2) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected interleaved stereo samples").into());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected interleaved stereo samples",
+            )
+            .into());
         }
 
-        let mode = self.description.mode().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing encryption mode"))?;
-        let secret_key = self.description.secret_key().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing secret key"))?;
+        let mode = self
+            .description
+            .mode()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing encryption mode"))?;
+        let secret_key = self
+            .description
+            .secret_key()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing secret key"))?;
 
         let encoded_len = self
             .encoder
             .encode_float(samples, self.encoded_audio_buf.as_mut_slice())
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("opus encode failed: {err:?}")))?;
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("opus encode failed: {err:?}"),
+                )
+            })?;
         let opus_payload = &self.encoded_audio_buf[..encoded_len];
 
         let samples_per_channel = (samples.len() / VOICE_CHANNELS) as u32;
@@ -279,7 +307,11 @@ impl SendAudioFuture<'_> {
                     .await?;
             }
             _ => {
-                return Err(io::Error::new(io::ErrorKind::Unsupported, format!("unsupported encryption mode: {mode:?}")).into());
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("unsupported encryption mode: {mode:?}"),
+                )
+                .into());
             }
         }
 
@@ -300,7 +332,11 @@ impl Connection {
         ssrc_to_user_id: &'a DashMap<Ssrc, SNOWFLAKE>,
     ) -> Result<(RecvAudioFuture<'a>, SendAudioFuture<'a>), Box<dyn Error>> {
         let Some(description) = self.description() else {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "no session description provided").into());
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no session description provided",
+            )
+            .into());
         };
 
         Ok((

@@ -25,5 +25,6 @@ facet-pretty = "0.46.0"
 # facet-pretty = { git = "https://github.com/facet-rs/facet", branch = "main" }
 facet-error = "0.46.0"
 # Async
+asyncs-sync = "0.4.0"
 futures = "0.3.32"
 async-trait = "0.1.89"

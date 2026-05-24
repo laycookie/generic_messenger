@@ -5,8 +5,8 @@ use auth::MessengersGenerator;
 use font_kit::{family_name::FamilyName, source::SystemSource};
 use futures::{StreamExt, future::join_all, join};
 use iced::{Element, Subscription, Task, window};
+use messenger_interface::interface::{CallState, CallStatus, SocketEvent};
 use messenger_unifier::Messengers;
-use messenger_interface::interface::SocketEvent;
 use pages::{AppMessage, Login, messenger::Messenger};
 use simple_audio_channels::{AudioMixer, SampleFormat};
 
@@ -359,19 +359,26 @@ impl App {
                             }
                         }
                     }
-                    SocketEvent::CallStatusUpdate(call_status) => match call_status {
-                        messenger_interface::interface::CallStatus::Connected(
-                            weak_socket_stream,
-                        ) => {
-                            return Task::stream(weak_socket_stream.map(move |event| {
-                                AppMessage::SocketEvent((handle, event.into()))
-                            }));
+                    SocketEvent::CallStatusUpdate(call_status) => {
+                        debug!("{}", call_status.as_str());
+                        if let Some(data) = self.messengers.mut_data_from_handle(handle) {
+                            // TODO: Set it for a specific call, and not all of the calls
+                            for call in &mut data.calls {
+                                call.set_state(CallState::Pending(call_status));
+                            }
                         }
-                        messenger_interface::interface::CallStatus::Connecting(msg) => {
-                            debug!("{msg}")
+                    }
+                    SocketEvent::CallStreamReady(weak_socket_stream) => {
+                        if let Some(data) = self.messengers.mut_data_from_handle(handle) {
+                            // TODO: Set it for a specific call, and not all of the calls
+                            for call in &mut data.calls {
+                                call.set_state(CallState::Connected);
+                            }
                         }
-                        messenger_interface::interface::CallStatus::Failed => error!("TODO"),
-                    },
+                        return Task::stream(weak_socket_stream.map(move |event| {
+                            AppMessage::SocketEvent((handle, event.into()))
+                        }));
+                    }
                     SocketEvent::Disconnected => debug!("Disconnected"),
                     SocketEvent::AddAudioSource(sender) => {
                         let producer = self
@@ -507,8 +514,12 @@ impl App {
                             };
                             // Convert Place<Room> to Room for voice API
                             let room_id = channel.swap_data((*channel).clone());
-                            if let Err(err) = vc.connect(&room_id).await {
-                                error!("{err}");
+                            let status = match vc.connect(&room_id).await {
+                                Ok(status) => status,
+                                Err(err) => {
+                                    error!("{err}");
+                                    CallStatus::Failed
+                                }
                             };
 
                             Task::done(AppMessage::SetMessengerData {
@@ -516,6 +527,7 @@ impl App {
                                 new_data: pages::MessengerData::Call(Call::new(
                                     interface.handle,
                                     channel,
+                                    CallState::Pending(status),
                                 )),
                             })
                             // .chain(vc_stream)

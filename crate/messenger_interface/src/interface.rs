@@ -110,6 +110,10 @@ pub trait Messenger: Send + Sync
 where
     Self: MessengerCasterQuery + MessengerCasterText + MessengerCasterVoice,
 {
+    // TODO: Replace auth_obj with a better representation then str
+    fn create_messenger(auth_obj: &str) -> Arc<dyn Messenger>
+    where
+        Self: Sized;
     /// Stable unique id for this backend instance (e.g. includes account/server context).
     fn id(&self) -> String;
     /// Human-readable backend name (e.g. `"discord"`).
@@ -216,20 +220,39 @@ pub trait Text: Send + Sync {
     }
 }
 
-/// Status of a voice call connection.
+/// Non-connected sub-states of a voice call. The connected state is represented
+/// by the *absence* of a `CallStatus` — see [`CallState`].
+#[derive(Debug, Clone, Copy)]
 pub enum CallStatus {
-    Connected(WeakSocketStream<AudioEvent>),
-    /// Currently attempting to connect to the voice channel.
-    Connecting(&'static str), // String contains info of what stage in the "Connecting" pipeline we are at.
+    /// Currently attempting to connect; the string carries the pipeline stage.
+    Connecting(&'static str),
     Failed,
     // TODO: Add Retrying.
 }
-impl Debug for CallStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+
+impl CallStatus {
+    pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Connected(_) => f.debug_tuple("Connected").finish(),
-            Self::Connecting(arg0) => f.debug_tuple("Connecting").field(arg0).finish(),
-            Self::Failed => write!(f, "Failed"),
+            Self::Connecting(msg) => msg,
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+/// Full state of a voice call as seen by the UI. The audio stream is delivered
+/// out-of-band via [`VoiceEvent::CallStreamReady`]; receiving that event is the
+/// signal to transition into [`CallState::Connected`].
+#[derive(Debug, Clone, Copy)]
+pub enum CallState {
+    Connected,
+    Pending(CallStatus),
+}
+
+impl CallState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Connected => "Connected",
+            Self::Pending(status) => status.as_str(),
         }
     }
 }
@@ -292,6 +315,9 @@ pub enum SocketEvent {
         room: Identifier<Place<Room>>,
     },
     CallStatusUpdate(CallStatus),
+    /// Audio stream for a newly-connected call. Receiving this implies the call
+    /// is connected — no separate status update is emitted for that transition.
+    CallStreamReady(WeakSocketStream<AudioEvent>),
     /// Request to attach an audio source into the audio graph.
     AddAudioSource(oneshot::Sender<SampleProducer>),
     /// Request to attach a local audio input (microphone) for sending to voice.
@@ -352,6 +378,10 @@ impl From<VoiceEvent> for SocketEvent {
     fn from(value: VoiceEvent) -> Self {
         match value {
             VoiceEvent::CallStatusUpdate(call_status) => SocketEvent::CallStatusUpdate(call_status),
+            VoiceEvent::CallStreamReady(stream) => SocketEvent::CallStreamReady(stream),
+            VoiceEvent::ParticipantJoined { .. } | VoiceEvent::ParticipantLeft { .. } => {
+                SocketEvent::Skip
+            }
         }
     }
 }
@@ -406,7 +436,19 @@ pub enum TextEvent {
 
 /// Updates in the status of the voice call
 pub enum VoiceEvent {
+    /// A non-connected sub-state update (Connecting/Failed). The connected
+    /// transition is signalled by [`VoiceEvent::CallStreamReady`] instead.
     CallStatusUpdate(CallStatus),
+    /// Audio stream for a newly-connected call. Receiving this implies the call
+    /// is connected.
+    CallStreamReady(WeakSocketStream<AudioEvent>),
+    ParticipantJoined {
+        room: Identifier<()>,
+        user: Identifier<User>,
+    },
+    ParticipantLeft {
+        user_id: ID,
+    },
 }
 /// Audio events that are meant to be processed with the mixer
 pub enum AudioEvent {

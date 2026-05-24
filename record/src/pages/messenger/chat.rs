@@ -20,7 +20,7 @@ pub struct Chat {
 #[derive(Clone)]
 pub enum Action {
     Call {
-interface: MessengerInterface,
+        interface: MessengerInterface,
         room: Identifier<Place<Room>>,
     },
     Message(Message),

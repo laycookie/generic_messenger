@@ -1,15 +1,15 @@
-use std::{io, sync::atomic::Ordering};
+use std::{collections::HashMap, io, sync::atomic::Ordering};
 
 use facet_pretty::FacetPretty;
 use messenger_interface::{
-    interface::{QueryEvent, TextEvent},
+    interface::{QueryEvent, TextEvent, VoiceEvent},
     types::{CacheCategory, Identifier, Message as GlobalMessage, User as GlobalUser},
 };
 use tracing::{debug, error, trace, warn};
 
 use super::{
     GatewayEvent, Opcode,
-    payloads::{SessionObjectPayload, VoiceServerUpdatePayload, VoiceStatePayload},
+    payloads::{ReadyPayload, SessionObjectPayload, VoiceServerUpdatePayload, VoiceStatePayload},
 };
 use crate::{
     ChannelID, Discord, InnerDiscord, UnitStruct,
@@ -17,6 +17,45 @@ use crate::{
     downloaders::cache_cdn_image,
     gateways::{GatewayPayload, voice::Endpoint},
 };
+
+async fn emit_voice_state_participant<T: UnitStruct>(
+    discord: &InnerDiscord<T>,
+    user_id: api_types::SNOWFLAKE,
+    voice_state: VoiceStatePayload,
+    member_user: Option<api_types::User>,
+) {
+    match voice_state.channel_id {
+        Some(channel_id) => {
+            let Some(user) = voice_state.member.map(|member| member.user).or(member_user) else {
+                warn!("Voice state for user {user_id} is missing member data");
+                return;
+            };
+
+            let icon = match &user.avatar {
+                Some(hash) => cache_cdn_image("avatars", CacheCategory::Users, user.id, hash)
+                    .await
+                    .ok(),
+                None => None,
+            };
+
+            discord.voice_events.push(VoiceEvent::ParticipantJoined {
+                room: Identifier::new(channel_id, ()),
+                user: Identifier::new(
+                    user.id,
+                    GlobalUser {
+                        name: user.username,
+                        icon,
+                    },
+                ),
+            });
+        }
+        None => {
+            discord
+                .voice_events
+                .push(VoiceEvent::ParticipantLeft { user_id });
+        }
+    }
+}
 
 impl GatewayPayload<Opcode> {
     pub(in crate::gateways) async fn exec<T: UnitStruct>(
@@ -48,7 +87,32 @@ impl GatewayPayload<Opcode> {
                 // https://discord.com/developers/docs/events/gateway-events#receive-events
                 match event_name {
                     GatewayEvent::Ready => {
-                        debug!("importing data");
+                        let ready = facet_value::from_value::<ReadyPayload>(self.d)?;
+                        let mut merged_members =
+                            ready.merged_members.unwrap_or_default().into_iter();
+
+                        for guild in ready.guilds.unwrap_or_default() {
+                            let mut guild_members = guild.members.unwrap_or_default();
+                            if let Some(members) = merged_members.next() {
+                                guild_members.extend(members);
+                            }
+
+                            let mut members = guild_members
+                                .into_iter()
+                                .map(|member| (member.user.id, member.user))
+                                .collect::<HashMap<_, _>>();
+
+                            for voice_state in guild.voice_states.unwrap_or_default() {
+                                let member_user = members.remove(&voice_state.user_id);
+                                emit_voice_state_participant(
+                                    discord,
+                                    voice_state.user_id,
+                                    voice_state,
+                                    member_user,
+                                )
+                                .await;
+                            }
+                        }
                     }
                     GatewayEvent::SessionsReplace => {
                         debug!("Session replace");
@@ -58,10 +122,23 @@ impl GatewayPayload<Opcode> {
                     GatewayEvent::VoiceStateUpdate => {
                         let voice_state = facet_value::from_value::<VoiceStatePayload>(self.d)?;
 
-                        gateway
-                            .voice
-                            .insert_session_id(voice_state.session_id)
-                            .await;
+                        let current_user_id =
+                            discord.profile.load().as_ref().map(|profile| profile.id);
+
+                        if current_user_id == Some(voice_state.user_id) {
+                            gateway
+                                .voice
+                                .insert_session_id(voice_state.session_id.clone())
+                                .await;
+                        }
+
+                        emit_voice_state_participant(
+                            discord,
+                            voice_state.user_id,
+                            voice_state,
+                            None,
+                        )
+                        .await;
                     }
                     GatewayEvent::VoiceServerUpdate => {
                         let server_update =
@@ -80,18 +157,14 @@ impl GatewayPayload<Opcode> {
                             ))
                             .await;
 
-                        let user_id = {
-                            let profile = discord.profile.read().await;
-                            profile
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::NotFound,
-                                        "user profile not loaded",
-                                    )
-                                })?
-                                .id
-                        };
+                        let user_id = discord
+                            .profile
+                            .load()
+                            .as_ref()
+                            .ok_or_else(|| {
+                                io::Error::new(io::ErrorKind::NotFound, "user profile not loaded")
+                            })?
+                            .id;
 
                         match gateway.voice.connect(user_id).await {
                             Ok(_) => (),
@@ -106,7 +179,7 @@ impl GatewayPayload<Opcode> {
                         let channel_id_hash = message.channel_id;
                         let msg_id_hash = message.id;
 
-                        trace!("MessageCreate: {}", message.pretty());
+                        trace!("{}", message.pretty());
                         let icon = match &message.author.avatar {
                             Some(hash) => cache_cdn_image(
                                 "avatars",
@@ -134,9 +207,9 @@ impl GatewayPayload<Opcode> {
                             },
                         );
 
-                        let mut msg_data = discord.msg_data.write().await;
-                        msg_data.insert(*msg_identifier.id(), msg_id_hash);
-                        drop(msg_data);
+                        discord
+                            .message_id_mappings
+                            .insert(*msg_identifier.id(), msg_id_hash);
 
                         discord.text_events.push(TextEvent::MessageCreated {
                             room: Identifier::new(channel_id_hash, ()),
@@ -224,15 +297,13 @@ impl GatewayPayload<Opcode> {
                         let place_room = channel.to_room_data().await;
                         let room = Discord::identifier_generator(channel.id, place_room);
 
-                        let mut channel_data = discord.channel_id_mappings.write().await;
-                        channel_data.insert(
+                        discord.channel_id_mappings.insert(
                             *room.id(),
                             ChannelID {
                                 guild_id: channel.guild_id,
                                 id: channel.id,
                             },
                         );
-                        drop(channel_data);
 
                         discord.query_events.push(QueryEvent::ChannelCreated {
                             r#where: channel

@@ -1,7 +1,8 @@
 use iced::{
-    Color, Element, Length, Padding,
+    Color, ContentFit, Element, Length, Padding,
     widget::{
-        Button, Column, Scrollable, Text, button, column, container, image, row, text::Wrapping,
+        Button, Column, Row, Scrollable, Text, button, column, container, image, row,
+        text::Wrapping,
     },
 };
 use iced_palace::widget::ellipsized_text;
@@ -60,15 +61,42 @@ impl Sidebar {
                 if chan.room_capabilities.contains(RoomCapabilities::Voice)
                     && !chan.room_capabilities.contains(RoomCapabilities::Text)
                 {
-                    return Button::new(chan.name.as_str())
+                    let channel_button = Button::new(chan.name.as_str())
                         .on_press(Action::Call(chan.clone()))
+                        .width(Length::Fill)
                         .style(|_, _| button::Style {
                             background: Some(iced::Background::Color(Color::from_rgb(
                                 0.0, 1.0, 0.2,
                             ))),
                             ..Default::default()
-                        })
-                        .into();
+                        });
+
+                    let participants =
+                        Column::from_iter(chan.participants.as_deref().unwrap_or(&[]).iter().map(
+                            |participant| {
+                                let avatar = match participant.icon.as_ref() {
+                                    Some(icon) => image(icon),
+                                    None => image(PLACEHOLDER_PFP),
+                                };
+
+                                Element::from(
+                                    row![
+                                        container(
+                                            avatar
+                                                .height(Length::Fixed(18.0))
+                                                .width(Length::Fixed(18.0))
+                                                .content_fit(ContentFit::Cover),
+                                        )
+                                        .padding(Padding::new(0.0).right(6.0).left(18.0)),
+                                        ellipsized_text(participant.name.as_str())
+                                            .wrapping(Wrapping::None),
+                                    ]
+                                    .width(Length::Fill),
+                                )
+                            },
+                        ));
+
+                    return column![channel_button, participants].into();
                 }
                 Button::new(chan.name.as_str())
                     .on_press(Action::OpenChat {
@@ -101,13 +129,48 @@ impl Sidebar {
             })),
         };
 
-        let mut active_calls = messengers.data_iter().flat_map(|m| &m.calls).peekable();
+        let mut active_calls = messengers
+            .data_iter()
+            .flat_map(|data| data.calls.iter().map(move |call| (call, data)))
+            .peekable();
 
         let panel = if active_calls.peek().is_some() {
-            let active_calls = Column::from_iter(active_calls.map(|call| {
-                Element::from(row![
-                    Text::from(call.status_str()),
-                    Button::new("D").on_press(Action::Disconnect(call.clone()))
+            let active_calls = Column::from_iter(active_calls.map(|(call, data)| {
+                let participant_icons = Row::from_iter(
+                    call.source()
+                        .participants
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter(|participant| {
+                            data.profile
+                                .as_ref()
+                                .is_none_or(|profile| profile.id() != participant.id())
+                        })
+                        .map(|participant| {
+                            let avatar = match participant.icon.as_ref() {
+                                Some(icon) => image(icon),
+                                None => image(PLACEHOLDER_PFP),
+                            };
+
+                            Element::from(
+                                container(
+                                    avatar
+                                        .height(Length::Fixed(24.0))
+                                        .width(Length::Fixed(24.0))
+                                        .content_fit(ContentFit::Cover),
+                                )
+                                .padding(Padding::new(0.0).right(4.0)),
+                            )
+                        }),
+                );
+
+                Element::from(column![
+                    row![
+                        Text::from(call.state_str()).width(Length::Fill),
+                        Button::new("D").on_press(Action::Disconnect(call.clone()))
+                    ],
+                    participant_icons,
                 ])
             }));
             Some(column![

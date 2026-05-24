@@ -27,7 +27,7 @@ pub trait ArcStream: Send + Sync {
 /// automatically stops when the underlying Arc is dropped.
 ///
 /// Note that next_future holds Arc ref to ArcStream data, this means that
-/// before the underlying Arc gets dropped we need to finish polling the 
+/// before the underlying Arc gets dropped we need to finish polling the
 /// current next_future.
 ///
 /// Yields `Event` items directly. Implements [`Stream`] for use with `StreamExt`, iced, etc.
@@ -53,6 +53,15 @@ impl<Event> WeakSocketStream<Event> {
         Self::new(Arc::downgrade(&erased))
     }
 }
+
+impl<Event> std::fmt::Debug for WeakSocketStream<Event> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakSocketStream")
+            .field("alive", &(self.socket.strong_count() > 0))
+            .finish()
+    }
+}
+
 impl<Event> Stream for WeakSocketStream<Event>
 where
     Event: Send + 'static,

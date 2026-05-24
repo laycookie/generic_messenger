@@ -1,6 +1,5 @@
 use std::{
     cell::Cell,
-    collections::HashMap,
     marker::PhantomData,
     sync::{Arc, Weak},
 };
@@ -9,8 +8,8 @@ use arc_swap::ArcSwapOption;
 use asyncs_sync::Notify;
 use bitflags::bitflags;
 use crossbeam::queue::SegQueue;
+use dashmap::DashMap;
 use futures::{channel::oneshot, lock::Mutex as AsyncMutex};
-use futures_locks::RwLock as RwLockAwait;
 use messenger_interface::{
     interface::{AudioEvent, Messenger, QueryEvent, TextEvent, VoiceEvent},
     stream::{ArcStream, WeakSocketStream},
@@ -66,22 +65,7 @@ type MessageID = SNOWFLAKE;
 pub struct Discord;
 impl Discord {
     pub fn new_messenger(token: &str) -> Arc<dyn Messenger> {
-        Arc::new(InnerDiscord {
-            token: token.into(),
-            intents: DEFAULT_INTENTS,
-            audio_manager: Default::default(),
-            gateway: Default::default(),
-            pulled_notification: Default::default(),
-            query_events: SegQueue::new(),
-            text_events: SegQueue::new(),
-            voice_events: SegQueue::new(),
-            audio_events: SegQueue::new(),
-            profile: RwLockAwait::new(None),
-            guild_id_mappings: RwLockAwait::new(HashMap::new()),
-            channel_id_mappings: RwLockAwait::new(HashMap::new()),
-            msg_data: RwLockAwait::new(HashMap::new()),
-            _marker: PhantomData,
-        })
+        InnerDiscord::create_messenger(token)
     }
     fn identifier_generator<D>(id: SNOWFLAKE, data: D) -> Identifier<D> {
         Identifier::new(id, data)
@@ -109,25 +93,26 @@ struct AudioManager {
 }
 
 struct InnerDiscord<T: UnitStruct> {
-    // Metadata
+    // === Metadata ===
     token: SecureString,
     intents: Intents,
     // Microphone
     audio_manager: AsyncMutex<AudioManager>,
-    // socket related
+    // === socket related ===
     gateway: ArcSwapOption<Gateway<General>>,
     pulled_notification: Notify,
-    // event queues
+    // === event queues === (TODO: Submit them diractly to the UI)
     query_events: SegQueue<QueryEvent>,
     text_events: SegQueue<TextEvent>,
     voice_events: SegQueue<VoiceEvent>,
     audio_events: SegQueue<AudioEvent>,
-    // Cached data
-    profile: RwLockAwait<Option<api_types::Profile>>,
-    channel_id_mappings: RwLockAwait<HashMap<ID, ChannelID>>,
-    guild_id_mappings: RwLockAwait<HashMap<ID, GuildID>>,
-    msg_data: RwLockAwait<HashMap<ID, MessageID>>,
-    // etc
+    // === Cached data ===
+    profile: ArcSwapOption<api_types::Profile>,
+    // External to internal ID mappings (TODO: Remove we can store discord IDs diractly in external
+    // IDs)
+    channel_id_mappings: DashMap<ID, ChannelID>,
+    guild_id_mappings: DashMap<ID, GuildID>,
+    message_id_mappings: DashMap<ID, MessageID>,
     _marker: PhantomData<T>,
 }
 impl<T: UnitStruct> InnerDiscord<T> {
@@ -136,7 +121,7 @@ impl<T: UnitStruct> InnerDiscord<T> {
     async fn ensure_gateway(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.gateway.load().is_none() {
             self.gateway
-                .store(Some(Arc::new(Gateway::<General>::new(&self).await?)));
+                .store(Some(Arc::new(Gateway::<General>::new(self).await?)));
         }
         Ok(())
     }
@@ -163,6 +148,28 @@ impl<T: UnitStruct> InnerDiscord<T> {
 }
 
 impl Messenger for InnerDiscord<Owned> {
+    /// Auth_obj is expected to be token for discord
+    fn create_messenger(auth_obj: &str) -> Arc<dyn Messenger>
+    where
+        Self: Sized,
+    {
+        Arc::new(InnerDiscord {
+            token: auth_obj.into(),
+            intents: DEFAULT_INTENTS,
+            audio_manager: Default::default(),
+            gateway: Default::default(),
+            pulled_notification: Default::default(),
+            query_events: SegQueue::new(),
+            text_events: SegQueue::new(),
+            voice_events: SegQueue::new(),
+            audio_events: SegQueue::new(),
+            profile: ArcSwapOption::empty(),
+            guild_id_mappings: DashMap::new(),
+            channel_id_mappings: DashMap::new(),
+            message_id_mappings: DashMap::new(),
+            _marker: PhantomData,
+        })
+    }
     fn id(&self) -> String {
         self.name().to_owned() + self.token.unsecure()
     }
