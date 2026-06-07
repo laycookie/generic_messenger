@@ -7,9 +7,12 @@ use num_enum::TryFromPrimitive;
 use surf::http::convert::json;
 use tracing::debug;
 
+use overwrite_ring::Ring;
+
 use self::payloads::HelloPayload;
 use crate::{
-    InnerDiscord, UnitStruct,
+    InnerDiscord, MESSAGE_DELETE_TOMBSTONE_CAP, UnitStruct,
+    api_types::SNOWFLAKE,
     gateways::{
         Gateway, GatewayStreamReciver as _, HeartBeatingData, Websocket, voice::VoiceGateway,
     },
@@ -95,6 +98,12 @@ pub enum GatewayEvent {
 
 pub struct General {
     pub voice: VoiceGateway,
+    /// Tombstones for messages deleted via gateway events, used to filter
+    /// concurrent `rest_get_messages` responses that race the delete.
+    /// Lives on the gateway so it drops automatically when the gateway
+    /// disconnects — at that point REST becomes the unfiltered source of
+    /// truth. See `crate/messenger_interface/docs/races.md`.
+    pub deleted_message_ids: Ring<SNOWFLAKE, MESSAGE_DELETE_TOMBSTONE_CAP>,
 }
 
 impl Gateway<General> {
@@ -159,6 +168,7 @@ impl Gateway<General> {
             last_sequence_number: OnceLock::new(),
             type_specific_data: General {
                 voice: VoiceGateway::default(),
+                deleted_message_ids: Ring::new(),
             },
         })
     }

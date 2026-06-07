@@ -114,11 +114,24 @@ load-bearing.
 
 Implementation: a lock-free atomic ring with overwrite-on-push, provided
 by the workspace's `overwrite-ring` crate (`crate/overwrite_ring`). For
-messages specifically:
+messages, the ring lives on `gateways::general::General` so its lifetime
+matches the gateway connection's:
 
 ```rust
-type DeletedMessageRing = overwrite_ring::Ring<SNOWFLAKE, 100>;
+pub struct General {
+    pub voice: VoiceGateway,
+    pub deleted_message_ids: Ring<SNOWFLAKE, 100>,
+}
 ```
+
+This co-location is the load-bearing piece for the
+"gateway-down implies REST-is-authoritative" property: when the gateway
+disconnects, the whole `Gateway<General>` is dropped, taking the
+tombstone ring with it. No `clear()` call, no risk of leftover state
+filtering subsequent REST queries — the lifetime *is* the invariant.
+
+`InnerDiscord::drop_tombstoned_messages` reflects this: it loads the
+gateway and, if `None`, returns the HTTP response unfiltered.
 
 The cap of **100** matches Discord's `MESSAGE_DELETE_BULK` per-event size,
 so a single bulk-delete event fits exactly. Larger purges chain multiple
@@ -147,6 +160,69 @@ consumer queue. The reverse order admits this race:
 3. HTTP response lands, queue check passes (ID not yet there).
 4. UI re-adds the deleted message.
 5. Tombstone finally arrives in the ring — too late to help.
+
+## Cache-backed queries: gateway is the only writer
+
+The reconciliation policy above is stated in its fully general form, but most of
+the `Query` / `Text` entry points in the Discord backend are actually a
+strictly simpler shape: **REST is a cold-start fallback, and once the cache is
+populated by the gateway, REST is never consulted again.** The race window for
+these queries is correspondingly narrow.
+
+Concretely, `houses()`, `rooms()`, and `house_details()` (in
+`interface/discord/src/query.rs`) all follow the same pattern:
+
+```rust
+async fn houses(&self) -> Result<Vec<...>, ...> {
+    if let Some(cached) = self.guilds.load_full() {
+        return Ok(self.process_guilds(&cached).await);
+    }
+    let guilds = self.rest_get_guilds().await?;
+    Ok(self.process_guilds(&guilds).await)
+}
+```
+
+Two properties matter here, and they hold by inspection:
+
+1. **The gateway's `Ready` handler is the sole writer of the cache.**
+   `discord.guilds`, `discord.dm_channels`, and `discord.guild_channels` are
+   only `store`d from the `Ready` branch of the dispatch handler in
+   `interface/discord/src/gateways/general/events.rs`. The REST fallback path
+   returns the fetched data directly to the caller and does **not** write it
+   back to the cache.
+2. **The cache, once populated, is never invalidated except by gateway
+   disconnect.** `Ready` arrives once per connection; subsequent gateway events
+   (`GUILD_UPDATE`, `CHANNEL_CREATE`, ...) mutate the cache in place. When the
+   gateway connection drops, the entire `Gateway<General>` is dropped, but the
+   `InnerDiscord` caches it populated outlive it — they remain readable. A
+   reconnect will overwrite them with a fresh `Ready` snapshot.
+
+Together these mean that for cache-backed queries:
+
+- **Steady state (post-`Ready`):** REST is never hit. There is no race surface.
+  A `GUILD_UPDATE` event simply mutates the cache and emits a `QueryEvent`; the
+  UI applies it; done. No HTTP response can arrive late and undo it because no
+  HTTP request was ever in flight.
+- **Cold-start window (gateway-up but pre-`Ready`):** REST may be in flight
+  when `Ready` and subsequent gateway events land. Because REST does not write
+  to the cache, there is no cache-clobber. The only residual race is at the UI
+  layer: if the UI consumes a `QueryEvent` from the event stream **before** the
+  in-flight REST future resolves, it can apply the update and then have it
+  visually overwritten when the stale REST snapshot is rendered. This window
+  is typically 1–3 seconds and ends permanently once `Ready` lands.
+
+This narrower race surface is why the "Audit" table below distinguishes
+*cache-backed* from *every-call HTTP*. Cache-backed fetches need
+`*_UPDATE` / `*_DELETE` handlers for correctness (otherwise the cache goes
+stale), but they do **not** need tombstone rings or per-ID merge policies for
+the race story alone — those are required only for fetches whose results are
+returned to the UI on every call without ever passing through the cache.
+
+The fetches that **do** require the full reconciliation policy are
+`rest_get_messages` (called on every `Text::get_messages`) and
+`rest_get_contacts` (called on every `Query::contacts`). Those have no
+cache-first path, so the race is open on every invocation, not just at
+cold-start.
 
 ## Audit: which fetches are exposed?
 

@@ -5,6 +5,50 @@
 //! the cached state populated by gateway events. It is also the place where
 //! data returned to the UI gets reconciled against the cache so that
 //! HTTP results and gateway events stay coherent.
+//!
+//! # Two query shapes
+//!
+//! Methods on this module fall into one of two shapes, and the distinction
+//! drives the entire race story for the Discord backend.
+//!
+//! ## Cache-backed (cache-first, REST cold-start fallback)
+//!
+//! `houses`, `rooms`, `house_details`, `client_user`: read the relevant
+//! `InnerDiscord` cache field (`guilds`, `dm_channels`, `guild_channels`,
+//! `profile`) and only fall back to REST if the cache is empty. The cache
+//! is seeded by the `Ready` gateway dispatch (see `gateways::general::events`),
+//! which is currently the **sole** writer for these fields. Subsequent
+//! `*_UPDATE` / `*_DELETE` / `*_CREATE` handlers that would mutate these
+//! caches in place are not yet wired up, so the cache today reflects the
+//! `Ready` snapshot frozen in time and goes progressively stale over the
+//! connection's lifetime. Adding those handlers is a tracked correctness
+//! task — see `crate/messenger_interface/docs/races.md` ("Audit").
+//!
+//! **The REST fallback returns data directly to the caller without writing
+//! it back to the cache.** This is load-bearing: once `Ready` lands, the
+//! cache is populated forever (or until the gateway reconnects, at which
+//! point a fresh `Ready` overwrites it), and REST is never consulted again
+//! for these queries. The race window for cache-backed queries is therefore
+//! confined to the gateway-up-but-pre-`Ready` cold-start window — typically
+//! 1–3 seconds — and even within that window there is no cache-clobber,
+//! only a potential UI-level phantom if the event stream is consumed before
+//! the in-flight REST future resolves.
+//!
+//! Practical consequence: handlers for `GUILD_UPDATE`, `CHANNEL_UPDATE`,
+//! etc. need to mutate the cache for correctness (otherwise it goes stale
+//! over the connection's lifetime), but they do **not** need tombstone
+//! rings or per-ID merge policies.
+//!
+//! ## Every-call HTTP (no cache, REST on every invocation)
+//!
+//! `get_messages`, `contacts`: have no cache-first path. Every call hits
+//! REST, and the result is returned to the UI without ever being stored.
+//! These are the queries where the gateway/REST reconciliation policy
+//! actually applies: a gateway event landing during the in-flight HTTP
+//! call can race with the response, and a tombstone ring (for deletes) or
+//! per-field merge (for updates) is required to keep the UI consistent.
+//! See `crate/messenger_interface/docs/races.md` for the full reconciliation
+//! policy and the per-fetch audit table.
 use crate::{
     AudioDiscord, Discord, InnerDiscord, Owned, QueryDiscord, TextDiscord, VoiceDiscord,
     api_types::{self, SNOWFLAKE},
@@ -302,11 +346,16 @@ impl Text for InnerDiscord<Owned> {
 
         // Drop any messages that a concurrent MessageDelete gateway event
         // has already tombstoned — Discord's REST view occasionally returns
-        // deleted messages before catching up. See
-        // `crate/messenger_interface/docs/races.md`.
-        let messages = messages
-            .into_iter()
-            .filter(|m| !self.deleted_message_ids.contains(m.id));
+        // deleted messages before catching up. If the gateway is
+        // disconnected, the ring doesn't exist and REST passes through
+        // unfiltered. See `crate/messenger_interface/docs/races.md`.
+        let gateway = self.gateway.load_full();
+        let messages = messages.into_iter().filter(move |m| {
+            gateway
+                .as_ref()
+                .map(|g| !g.deleted_message_ids.contains(m.id))
+                .unwrap_or(true)
+        });
 
         // Discord returns messages newest-first. For `Ordering::Time` we
         // reverse so callers get oldest-first; `Unordered` keeps the

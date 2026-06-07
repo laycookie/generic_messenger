@@ -15,18 +15,19 @@ use messenger_interface::{
     stream::{ArcStream, WeakSocketStream},
     types::{ID, Identifier},
 };
-use overwrite_ring::Ring;
 use secure_string::SecureString;
 use simple_audio_channels::input::SampleConsumer;
 
 use crate::{
     api_types::SNOWFLAKE,
     gateways::{Gateway, general::General, general::payloads::VoiceStatePayload},
+    lazy_arc::LazyArc,
 };
 
 mod api_types;
 mod downloaders;
 mod gateways;
+mod lazy_arc;
 mod query;
 mod rest_api;
 
@@ -69,15 +70,10 @@ const DEFAULT_CAPABILITIES: Capabilities = Capabilities::CLIENT_STATE_V2;
 
 /// Capacity of the deleted-message tombstone ring. Matches Discord's
 /// `MESSAGE_DELETE_BULK` per-event cap, so a single bulk event fits exactly.
-/// See `crate/messenger_interface/docs/races.md` for the rationale.
-const MESSAGE_DELETE_TOMBSTONE_CAP: usize = 100;
-
-/// Tombstone ring of recently-deleted message IDs.
-///
-/// The slot sentinel is `0` (via `u64`'s `Default`); real Discord
-/// snowflakes are non-zero, so this can't collide with a live ID.
-/// See `crate/messenger_interface/docs/races.md`.
-type DeletedMessageRing = Ring<SNOWFLAKE, MESSAGE_DELETE_TOMBSTONE_CAP>;
+/// The ring itself lives on `gateways::general::General` so it shares the
+/// gateway connection's lifetime — see
+/// `crate/messenger_interface/docs/races.md`.
+pub(crate) const MESSAGE_DELETE_TOMBSTONE_CAP: usize = 100;
 
 /// Where a Discord channel lives. Splits guild vs. private so the opcode 4
 /// payload and join flow can be picked statically instead of inferring from
@@ -170,7 +166,7 @@ struct InnerDiscord<T: UnitStruct> {
     // Microphone
     audio_manager: AsyncMutex<AudioManager>,
     // === socket related ===
-    gateway: ArcSwapOption<Gateway<General>>,
+    gateway: LazyArc<Gateway<General>>,
     pulled_notification: Notify,
     // === event queues === (TODO: Submit them diractly to the UI)
     query_events: SegQueue<QueryEvent>,
@@ -180,14 +176,20 @@ struct InnerDiscord<T: UnitStruct> {
     // === Cached data ===
     profile: ArcSwapOption<api_types::Profile>,
     voice_states: DashMap<SNOWFLAKE, VoiceStatePayload>,
-    // Populated from the Ready gateway event so we can serve queries without
-    // re-hitting the REST API on first paint.
+    // Gateway-owned caches. The `Ready` dispatch handler in
+    // `gateways::general::events` is currently the *sole* writer; the REST
+    // fallback in `query.rs` reads through these for the cold-start path but
+    // never writes back. Once `Ready` lands, REST is bypassed entirely.
+    // Caveat: `*_UPDATE` / `*_DELETE` / `*_CREATE` handlers that would keep
+    // these caches fresh over the connection's lifetime are not yet wired
+    // up, so the cache reflects the `Ready` snapshot frozen in time. That's
+    // a separate correctness gap, not a race-policy concern.
+    // This is what keeps the gateway/REST race surface narrow for non-message
+    // entities; see `crate/messenger_interface/docs/races.md` ("Cache-backed
+    // queries: gateway is the only writer").
     dm_channels: ArcSwapOption<Vec<api_types::Channel>>,
     guilds: ArcSwapOption<Vec<api_types::Guild>>,
     guild_channels: DashMap<SNOWFLAKE, Vec<api_types::Channel>>,
-    // === Tombstones ===
-    /// See [`DeletedMessageRing`].
-    deleted_message_ids: DeletedMessageRing,
     // External to internal ID mappings (TODO: Remove we can store discord IDs diractly in external
     // IDs)
     channel_id_mappings: DashMap<ID, ChannelLocation>,
@@ -196,13 +198,10 @@ struct InnerDiscord<T: UnitStruct> {
     _marker: PhantomData<T>,
 }
 impl<T: UnitStruct> InnerDiscord<T> {
-    // TODO: TOCTOU race — two concurrent `listen()` calls can both see `is_none()`,
-    // both create a gateway, and the second `store()` silently drops the first connection.
     async fn ensure_gateway(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.gateway.load().is_none() {
-            self.gateway
-                .store(Some(Arc::new(Gateway::<General>::new(self).await?)));
-        }
+        self.gateway
+            .get_or_try_init(async || Gateway::<General>::new(self).await)
+            .await?;
         Ok(())
     }
 
@@ -249,7 +248,6 @@ impl Messenger for InnerDiscord<Owned> {
             dm_channels: ArcSwapOption::empty(),
             guilds: ArcSwapOption::empty(),
             guild_channels: DashMap::new(),
-            deleted_message_ids: DeletedMessageRing::new(),
             guild_id_mappings: DashMap::new(),
             channel_id_mappings: DashMap::new(),
             message_id_mappings: DashMap::new(),

@@ -303,7 +303,7 @@ impl GatewayPayload<Opcode> {
                         // consumes this delete must still find the ID in
                         // the ring so it can be filtered. See
                         // `crate/messenger_interface/docs/races.md`.
-                        discord.deleted_message_ids.push(payload.id);
+                        gateway.deleted_message_ids.push(payload.id);
 
                         discord.text_events.push(TextEvent::MessageDeleted {
                             room: Identifier::new(payload.channel_id, ()),
@@ -317,8 +317,8 @@ impl GatewayPayload<Opcode> {
                         // case becoming "bulk of one"). At that point this
                         // handler should:
                         //   1. Iterate the bulk payload's `ids` field and
-                        //      call `discord.record_deleted_message(id)` for
-                        //      each, BEFORE emitting any TextEvent, to
+                        //      call `gateway.deleted_message_ids.push(id)`
+                        //      for each, BEFORE emitting any TextEvent, to
                         //      preserve the ordering invariant documented
                         //      in `crate/messenger_interface/docs/races.md`.
                         //   2. Emit one unified TextEvent carrying all IDs.
