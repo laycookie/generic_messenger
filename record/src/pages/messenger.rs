@@ -223,7 +223,13 @@ impl Messenger {
                                     .api
                                     .text()
                                     .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                                let msgs = text.get_messages(&conversation, None).await?;
+                                let msgs = text
+                                    .get_messages(
+                                        &conversation,
+                                        None,
+                                        messenger_interface::interface::Ordering::Time,
+                                    )
+                                    .await?;
                                 let handle = interface.handle;
 
                                 Ok((handle, conversation, msgs))

@@ -20,13 +20,14 @@ use simple_audio_channels::input::SampleConsumer;
 
 use crate::{
     api_types::SNOWFLAKE,
-    gateways::{Gateway, general::General},
+    gateways::{Gateway, general::General, general::payloads::VoiceStatePayload},
 };
 
 mod api_types;
 mod downloaders;
 mod gateways;
 mod query;
+mod rest_api;
 
 pub(crate) const DISCORD_API: &str = "https://discord.com/api/v10";
 
@@ -53,10 +54,69 @@ bitflags! {
 
 const DEFAULT_INTENTS: Intents = Intents::all();
 
-#[derive(Clone)]
-struct ChannelID {
-    guild_id: Option<SNOWFLAKE>,
-    id: SNOWFLAKE,
+bitflags! {
+    /// <https://docs.discord.food/topics/gateway#gateway-capabilities>
+    struct Capabilities: u32 {
+        /// Splits each guild's static metadata into a `properties` sub-object
+        /// in Ready/GuildCreate events. Without this, those fields are merged
+        /// flat into the guild object.
+        const CLIENT_STATE_V2 = 1 << 10;
+    }
+}
+
+const DEFAULT_CAPABILITIES: Capabilities = Capabilities::CLIENT_STATE_V2;
+
+/// Where a Discord channel lives. Splits guild vs. private so the opcode 4
+/// payload and join flow can be picked statically instead of inferring from
+/// an `Option<guild_id>` that has two meanings (DM vs "Discord didn't send").
+#[derive(Clone, Copy, Debug)]
+enum ChannelLocation {
+    Guild {
+        guild_id: SNOWFLAKE,
+        channel_id: SNOWFLAKE,
+    },
+    /// DM or GroupDM. The two are protocol-identical for voice/messaging
+    /// routing; the recipient/name distinction lives on `api_types::Channel`.
+    Private { channel_id: SNOWFLAKE },
+}
+
+impl ChannelLocation {
+    fn channel_id(&self) -> SNOWFLAKE {
+        match self {
+            Self::Guild { channel_id, .. } | Self::Private { channel_id } => *channel_id,
+        }
+    }
+
+    fn guild_id(&self) -> Option<SNOWFLAKE> {
+        match self {
+            Self::Guild { guild_id, .. } => Some(*guild_id),
+            Self::Private { .. } => None,
+        }
+    }
+
+    /// Build from a raw `api_types::Channel`. For guild channels nested
+    /// inside a Ready/GuildCreate payload, Discord omits `guild_id` — pass
+    /// the parent guild's id via `parent_guild_id` to fill it in.
+    /// Top-level events (e.g. ChannelCreate for a guild channel) include
+    /// `guild_id` themselves and can pass `None`.
+    fn from_api(
+        channel: &api_types::Channel,
+        parent_guild_id: Option<SNOWFLAKE>,
+    ) -> Option<Self> {
+        use api_types::ChannelTypes::*;
+        match channel.channel_type {
+            DM | GroupDM => Some(Self::Private {
+                channel_id: channel.id,
+            }),
+            _ => {
+                let guild_id = parent_guild_id.or(channel.guild_id)?;
+                Some(Self::Guild {
+                    guild_id,
+                    channel_id: channel.id,
+                })
+            }
+        }
+    }
 }
 type GuildID = SNOWFLAKE;
 type MessageID = SNOWFLAKE;
@@ -96,6 +156,7 @@ struct InnerDiscord<T: UnitStruct> {
     // === Metadata ===
     token: SecureString,
     intents: Intents,
+    capabilities: Capabilities,
     // Microphone
     audio_manager: AsyncMutex<AudioManager>,
     // === socket related ===
@@ -108,9 +169,15 @@ struct InnerDiscord<T: UnitStruct> {
     audio_events: SegQueue<AudioEvent>,
     // === Cached data ===
     profile: ArcSwapOption<api_types::Profile>,
+    voice_states: DashMap<SNOWFLAKE, VoiceStatePayload>,
+    // Populated from the Ready gateway event so we can serve queries without
+    // re-hitting the REST API on first paint.
+    dm_channels: ArcSwapOption<Vec<api_types::Channel>>,
+    guilds: ArcSwapOption<Vec<api_types::Guild>>,
+    guild_channels: DashMap<SNOWFLAKE, Vec<api_types::Channel>>,
     // External to internal ID mappings (TODO: Remove we can store discord IDs diractly in external
     // IDs)
-    channel_id_mappings: DashMap<ID, ChannelID>,
+    channel_id_mappings: DashMap<ID, ChannelLocation>,
     guild_id_mappings: DashMap<ID, GuildID>,
     message_id_mappings: DashMap<ID, MessageID>,
     _marker: PhantomData<T>,
@@ -156,6 +223,7 @@ impl Messenger for InnerDiscord<Owned> {
         Arc::new(InnerDiscord {
             token: auth_obj.into(),
             intents: DEFAULT_INTENTS,
+            capabilities: DEFAULT_CAPABILITIES,
             audio_manager: Default::default(),
             gateway: Default::default(),
             pulled_notification: Default::default(),
@@ -164,6 +232,10 @@ impl Messenger for InnerDiscord<Owned> {
             voice_events: SegQueue::new(),
             audio_events: SegQueue::new(),
             profile: ArcSwapOption::empty(),
+            voice_states: DashMap::new(),
+            dm_channels: ArcSwapOption::empty(),
+            guilds: ArcSwapOption::empty(),
+            guild_channels: DashMap::new(),
             guild_id_mappings: DashMap::new(),
             channel_id_mappings: DashMap::new(),
             message_id_mappings: DashMap::new(),

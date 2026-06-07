@@ -9,7 +9,7 @@ use simple_audio_channels::output::SampleProducer;
 
 pub(super) use self::gateway::Voice;
 use crate::gateways::Gateway;
-use crate::{ChannelID, api_types::SNOWFLAKE};
+use crate::{ChannelLocation, api_types::SNOWFLAKE};
 
 pub(super) mod connection;
 mod events;
@@ -127,18 +127,18 @@ pub enum VoiceGatewayStatus {
     #[default]
     Closed,
     AwaitingData {
-        channel_id: ChannelID,
+        channel: ChannelLocation,
     },
     AwaitingEndpoint {
-        channel_id: ChannelID,
+        channel: ChannelLocation,
         session_id: SessionId,
     },
     AwaitingSession {
-        channel_id: ChannelID,
+        channel: ChannelLocation,
         endpoint: Endpoint,
     },
     Ready {
-        channel_id: ChannelID,
+        channel: ChannelLocation,
         endpoint: Endpoint,
         session_id: SessionId,
     },
@@ -147,63 +147,52 @@ impl VoiceGatewayStatus {
     pub fn insert_endpoint(&mut self, endpoint: Endpoint) {
         *self = match mem::take(self) {
             Self::Closed => Self::Closed,
-            Self::AwaitingData { channel_id } => Self::AwaitingSession {
-                endpoint,
-                channel_id,
-            },
+            Self::AwaitingData { channel } => Self::AwaitingSession { endpoint, channel },
             Self::AwaitingEndpoint {
-                channel_id,
+                channel,
                 session_id,
             } => Self::Ready {
                 endpoint,
                 session_id,
-                channel_id,
+                channel,
             },
-            Self::AwaitingSession { channel_id, .. } => Self::AwaitingSession {
-                endpoint,
-                channel_id,
-            },
+            Self::AwaitingSession { channel, .. } => Self::AwaitingSession { endpoint, channel },
             Self::Ready {
                 session_id,
-                channel_id,
+                channel,
                 ..
             } => Self::Ready {
                 endpoint,
                 session_id,
-                channel_id,
+                channel,
             },
         }
     }
     pub fn insert_session_id(&mut self, session_id: SessionId) {
         *self = match mem::take(self) {
             Self::Closed => Self::Closed,
-            Self::AwaitingData { channel_id } => Self::AwaitingEndpoint {
+            Self::AwaitingData { channel } => Self::AwaitingEndpoint {
                 session_id,
-                channel_id,
+                channel,
             },
             Self::AwaitingEndpoint {
-                channel_id,
+                channel,
                 session_id,
             } => Self::AwaitingEndpoint {
-                channel_id,
+                channel,
                 session_id,
             },
-            Self::AwaitingSession {
-                channel_id,
-                endpoint,
-            } => Self::Ready {
+            Self::AwaitingSession { channel, endpoint } => Self::Ready {
                 endpoint,
                 session_id,
-                channel_id,
+                channel,
             },
             Self::Ready {
-                endpoint,
-                channel_id,
-                ..
+                endpoint, channel, ..
             } => Self::Ready {
                 endpoint,
                 session_id,
-                channel_id,
+                channel,
             },
         }
     }
@@ -215,9 +204,9 @@ pub struct VoiceGateway {
     voice_gateway: ArcSwapOption<Gateway<Voice>>,
 }
 impl VoiceGateway {
-    pub async fn initiate_connection(&self, channel_id: ChannelID) {
+    pub async fn initiate_connection(&self, channel: ChannelLocation) {
         let mut status = self.status.lock().await;
-        *status = VoiceGatewayStatus::AwaitingData { channel_id };
+        *status = VoiceGatewayStatus::AwaitingData { channel };
     }
     pub async fn replace_status(&self, new_status: VoiceGatewayStatus) {
         let mut status = self.status.lock().await;
@@ -237,12 +226,12 @@ impl VoiceGateway {
     pub async fn connect(&self, user_id: SNOWFLAKE) -> Result<(), Box<dyn Error + Send + Sync>> {
         let status = self.status.lock().await;
 
-        let (endpoint, session_id, channel_id) = match &*status {
+        let (endpoint, session_id, channel) = match &*status {
             VoiceGatewayStatus::Ready {
                 endpoint,
                 session_id,
-                channel_id,
-            } => (endpoint, session_id, channel_id),
+                channel,
+            } => (endpoint, session_id, channel),
             _ => {
                 return Err(
                     io::Error::new(io::ErrorKind::NotConnected, "voice gateway not ready").into(),
@@ -253,8 +242,8 @@ impl VoiceGateway {
         let gateway = Gateway::<Voice>::new(
             endpoint,
             session_id,
-            channel_id.guild_id,
-            channel_id.id,
+            channel.guild_id(),
+            channel.channel_id(),
             user_id,
         )
         .await?;

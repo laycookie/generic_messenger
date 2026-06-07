@@ -1,76 +1,61 @@
+//! High-level query layer.
+//!
+//! This module implements the `Query` and `Text` traits from
+//! `messenger_interface` on top of the raw REST calls in `rest_api.rs` and
+//! the cached state populated by gateway events. It is also the place where
+//! data returned to the UI gets reconciled against the cache so that
+//! HTTP results and gateway events stay coherent.
 use crate::{
-    AudioDiscord, DISCORD_API, Discord, InnerDiscord, Owned, QueryDiscord, TextDiscord,
-    VoiceDiscord,
+    AudioDiscord, Discord, InnerDiscord, Owned, QueryDiscord, TextDiscord, VoiceDiscord,
     api_types::{self, SNOWFLAKE},
-    downloaders::{cache_cdn_image, http_request},
+    downloaders::cache_cdn_image,
 };
 use async_trait::async_trait;
 use futures::future::join_all;
 use messenger_interface::{
-    interface::{AudioEvent, Query, QueryEvent, Text, TextEvent, VoiceEvent},
+    interface::{AudioEvent, Ordering, Query, QueryEvent, Text, TextEvent, VoiceEvent},
     stream::{ArcStream, WeakSocketStream},
     types::{
         CacheCategory, House, Identifier, Message, Place, Reaction, Room, RoomCapabilities, User,
     },
 };
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use tracing::error;
+use tracing::{error, warn};
 
 use std::{error::Error, sync::Arc};
 
 impl InnerDiscord<Owned> {
-    fn get_auth_header(&self) -> Vec<(&str, String)> {
-        vec![("Authorization", self.token.unsecure().to_string())]
-    }
-
-    async fn fetch_dms(
+    async fn process_dm_channels(
         &self,
-    ) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
-        // DMs / group DMs
-        let mut channels = http_request::<Vec<api_types::Channel>>(
-            surf::get(format!("{DISCORD_API}/users/@me/channels")),
-            self.get_auth_header(),
-        )
-        .await?;
-
+        channels: &[api_types::Channel],
+    ) -> Vec<Identifier<Place<Room>>> {
         // Sort by last_message_id descending (most recent first).
         // Discord snowflake IDs encode timestamps, so higher = newer.
-        channels.sort_by(|a, b| b.last_message_id.cmp(&a.last_message_id));
+        let mut sorted: Vec<&api_types::Channel> = channels.iter().collect();
+        sorted.sort_by_key(|c| std::cmp::Reverse(c.last_message_id));
 
-        let rooms_producer = channels
-            .iter()
-            .map(async move |channel| {
-                let place_room = channel.to_room_data().await;
-                Discord::identifier_generator(channel.id, place_room)
-            })
-            .collect::<Vec<_>>();
+        let rooms_producer = sorted.iter().map(async move |channel| {
+            let place_room = channel.to_room_data().await;
+            Discord::identifier_generator(channel.id, place_room)
+        });
 
         let places = join_all(rooms_producer).await;
 
-        // Cache mapping internal room id -> discord channel id
-        for (identifier, channel) in places.iter().zip(channels.iter()) {
-            self.channel_id_mappings.insert(
-                *identifier.id(),
-                super::ChannelID {
-                    guild_id: channel.guild_id,
-                    id: channel.id,
-                },
-            );
+        for (identifier, channel) in places.iter().zip(sorted.iter()) {
+            // DMs/GroupDMs have no guild; pass None for parent_guild_id.
+            if let Some(location) = super::ChannelLocation::from_api(channel, None) {
+                self.channel_id_mappings.insert(*identifier.id(), location);
+            } else {
+                warn!(
+                    "DM channel {} produced no ChannelLocation (unexpected channel_type)",
+                    channel.id
+                );
+            }
         }
 
-        Ok(places)
+        places
     }
 
-    async fn fetch_guilds(
-        &self,
-    ) -> Result<Vec<Identifier<Place<House>>>, Box<dyn Error + Sync + Send>> {
-        // Guilds / servers
-        let guilds = http_request::<Vec<api_types::Guild>>(
-            surf::get(format!("{DISCORD_API}/users/@me/guilds")),
-            self.get_auth_header(),
-        )
-        .await?;
-
+    async fn process_guilds(&self, guilds: &[api_types::Guild]) -> Vec<Identifier<Place<House>>> {
         let house_producer = guilds.iter().map(async move |guild| {
             let icon = guild.icon.as_ref().map(async move |hash| {
                 match cache_cdn_image("icons", CacheCategory::Servers, guild.id, hash).await {
@@ -81,8 +66,6 @@ impl InnerDiscord<Owned> {
                     }
                 }
             });
-
-            // let rooms = self.fetch_guild_channels(&g.id).await.unwrap_or_default();
 
             Discord::identifier_generator(
                 guild.id,
@@ -99,23 +82,18 @@ impl InnerDiscord<Owned> {
 
         let places = join_all(house_producer).await;
 
-        for (identifier, guild) in places.iter().zip(guilds) {
+        for (identifier, guild) in places.iter().zip(guilds.iter()) {
             self.guild_id_mappings.insert(*identifier.id(), guild.id);
         }
 
-        Ok(places)
+        places
     }
 
-    async fn fetch_guild_channels(
+    fn process_guild_channels(
         &self,
         guild_id: SNOWFLAKE,
-    ) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
-        let mut channels = http_request::<Vec<api_types::Channel>>(
-            surf::get(format!("{DISCORD_API}/guilds/{guild_id}/channels")),
-            self.get_auth_header(),
-        )
-        .await?;
-
+        channels: &[api_types::Channel],
+    ) -> Vec<Identifier<Place<Room>>> {
         // Build category position lookup: category_id → position
         let category_positions: std::collections::HashMap<SNOWFLAKE, i32> = channels
             .iter()
@@ -126,7 +104,8 @@ impl InnerDiscord<Owned> {
         // Sort: categories first by position, then children grouped under
         // their parent category and sorted by their own position.
         // Channels without a parent sort to the top.
-        channels.sort_by_key(|channel| {
+        let mut sorted: Vec<&api_types::Channel> = channels.iter().collect();
+        sorted.sort_by_key(|channel| {
             let own_pos = channel.position.unwrap_or(0);
             let is_category =
                 matches!(channel.channel_type, api_types::ChannelTypes::GuildCategory);
@@ -152,7 +131,7 @@ impl InnerDiscord<Owned> {
             }
         });
 
-        Ok(channels
+        sorted
             .into_iter()
             .filter_map(|channel| {
                 if channel
@@ -184,28 +163,17 @@ impl InnerDiscord<Owned> {
                         ),
                     ),
                 );
-                self.channel_id_mappings.insert(
-                    *identifier.id(),
-                    crate::ChannelID {
-                        guild_id: channel.guild_id,
-                        id: channel.id,
-                    },
-                );
+                // Discord omits guild_id on channels nested in Ready/
+                // GuildCreate payloads, so pass the parent guild_id in.
+                if let Some(location) = crate::ChannelLocation::from_api(channel, Some(guild_id)) {
+                    self.channel_id_mappings.insert(*identifier.id(), location);
+                }
                 Some(identifier)
             })
-            .collect::<Vec<_>>())
+            .collect::<Vec<_>>()
     }
-}
 
-#[async_trait]
-impl Query for InnerDiscord<Owned> {
-    async fn client_user(&self) -> Result<Identifier<User>, Box<dyn Error + Sync + Send>> {
-        let profile = http_request::<api_types::Profile>(
-            surf::get(format!("{DISCORD_API}/users/@me")),
-            self.get_auth_header(),
-        )
-        .await?;
-
+    async fn process_profile(&self, profile: &api_types::Profile) -> Identifier<User> {
         let icon = match &profile.avatar {
             Some(hash) => cache_cdn_image("avatars", CacheCategory::Users, profile.id, hash)
                 .await
@@ -213,25 +181,28 @@ impl Query for InnerDiscord<Owned> {
             None => None,
         };
 
-        let prof = Discord::identifier_generator(
+        Discord::identifier_generator(
             profile.id,
             User {
                 name: profile.username.clone(),
                 icon,
             },
-        );
+        )
+    }
+}
 
-        self.profile.store(Some(Arc::new(profile)));
-
-        Ok(prof)
+#[async_trait]
+impl Query for InnerDiscord<Owned> {
+    async fn client_user(&self) -> Result<Identifier<User>, Box<dyn Error + Sync + Send>> {
+        if let Some(profile) = self.profile.load_full() {
+            return Ok(self.process_profile(&profile).await);
+        }
+        let profile = self.rest_get_profile().await?;
+        Ok(self.process_profile(&profile).await)
     }
 
     async fn contacts(&self) -> Result<Vec<Identifier<User>>, Box<dyn Error + Sync + Send>> {
-        let friends = http_request::<Vec<api_types::Friend>>(
-            surf::get(format!("{DISCORD_API}/users/@me/relationships")),
-            self.get_auth_header(),
-        )
-        .await?;
+        let friends = self.rest_get_contacts().await?;
 
         let contact_producer = friends
             .iter()
@@ -257,11 +228,19 @@ impl Query for InnerDiscord<Owned> {
     }
 
     async fn rooms(&self) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
-        self.fetch_dms().await
+        if let Some(cached) = self.dm_channels.load_full() {
+            return Ok(self.process_dm_channels(&cached).await);
+        }
+        let channels = self.rest_get_dms().await?;
+        Ok(self.process_dm_channels(&channels).await)
     }
 
     async fn houses(&self) -> Result<Vec<Identifier<Place<House>>>, Box<dyn Error + Sync + Send>> {
-        self.fetch_guilds().await
+        if let Some(cached) = self.guilds.load_full() {
+            return Ok(self.process_guilds(&cached).await);
+        }
+        let guilds = self.rest_get_guilds().await?;
+        Ok(self.process_guilds(&guilds).await)
     }
 
     // TODO: Implement room_details and house_details if needed
@@ -275,7 +254,16 @@ impl Query for InnerDiscord<Owned> {
             .guild_id_mappings
             .get(house.id())
             .ok_or("No discord guild id mapping for this house")?;
-        let rooms = self.fetch_guild_channels(guild_id).await.unwrap_or_default();
+
+        let rooms = if let Some(cached) = self.guild_channels.get(&guild_id) {
+            self.process_guild_channels(guild_id, &cached)
+        } else {
+            self.rest_get_guild_channels(guild_id)
+                .await
+                .map(|channels| self.process_guild_channels(guild_id, &channels))
+                .unwrap_or_default()
+        };
+
         Ok(House::new(Some(rooms)))
     }
     async fn listen(
@@ -291,34 +279,35 @@ impl Text for InnerDiscord<Owned> {
         &self,
         location: &Identifier<Place<Room>>,
         load_messages_before: Option<Identifier<Message>>,
+        ordering: Ordering,
     ) -> Result<Vec<Identifier<Message>>, Box<dyn Error + Sync + Send>> {
-        let channel_id = self
+        let channel_location = *self
             .channel_id_mappings
             .get(location.id())
-            .ok_or("No discord channel id mapping for this room")?
-            .clone();
+            .ok_or("No discord channel id mapping for this room")?;
 
         let before = match load_messages_before {
-            Some(msg) => {
-                let msg_id = *self
+            Some(msg) => Some(
+                *self
                     .message_id_mappings
                     .get(msg.id())
-                    .ok_or("No discord message id mapping for before-pagination")?;
-                format!("?before={msg_id}")
-            }
-            None => String::new(),
+                    .ok_or("No discord message id mapping for before-pagination")?,
+            ),
+            None => None,
         };
 
-        let messages = http_request::<Vec<api_types::Message>>(
-            surf::get(format!(
-                "{DISCORD_API}/channels/{}/messages{before}",
-                channel_id.id,
-            )),
-            self.get_auth_header(),
-        )
-        .await?;
+        let messages = self
+            .rest_get_messages(channel_location.channel_id(), before)
+            .await?;
 
-        let identifiers = join_all(messages.into_iter().rev().map(async |message| {
+        // Discord returns messages newest-first. For `Ordering::Time` we
+        // reverse so callers get oldest-first; `Unordered` keeps the
+        // newest-first arrival order.
+        let messages_iter: Box<dyn Iterator<Item = api_types::Message> + Send> = match ordering {
+            Ordering::Time => Box::new(messages.into_iter().rev()),
+            Ordering::Unordered => Box::new(messages.into_iter()),
+        };
+        let identifiers = join_all(messages_iter.map(async |message| {
             let reactions = message
                 .reactions
                 .unwrap_or(Vec::new())
@@ -369,98 +358,55 @@ impl Text for InnerDiscord<Owned> {
             .collect())
     }
 
-    // Docs: https://discord.com/developers/docs/resources/message#create-reaction
     async fn add_reaction(
         &self,
         location: &Identifier<Place<Room>>,
         message: &Identifier<Message>,
         emoji: &str,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let channel_id = self
+        let channel_location = *self
             .channel_id_mappings
             .get(location.id())
-            .ok_or("No discord channel id mapping for this room")?
-            .clone();
+            .ok_or("No discord channel id mapping for this room")?;
         let msg_id = *self
             .message_id_mappings
             .get(message.id())
             .ok_or("No discord message id mapping")?;
-        let encoded_emoji = utf8_percent_encode(emoji, NON_ALPHANUMERIC);
-        let url = format!(
-            "{DISCORD_API}/channels/{}/messages/{msg_id}/reactions/{encoded_emoji}/@me",
-            channel_id.id,
-        );
-        let mut req = surf::put(&url);
-        for (key, value) in self.get_auth_header() {
-            req = req.header(key, value);
-        }
-        let res = req.send().await?;
-        if !res.status().is_success() {
-            return Err(surf::Error::from_str(res.status(), "Failed to add reaction").into());
-        }
-        Ok(())
+        self.rest_add_reaction(channel_location.channel_id(), msg_id, emoji)
+            .await
     }
 
-    // Docs: https://discord.com/developers/docs/resources/message#delete-own-reaction
     async fn remove_reaction(
         &self,
         location: &Identifier<Place<Room>>,
         message: &Identifier<Message>,
         emoji: &str,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let channel_id = self
+        let channel_location = *self
             .channel_id_mappings
             .get(location.id())
-            .ok_or("No discord channel id mapping for this room")?
-            .clone();
+            .ok_or("No discord channel id mapping for this room")?;
         let msg_id = *self
             .message_id_mappings
             .get(message.id())
             .ok_or("No discord message id mapping")?;
-        let encoded_emoji = utf8_percent_encode(emoji, NON_ALPHANUMERIC);
-        let url = format!(
-            "{DISCORD_API}/channels/{}/messages/{msg_id}/reactions/{encoded_emoji}/@me",
-            channel_id.id,
-        );
-        let mut req = surf::delete(&url);
-        for (key, value) in self.get_auth_header() {
-            req = req.header(key, value);
-        }
-        let res = req.send().await?;
-        if !res.status().is_success() {
-            return Err(surf::Error::from_str(res.status(), "Failed to remove reaction").into());
-        }
-        Ok(())
+        self.rest_remove_reaction(channel_location.channel_id(), msg_id, emoji)
+            .await
     }
 
-    // Docs: https://discord.com/developers/docs/resources/message#create-message
     async fn send_message(
         &self,
         location: &Identifier<Place<Room>>,
         contents: Message,
     ) -> Result<Identifier<Message>, Box<dyn Error + Sync + Send>> {
-        let channel_id = self
+        let channel_location = *self
             .channel_id_mappings
             .get(location.id())
-            .ok_or("No discord channel id mapping for this room")?
-            .clone();
+            .ok_or("No discord channel id mapping for this room")?;
 
-        let message = api_types::CreateMessage {
-            content: Some(contents.text),
-            nonce: None,
-            enforce_nonce: None,
-            tts: Some(false),
-            flags: Some(0),
-        };
-        let msg_string = facet_json::to_vec(&message)?;
-
-        let msg = http_request::<api_types::Message>(
-            surf::post(format!("{DISCORD_API}/channels/{}/messages", channel_id.id,))
-                .body(msg_string)
-                .content_type("application/json"),
-            self.get_auth_header(),
-        )
-        .await?;
+        let msg = self
+            .rest_send_message(channel_location.channel_id(), contents.text)
+            .await?;
 
         let icon = match &msg.author.avatar {
             Some(hash) => cache_cdn_image("avatars", CacheCategory::Users, msg.author.id, hash)

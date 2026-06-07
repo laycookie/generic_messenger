@@ -274,7 +274,11 @@ impl VoiceTrait for InnerDiscord<Owned> {
             None => {
                 // TODO(discord-migration): ensure all Rooms returned by Query have a mapping,
                 // and support guild voice channels too.
-                warn!("Tried to connect voice for a Room without a discord channel mapping");
+                warn!(
+                    "Tried to connect voice for a Room without a discord channel mapping: room_id={:?}, cache_size={}",
+                    location.id(),
+                    self.channel_id_mappings.len()
+                );
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "no channel mapping for this room",
@@ -283,17 +287,23 @@ impl VoiceTrait for InnerDiscord<Owned> {
             }
         };
 
-        gateway.voice.initiate_connection(channel.clone()).await;
+        debug!(
+            "Voice connect: room_id={:?} → {channel:?}",
+            location.id()
+        );
+
+        gateway.voice.initiate_connection(channel).await;
 
         let payload = json!({
             "op": Opcode::VoiceStateUpdate as u8,
             "d": {
-                "guild_id": channel.guild_id,
-                "channel_id": channel.id,
+                "guild_id": channel.guild_id(),
+                "channel_id": channel.channel_id(),
                 "self_mute": false,
                 "self_deaf": false
               }
         });
+        debug!("Sending opcode 4 (VoiceStateUpdate): {}", payload);
 
         if let Err(err) = gateway.websocket.send(payload.to_string().into()).await {
             gateway.voice.disconnect().await;
@@ -323,7 +333,7 @@ impl VoiceTrait for InnerDiscord<Owned> {
         let payload = json!({
             "op": Opcode::VoiceStateUpdate as u8,
             "d": {
-                "guild_id": channel.guild_id,
+                "guild_id": channel.guild_id(),
                 "channel_id": null,
                 "self_mute": false,
                 "self_deaf": false

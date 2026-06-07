@@ -1,4 +1,4 @@
-use crate::api_types::{SNOWFLAKE, User};
+use crate::api_types::{self, SNOWFLAKE, User};
 use facet::Facet;
 
 #[derive(Facet)]
@@ -23,7 +23,7 @@ pub(super) struct ReadyPayload {
     pub(super) relationships: Option<Vec<facet_value::Value>>,
     pub(super) game_relationships: Option<Vec<facet_value::Value>>,
     pub(super) friend_suggestion_count: Option<u64>,
-    pub(super) private_channels: Option<Vec<facet_value::Value>>,
+    pub(super) private_channels: Option<Vec<api_types::Channel>>,
     pub(super) connected_accounts: Option<Vec<facet_value::Value>>,
     pub(super) notes: Option<facet_value::Value>,
     pub(super) presences: Option<Vec<facet_value::Value>>,
@@ -74,7 +74,7 @@ pub(super) struct ReadyGuildPayload {
     pub(super) geo_restricted: Option<bool>,
     pub(super) member_count: Option<u64>,
     pub(super) members: Option<Vec<VoiceStateMemberPayload>>,
-    pub(super) channels: Option<Vec<facet_value::Value>>,
+    pub(super) channels: Option<Vec<api_types::Channel>>,
     pub(super) threads: Option<Vec<facet_value::Value>>,
     pub(super) presences: Option<Vec<facet_value::Value>>,
     pub(super) voice_states: Option<Vec<VoiceStatePayload>>,
@@ -82,7 +82,7 @@ pub(super) struct ReadyGuildPayload {
     pub(super) stage_instances: Option<Vec<facet_value::Value>>,
     pub(super) guild_scheduled_events: Option<Vec<facet_value::Value>>,
     pub(super) data_mode: Option<String>,
-    pub(super) properties: Option<facet_value::Value>,
+    pub(super) properties: Option<api_types::Guild>,
     pub(super) stickers: Option<Vec<facet_value::Value>>,
     pub(super) roles: Option<Vec<facet_value::Value>>,
     pub(super) emojis: Option<Vec<facet_value::Value>>,
@@ -100,28 +100,28 @@ pub struct VoiceServerUpdatePayload {
 
 /// <https://docs.discord.food/resources/voice#voice-state-structure>
 #[derive(Facet)]
-pub(super) struct VoiceStatePayload {
-    pub(super) guild_id: Option<String>,
-    pub(super) channel_id: Option<SNOWFLAKE>,
-    pub(super) lobby_id: Option<String>,
-    pub(super) user_id: SNOWFLAKE,
-    pub(super) member: Option<VoiceStateMemberPayload>,
-    pub(super) session_id: String,
-    pub(super) deaf: bool,
-    pub(super) mute: bool,
-    pub(super) self_deaf: bool,
-    pub(super) self_mute: bool,
-    pub(super) self_stream: Option<bool>,
-    pub(super) self_video: bool,
-    pub(super) suppress: bool,
+pub(crate) struct VoiceStatePayload {
+    pub(crate) guild_id: Option<SNOWFLAKE>,
+    pub(crate) channel_id: Option<SNOWFLAKE>,
+    pub(crate) lobby_id: Option<String>,
+    pub(crate) user_id: SNOWFLAKE,
+    pub(crate) member: Option<VoiceStateMemberPayload>,
+    pub(crate) session_id: String,
+    pub(crate) deaf: bool,
+    pub(crate) mute: bool,
+    pub(crate) self_deaf: bool,
+    pub(crate) self_mute: bool,
+    pub(crate) self_stream: Option<bool>,
+    pub(crate) self_video: bool,
+    pub(crate) suppress: bool,
     // request_to_speak_timestamp: ?
-    pub(super) discoverable: Option<bool>,
-    pub(super) user_volume: Option<f32>,
+    pub(crate) discoverable: Option<bool>,
+    pub(crate) user_volume: Option<f32>,
 }
 
 #[derive(Facet)]
-pub(super) struct VoiceStateMemberPayload {
-    pub(super) user: User,
+pub(crate) struct VoiceStateMemberPayload {
+    pub(crate) user: User,
 }
 
 /// https://docs.discord.food/resources/presence#session-object

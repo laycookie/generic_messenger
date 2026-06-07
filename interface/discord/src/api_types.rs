@@ -74,23 +74,24 @@ pub(crate) struct OverwriteObject {
     pub(crate) deny: String,
 }
 
+/// <https://discord.com/developers/docs/resources/channel#channel-object-channel-types>
 #[derive(Facet, Clone, Copy)]
 #[facet(is_numeric)]
 #[repr(u8)]
 pub enum ChannelTypes {
-    GuildText,
-    DM,
-    GuildVoice,
-    GroupDM,
-    GuildCategory,
-    GuildAnnouncement,
-    AnnouncementThread,
-    PublicThread,
-    PrivateThread,
-    GuildStageVoice,
-    GuildDirectory,
-    GuildForum,
-    GuildMedia,
+    GuildText = 0,
+    DM = 1,
+    GuildVoice = 2,
+    GroupDM = 3,
+    GuildCategory = 4,
+    GuildAnnouncement = 5,
+    AnnouncementThread = 10,
+    PublicThread = 11,
+    PrivateThread = 12,
+    GuildStageVoice = 13,
+    GuildDirectory = 14,
+    GuildForum = 15,
+    GuildMedia = 16,
 }
 impl From<ChannelTypes> for RoomCapabilities {
     fn from(val: ChannelTypes) -> Self {

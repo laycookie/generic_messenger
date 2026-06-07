@@ -148,7 +148,6 @@ pub trait Query: Send + Sync {
     async fn rooms(&self) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
     }
-
     /// Fetch all houses/servers/guilds available to the client.
     async fn houses(&self) -> Result<Vec<Identifier<Place<House>>>, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
@@ -174,15 +173,33 @@ pub trait Query: Send + Sync {
     }
 }
 
+/// Ordering requested by a caller of [`Text::get_messages`].
+///
+/// Adapters that do not care about the distinction may treat both variants
+/// the same. The intent is to let callers that *do* care opt into a stronger
+/// guarantee without forcing every adapter to sort eagerly when the cost is
+/// non-trivial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ordering {
+    /// No ordering guarantee. The adapter returns messages in whatever order is
+    /// cheapest (typically the order the backend returned them).
+    Unordered,
+    /// Messages are returned sorted oldest-first by their creation time.
+    /// Adapters whose IDs encode a timestamp (e.g. Discord snowflakes) should
+    /// sort by ID; others should sort by an equivalent timestamp field.
+    Time,
+}
+
 /// Text chat API for reading/sending messages in a room/channel.
 #[async_trait]
 pub trait Text: Send + Sync {
     /// Load messages in `location`, optionally paginating older messages by passing
-    /// `load_messages_before`.
+    /// `load_messages_before`. `ordering` selects how the returned vector is sorted.
     async fn get_messages(
         &self,
         location: &Identifier<Place<Room>>,
         load_messages_before: Option<Identifier<Message>>,
+        ordering: Ordering,
     ) -> Result<Vec<Identifier<Message>>, Box<dyn Error + Sync + Send>>;
 
     /// Add a reaction to a message.

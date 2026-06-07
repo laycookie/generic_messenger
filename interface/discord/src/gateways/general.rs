@@ -16,7 +16,7 @@ use crate::{
 };
 
 mod events;
-mod payloads;
+pub(crate) mod payloads;
 
 // Implementation of:
 // https://discord.com/developers/docs/events/gateway
@@ -62,6 +62,7 @@ pub enum GatewayEvent {
     ChannelPinsUpdate,
     CallCreate,
     CallUpdate,
+    CallDelete,
     ThreadCreate,
     ThreadUpdate,
     ThreadDelete,
@@ -137,6 +138,7 @@ impl Gateway<General> {
                     "d": {
                         "token": token,
                         "intents": discord.intents.bits(),
+                        "capabilities": discord.capabilities.bits(),
                         "properties": {
                             "$os": "Linux",
                             "$browser": "Firefox",

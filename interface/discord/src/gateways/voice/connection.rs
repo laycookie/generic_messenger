@@ -1,3 +1,14 @@
+//! Discord voice connection: RTP send/receive over UDP.
+//!
+//! Relevant RFCs (referenced by name throughout this file):
+//! - [RFC 3550] — RTP: A Transport Protocol for Real-Time Applications
+//! - [RFC 5285] — A General Mechanism for RTP Header Extensions
+//! - [RFC 6464] — RTP Header Extension for Client-to-Mixer Audio Level Indication
+//!
+//! [RFC 3550]: https://datatracker.ietf.org/doc/html/rfc3550
+//! [RFC 5285]: https://datatracker.ietf.org/doc/html/rfc5285
+//! [RFC 6464]: https://datatracker.ietf.org/doc/html/rfc6464
+
 use std::{error::Error, io, sync::OnceLock, time::Instant};
 
 use dashmap::DashMap;
@@ -32,6 +43,41 @@ pub const VOICE_FREQUENCY: usize = 48_000;
 pub const VOICE_CHANNELS: usize = 2; // Stereo
 pub const VOICE_FRAME_SAMPLES: usize = 960 * VOICE_CHANNELS;
 
+const RTP_HEADER_LEN: usize = 12;
+
+/// RFC 5285 extension elements Discord emits on Opus voice packets.
+/// Discriminants are the RFC 5285 element IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum RtpExtension {
+    /// RFC 6464 audio level indication.
+    AudioLevel = 1,
+    /// Discord-specific (purpose unconfirmed; possibly timing).
+    Timecode = 3,
+    /// Discord-specific (purpose unconfirmed; possibly channel info).
+    Channels = 9,
+}
+
+impl RtpExtension {
+    const fn from_id(id: u8) -> Option<Self> {
+        Some(match id {
+            1 => Self::AudioLevel,
+            3 => Self::Timecode,
+            9 => Self::Channels,
+            _ => return None,
+        })
+    }
+
+    /// Expected size of the data portion (excluding the sub-header byte).
+    const fn expected_data_len(self) -> usize {
+        match self {
+            Self::AudioLevel => 1,
+            Self::Timecode => 3,
+            Self::Channels => 1,
+        }
+    }
+}
+
 pub struct RecvAudioFuture<'a> {
     udp: &'a UdpSocket,
     description: &'a SessionDescription,
@@ -52,8 +98,8 @@ impl RecvAudioFuture<'_> {
         match PacketClass::classify(rtp_packet_buf[1]) {
             PacketClass::Rtcp(rtcp_type) => return Ok(UdpPacket::Rtcp(rtcp_type)),
             PacketClass::Rtp { payload_type, .. } if payload_type != OPUS_PAYLOAD_TYPE => {
-                let ssrc = if rtp_packet_buf.len() >= 12 {
-                    u32::from_be_bytes(rtp_packet_buf[8..12].try_into().unwrap())
+                let ssrc = if rtp_packet_buf.len() >= RTP_HEADER_LEN {
+                    u32::from_be_bytes(rtp_packet_buf[8..RTP_HEADER_LEN].try_into().unwrap())
                 } else {
                     0
                 };
@@ -111,34 +157,104 @@ impl RecvAudioFuture<'_> {
             EncryptionMode::xsalsa20_poly1305_lite_rtpsize => unimplemented!("Deprecated"),
         };
 
-        // <https://datatracker.ietf.org/doc/html/rfc6464>
-        if decrypted_payload.len() < 8 {
+        // RFC 5285 one-byte RTP header extensions live at the start of the
+        // decrypted payload. The block size is given by the length field
+        // (in 32-bit words) of the 0xBEDE preamble — the last 2 bytes of
+        // rtp_header when the X bit is set.
+        // Each sub-header byte encodes ID:4 | (length-1):4 followed by
+        // `length` bytes of data. ID=0 is alignment padding; ID=15 is
+        // reserved and terminates parsing.
+        let ext_size_bytes = if is_rtp_extended {
+            // The last 4 bytes of rtp_header are the RFC 5285 extension
+            // preamble: profile (2 bytes) + length-in-32-bit-words (2 bytes).
+            let &[profile_hi, profile_lo, length_hi, length_lo] = rtp_header
+                .last_chunk::<4>()
+                .expect("X bit set ⇒ rtp_header includes the 4-byte preamble");
+            let ext_profile = u16::from_be_bytes([profile_hi, profile_lo]);
+            let ext_length_words = u16::from_be_bytes([length_hi, length_lo]);
+            if ext_profile != 0xBEDE {
+                trace!(
+                    "RTP extension profile {ext_profile:#06x} is not RFC 5285 one-byte form (0xBEDE); parser may yield garbage"
+                );
+            }
+            usize::from(ext_length_words) * 4
+        } else {
+            0
+        };
+        if decrypted_payload.len() < ext_size_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "decrypted payload too short for RTP extension header",
+                format!(
+                    "decrypted payload {} bytes < declared RTP extension size {ext_size_bytes}",
+                    decrypted_payload.len()
+                ),
             )
             .into());
         }
-        let (potentially, voice_data) = decrypted_payload.split_at(8);
-        let unknown_const = &potentially[..1]; // CONST 55
-        // let timecode = &potentially[1..4]; // Timecode
-        let unknown_const_2 = &potentially[4..5]; // CONST 16
-        // let average_volume = &potentially[5..6]; // Average volume of the frame?
-        let unknown_const_3 = &potentially[6..7]; // CONST 144
-        let _channels = &potentially[7]; // Channels?
-        if unknown_const != [50] {
-            trace!("RTP extension byte 0 unexpected: {:?}", unknown_const);
-        }
-        if unknown_const_2 != [16] {
-            trace!("RTP extension byte 4 unexpected: {:?}", unknown_const_2);
-        }
-        if unknown_const_3 != [144] {
-            trace!("RTP extension byte 6 unexpected: {:?}", unknown_const_3);
-        }
+        let (rtp_extensions, voice_data) = decrypted_payload.split_at(ext_size_bytes);
 
+        let mut timecode = None; // ID=3, Discord-specific (purpose unconfirmed)
+        let mut audio_level = None; // ID=1, RFC 6464: V:1 | level:7
+        let mut channels = None; // ID=9, Discord-specific (purpose unconfirmed)
+        let mut cursor = rtp_extensions;
+        while !cursor.is_empty() {
+            let subheader = cursor[0];
+            let id = subheader >> 4;
+            if id == 0 {
+                // alignment padding per RFC 5285 §4.2
+                cursor = &cursor[1..];
+                continue;
+            }
+            if id == 15 {
+                // reserved; terminates extension processing per RFC 5285 §4.2
+                // Maybe consider just erroring here, if we get an invalide RTP header?
+                break;
+            }
+            let data_len = ((subheader & 0x0F) as usize) + 1;
+            let total_len = 1 + data_len;
+            if total_len > cursor.len() {
+                trace!(
+                    "Truncated RFC 5285 sub-header: ID={id} claims {data_len} data bytes, only {} available",
+                    cursor.len() - 1
+                );
+                break;
+            }
+            let data = &cursor[1..total_len];
+            match RtpExtension::from_id(id) {
+                Some(ext) if ext.expected_data_len() == data_len => match ext {
+                    RtpExtension::AudioLevel => audio_level = Some(data[0]),
+                    RtpExtension::Timecode => timecode = Some(data),
+                    RtpExtension::Channels => channels = Some(data[0]),
+                },
+                Some(ext) => trace!(
+                    "RFC 5285 sub-header {ext:?}: expected {} data bytes, got {data_len}",
+                    ext.expected_data_len()
+                ),
+                None => {
+                    trace!("Unknown RFC 5285 sub-header: ID={id}, len={data_len}, data={data:02x?}")
+                }
+            }
+            cursor = &cursor[total_len..];
+        }
+        trace!(
+            "RTP extensions parsed: timecode={timecode:02x?} audio_level={audio_level:?} channels={channels:?}"
+        );
+
+        // RTP padding per RFC 3550 §5.1: when the P bit is set, the last
+        // octet of the payload counts padding bytes (including itself).
         let voice_data = if rtp_packet.get_padding() == 1
             && let Some(last_byte) = voice_data.last()
         {
+            // TODO: overflow was previously reported here. Now that the
+            // extension block is sized from the preamble, any remaining
+            // overflow means Discord set the P bit without real RFC 3550
+            // padding bytes. Use checked_sub to drop the packet rather
+            // than panic if this still triggers.
+            trace!(
+                "RTP padding strip: voice_data.len()={}, padding_count={}",
+                voice_data.len(),
+                last_byte
+            );
             &voice_data[..voice_data.len() - *last_byte as usize]
         } else {
             voice_data
@@ -258,13 +374,12 @@ impl SendAudioFuture<'_> {
         self.sequence += 1;
         self.last_send_time = Some(now);
 
-        const RTP_HEADER_LEN: usize = 12;
-        let rtp_header = &mut self.rtp_packet_buf[0..12];
+        let rtp_header = &mut self.rtp_packet_buf[0..RTP_HEADER_LEN];
         rtp_header[0] = 0x80;
         rtp_header[1] = OPUS_PAYLOAD_TYPE;
         rtp_header[2..4].copy_from_slice(&u16::from(sequence).to_be_bytes());
         rtp_header[4..8].copy_from_slice(&u32::from(timestamp).to_be_bytes());
-        rtp_header[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
+        rtp_header[8..RTP_HEADER_LEN].copy_from_slice(&self.ssrc.to_be_bytes());
 
         match mode {
             EncryptionMode::aead_xchacha20_poly1305_rtpsize => {
