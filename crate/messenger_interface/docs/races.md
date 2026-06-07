@@ -112,21 +112,31 @@ typically sub-second. Anything Discord deleted longer ago than that would
 also be reflected in Discord's HTTP view, so the tombstone is no longer
 load-bearing.
 
-Implementation: a bounded ring buffer, FIFO eviction (oldest entries removed
-when full). For messages specifically:
+Implementation: a lock-free atomic ring with overwrite-on-push, provided
+by the workspace's `overwrite-ring` crate (`crate/overwrite_ring`). For
+messages specifically:
 
 ```rust
-deleted_message_ids: std::sync::Mutex<VecDeque<SNOWFLAKE>>  // cap 100
+type DeletedMessageRing = overwrite_ring::Ring<SNOWFLAKE, 100>;
 ```
 
-The cap of **100** matches Discord's `MESSAGE_DELETE_BULK` per-event size, so
-a single bulk-delete event fits exactly without eviction pressure. Larger
-purges chain multiple bulk events; older entries will be evicted, but by the
-time eviction happens (~100 newer deletes ago), Discord's HTTP view has
-near-certainly caught up.
+The cap of **100** matches Discord's `MESSAGE_DELETE_BULK` per-event size,
+so a single bulk-delete event fits exactly. Larger purges chain multiple
+bulk events; older entries will be overwritten, but by the time that
+happens (~100 newer deletes ago), Discord's HTTP view has near-certainly
+caught up.
 
-Lookups iterate from the back (newest first) so the common case — a recent
-delete matching an in-flight HTTP response — short-circuits quickly.
+`Ring::push` is a single `fetch_add` on the head index plus an atomic
+store into the resulting slot — no conditional eviction branch, the
+modulo handles overflow. `Ring::contains` loads every slot atomically;
+at this size it's cache-friendly and the order in which slots are
+scanned doesn't matter. Slot value `T::default()` (here `0u64`) is the
+never-written sentinel; real Discord snowflakes are non-zero, so this
+can't collide with a live ID.
+
+The same `Ring<T, CAP>` type will be reused for the future per-entity
+tombstone rings (channels, guilds, relationships) — see "open issues"
+below.
 
 **Ordering invariant in the event handler:** push to the tombstone ring
 **before** pushing the corresponding `TextEvent::MessageDeleted` to the

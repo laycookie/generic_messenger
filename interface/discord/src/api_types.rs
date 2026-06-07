@@ -1,5 +1,8 @@
+use chrono::{DateTime, Utc};
 use facet::Facet;
-use messenger_interface::types::{CacheCategory, Identifier, Place, Room, RoomCapabilities};
+use messenger_interface::types::{
+    CacheCategory, Identifier, Place, Revision, Room, RoomCapabilities,
+};
 use tracing::error;
 
 use crate::downloaders::cache_cdn_image;
@@ -229,7 +232,7 @@ pub struct Message {
     pub channel_id: SNOWFLAKE,
     // components: Vec<String>,
     pub content: String,
-    // edited_timestamp: Option<String>,
+    pub edited_timestamp: Option<String>,
     // embeds: Vec<u32>,
     // flags: u32,
     pub id: SNOWFLAKE,
@@ -238,9 +241,50 @@ pub struct Message {
     // mentions: Vec<String>,
     // pinned: bool,
     pub reactions: Option<Vec<Reaction>>,
-    // timestamp: String,
+    pub timestamp: String,
     // tts: bool,
     // type: u32,
+}
+
+impl Message {
+    /// Split this Discord message into `(content, history)` for the
+    /// `messenger_interface::types::Message` fields.
+    ///
+    /// Discord's REST and gateway payloads expose `timestamp` (creation
+    /// time) and `edited_timestamp` (last-edit time, present only if the
+    /// message has ever been edited), but they don't surface the original
+    /// *content* of an edited message. So when `edited_timestamp` is
+    /// present, we populate `history` with a single placeholder revision
+    /// whose `text` is empty — enough to drive the UI's "edited"
+    /// indicator while being honest that we don't know what the message
+    /// used to say.
+    pub fn revisions(&self) -> (Revision, Vec<Revision>) {
+        let parse = |s: &str| {
+            DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        };
+        let created_at = parse(&self.timestamp);
+        match self.edited_timestamp.as_deref().and_then(parse) {
+            Some(edit_at) => (
+                Revision {
+                    at: Some(edit_at),
+                    text: self.content.clone(),
+                },
+                vec![Revision {
+                    at: created_at,
+                    text: String::new(),
+                }],
+            ),
+            None => (
+                Revision {
+                    at: created_at,
+                    text: self.content.clone(),
+                },
+                Vec::new(),
+            ),
+        }
+    }
 }
 
 // https://discord.com/developers/docs/resources/message#create-message-jsonform-params

@@ -88,6 +88,7 @@ pub enum GatewayEvent {
     MessageCreate,
     MessageUpdate,
     MessageDelete,
+    MessageDeleteBulk,
     MessageReactionAdd,
     MessageReactionRemove,
 }

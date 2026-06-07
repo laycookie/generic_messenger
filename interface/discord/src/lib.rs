@@ -15,6 +15,7 @@ use messenger_interface::{
     stream::{ArcStream, WeakSocketStream},
     types::{ID, Identifier},
 };
+use overwrite_ring::Ring;
 use secure_string::SecureString;
 use simple_audio_channels::input::SampleConsumer;
 
@@ -66,6 +67,18 @@ bitflags! {
 
 const DEFAULT_CAPABILITIES: Capabilities = Capabilities::CLIENT_STATE_V2;
 
+/// Capacity of the deleted-message tombstone ring. Matches Discord's
+/// `MESSAGE_DELETE_BULK` per-event cap, so a single bulk event fits exactly.
+/// See `crate/messenger_interface/docs/races.md` for the rationale.
+const MESSAGE_DELETE_TOMBSTONE_CAP: usize = 100;
+
+/// Tombstone ring of recently-deleted message IDs.
+///
+/// The slot sentinel is `0` (via `u64`'s `Default`); real Discord
+/// snowflakes are non-zero, so this can't collide with a live ID.
+/// See `crate/messenger_interface/docs/races.md`.
+type DeletedMessageRing = Ring<SNOWFLAKE, MESSAGE_DELETE_TOMBSTONE_CAP>;
+
 /// Where a Discord channel lives. Splits guild vs. private so the opcode 4
 /// payload and join flow can be picked statically instead of inferring from
 /// an `Option<guild_id>` that has two meanings (DM vs "Discord didn't send").
@@ -99,10 +112,7 @@ impl ChannelLocation {
     /// the parent guild's id via `parent_guild_id` to fill it in.
     /// Top-level events (e.g. ChannelCreate for a guild channel) include
     /// `guild_id` themselves and can pass `None`.
-    fn from_api(
-        channel: &api_types::Channel,
-        parent_guild_id: Option<SNOWFLAKE>,
-    ) -> Option<Self> {
+    fn from_api(channel: &api_types::Channel, parent_guild_id: Option<SNOWFLAKE>) -> Option<Self> {
         use api_types::ChannelTypes::*;
         match channel.channel_type {
             DM | GroupDM => Some(Self::Private {
@@ -175,6 +185,9 @@ struct InnerDiscord<T: UnitStruct> {
     dm_channels: ArcSwapOption<Vec<api_types::Channel>>,
     guilds: ArcSwapOption<Vec<api_types::Guild>>,
     guild_channels: DashMap<SNOWFLAKE, Vec<api_types::Channel>>,
+    // === Tombstones ===
+    /// See [`DeletedMessageRing`].
+    deleted_message_ids: DeletedMessageRing,
     // External to internal ID mappings (TODO: Remove we can store discord IDs diractly in external
     // IDs)
     channel_id_mappings: DashMap<ID, ChannelLocation>,
@@ -236,6 +249,7 @@ impl Messenger for InnerDiscord<Owned> {
             dm_channels: ArcSwapOption::empty(),
             guilds: ArcSwapOption::empty(),
             guild_channels: DashMap::new(),
+            deleted_message_ids: DeletedMessageRing::new(),
             guild_id_mappings: DashMap::new(),
             channel_id_mappings: DashMap::new(),
             message_id_mappings: DashMap::new(),

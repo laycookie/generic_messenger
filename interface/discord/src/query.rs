@@ -300,6 +300,14 @@ impl Text for InnerDiscord<Owned> {
             .rest_get_messages(channel_location.channel_id(), before)
             .await?;
 
+        // Drop any messages that a concurrent MessageDelete gateway event
+        // has already tombstoned — Discord's REST view occasionally returns
+        // deleted messages before catching up. See
+        // `crate/messenger_interface/docs/races.md`.
+        let messages = messages
+            .into_iter()
+            .filter(|m| !self.deleted_message_ids.contains(m.id));
+
         // Discord returns messages newest-first. For `Ordering::Time` we
         // reverse so callers get oldest-first; `Unordered` keeps the
         // newest-first arrival order.
@@ -308,6 +316,7 @@ impl Text for InnerDiscord<Owned> {
             Ordering::Unordered => Box::new(messages.into_iter()),
         };
         let identifiers = join_all(messages_iter.map(async |message| {
+            let (content, history) = message.revisions();
             let reactions = message
                 .reactions
                 .unwrap_or(Vec::new())
@@ -338,7 +347,8 @@ impl Text for InnerDiscord<Owned> {
             let identifier = Discord::identifier_generator(
                 message.id,
                 Message {
-                    text: message.content,
+                    content,
+                    history,
                     reactions,
                     author: Some(author),
                 },
@@ -405,9 +415,10 @@ impl Text for InnerDiscord<Owned> {
             .ok_or("No discord channel id mapping for this room")?;
 
         let msg = self
-            .rest_send_message(channel_location.channel_id(), contents.text)
+            .rest_send_message(channel_location.channel_id(), contents.content.text)
             .await?;
 
+        let (content, history) = msg.revisions();
         let icon = match &msg.author.avatar {
             Some(hash) => cache_cdn_image("avatars", CacheCategory::Users, msg.author.id, hash)
                 .await
@@ -425,7 +436,8 @@ impl Text for InnerDiscord<Owned> {
         Ok(Identifier::new(
             msg.id,
             Message {
-                text: msg.content,
+                content,
+                history,
                 reactions: Vec::new(),
                 author: Some(author),
             },

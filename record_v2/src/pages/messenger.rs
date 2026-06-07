@@ -16,7 +16,9 @@ use iced::{
     Task,
     widget::{Responsive, Text, column, row},
 };
-use messenger_interface::types::{ID, Identifier, Message as InterfaceMessage, Place, Room};
+use messenger_interface::types::{
+    ID, Identifier, Message as InterfaceMessage, Place, Revision, Room,
+};
 use tracing::error;
 
 mod chat;
@@ -229,10 +231,16 @@ impl Messenger {
                                 let room_id = *room.id();
                                 let pending_id = self.next_pending_id();
 
+                                // TODO: Verify if we actually need to create an InterfaceMessage here,
+                                // as we are already in the UI and all data in here is in the unified format.
                                 let pending_msg = Identifier::new(
                                     pending_id,
                                     InterfaceMessage {
-                                        text: contents.clone(),
+                                        content: Revision {
+                                            at: None,
+                                            text: contents.clone(),
+                                        },
+                                        history: Vec::new(),
                                         reactions: Vec::new(),
                                         author: None,
                                     },
@@ -256,7 +264,11 @@ impl Messenger {
                                                 .send_message(
                                                     &room,
                                                     InterfaceMessage {
-                                                        text: contents,
+                                                        content: Revision {
+                                                            at: None,
+                                                            text: contents,
+                                                        },
+                                                        history: Vec::new(),
                                                         reactions: Vec::new(),
                                                         author: None,
                                                     },
@@ -304,14 +316,8 @@ impl Messenger {
                                             return;
                                         }
                                     };
-                                    let msg_ident = Identifier::new(
-                                        message_id,
-                                        InterfaceMessage {
-                                            text: String::new(),
-                                            reactions: Vec::new(),
-                                            author: None,
-                                        },
-                                    );
+                                    let msg_ident =
+                                        Identifier::new(message_id, InterfaceMessage::default());
                                     let result = if reacted {
                                         text.remove_reaction(&room, &msg_ident, &emoji).await
                                     } else {

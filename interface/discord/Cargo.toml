@@ -20,6 +20,8 @@ pin-project = "1.1.11"
 arc-swap = "1.9.1"
 dashmap = "6.1.0"
 crossbeam = "0.8.4"
+# Time
+chrono = { workspace = true }
 # Fetch
 surf = "2.3.2"
 percent-encoding = "2"
@@ -41,6 +43,8 @@ libsodium-rs = "0.2.4"
 davey = "0.1.3"
 # Interface
 messenger_interface = { path = "../../crate/messenger_interface" }
+# Data structures
+overwrite-ring = { path = "../../crate/overwrite_ring" }
 # enums
 num_enum = "0.7.6"
 # Bitflags

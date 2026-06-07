@@ -214,6 +214,7 @@ impl GatewayPayload<Opcode> {
                         let msg_id_hash = message.id;
 
                         trace!("{}", message.pretty());
+                        let (content, history) = message.revisions();
                         let icon = match &message.author.avatar {
                             Some(hash) => cache_cdn_image(
                                 "avatars",
@@ -235,7 +236,8 @@ impl GatewayPayload<Opcode> {
                         let msg_identifier = Identifier::new(
                             msg_id_hash,
                             GlobalMessage {
-                                text: message.content,
+                                content,
+                                history,
                                 reactions: Vec::new(),
                                 author: Some(author),
                             },
@@ -257,6 +259,7 @@ impl GatewayPayload<Opcode> {
                         let msg_id_hash = message.id;
 
                         trace!("{}", message.pretty());
+                        let (content, history) = message.revisions();
                         let icon = match &message.author.avatar {
                             Some(hash) => cache_cdn_image(
                                 "avatars",
@@ -278,7 +281,8 @@ impl GatewayPayload<Opcode> {
                         let msg_identifier = Identifier::new(
                             msg_id_hash,
                             GlobalMessage {
-                                text: message.content,
+                                content,
+                                history,
                                 reactions: Vec::new(),
                                 author: Some(author),
                             },
@@ -294,10 +298,34 @@ impl GatewayPayload<Opcode> {
 
                         trace!("{}", payload.pretty());
 
+                        // Tombstone BEFORE pushing the event: a concurrent
+                        // rest_get_messages response landing after the UI
+                        // consumes this delete must still find the ID in
+                        // the ring so it can be filtered. See
+                        // `crate/messenger_interface/docs/races.md`.
+                        discord.deleted_message_ids.push(payload.id);
+
                         discord.text_events.push(TextEvent::MessageDeleted {
                             room: Identifier::new(payload.channel_id, ()),
                             message_id: payload.id,
                         });
+                    }
+                    GatewayEvent::MessageDeleteBulk => {
+                        // TODO: implement once messenger_interface unifies
+                        // single + bulk delete events (TextEvent::MessageDeleted
+                        // extended to carry multiple IDs, with the singular
+                        // case becoming "bulk of one"). At that point this
+                        // handler should:
+                        //   1. Iterate the bulk payload's `ids` field and
+                        //      call `discord.record_deleted_message(id)` for
+                        //      each, BEFORE emitting any TextEvent, to
+                        //      preserve the ordering invariant documented
+                        //      in `crate/messenger_interface/docs/races.md`.
+                        //   2. Emit one unified TextEvent carrying all IDs.
+                        // Discord caps MESSAGE_DELETE_BULK at 100 IDs per
+                        // event, matching MESSAGE_DELETE_TOMBSTONE_CAP, so
+                        // a single bulk event fits the ring exactly.
+                        warn!("MessageDeleteBulk received but not yet handled");
                     }
                     GatewayEvent::MessageReactionAdd => {
                         let payload =

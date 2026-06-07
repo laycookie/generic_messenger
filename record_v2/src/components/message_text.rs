@@ -93,7 +93,7 @@ pub fn message_text<'a, M: Clone + 'static>(
     // === Create Message text box ===
     let mut spans: std::vec::Vec<Span<'_>> = Vec::new();
 
-    let mut text_left = msg.text.as_str();
+    let mut text_left = msg.content.text.as_str();
     while let Ok((regular_text_parsed, (unparssed, parsed_markdown))) =
         until_parser(alt((url_parser, italicized_parser, bold_parser))).parse(text_left)
     {
@@ -119,6 +119,14 @@ pub fn message_text<'a, M: Clone + 'static>(
         for span in &mut spans {
             *span = span.clone().color(Color::from_rgb(0.0, 0.8, 0.0));
         }
+    }
+
+    if msg.is_edited() {
+        spans.push(
+            Span::new(" (edited)")
+                .color(Color::from_rgb(0.5, 0.5, 0.5))
+                .size(12.0),
+        );
     }
 
     let message = Rich::from_iter(spans);

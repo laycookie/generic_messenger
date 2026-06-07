@@ -2,10 +2,10 @@
 resolver = "2"
 members = [
 	"macro",
-	"record",
 	"record_v2",
 	"crate/audio",
 	"crate/messenger_interface",
+	"crate/overwrite_ring",
 	"interface/discord"
 ]
 
@@ -28,3 +28,5 @@ facet-error = "0.46.0"
 asyncs-sync = "0.4.0"
 futures = "0.3.32"
 async-trait = "0.1.89"
+# Time
+chrono = "0.4"
