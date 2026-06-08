@@ -68,13 +68,6 @@ bitflags! {
 
 const DEFAULT_CAPABILITIES: Capabilities = Capabilities::CLIENT_STATE_V2;
 
-/// Capacity of the deleted-message tombstone ring. Matches Discord's
-/// `MESSAGE_DELETE_BULK` per-event cap, so a single bulk event fits exactly.
-/// The ring itself lives on `gateways::general::General` so it shares the
-/// gateway connection's lifetime — see
-/// `crate/messenger_interface/docs/races.md`.
-pub(crate) const MESSAGE_DELETE_TOMBSTONE_CAP: usize = 100;
-
 /// Where a Discord channel lives. Splits guild vs. private so the opcode 4
 /// payload and join flow can be picked statically instead of inferring from
 /// an `Option<guild_id>` that has two meanings (DM vs "Discord didn't send").

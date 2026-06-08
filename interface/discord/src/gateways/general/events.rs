@@ -14,6 +14,7 @@ use tracing::{debug, error, trace, warn};
 use super::{
     GatewayEvent, Opcode,
     payloads::{ReadyPayload, SessionObjectPayload, VoiceServerUpdatePayload, VoiceStatePayload},
+    recording::RecordedEvent,
 };
 use crate::{
     ChannelLocation, Discord, InnerDiscord, UnitStruct,
@@ -255,10 +256,19 @@ impl GatewayPayload<Opcode> {
                     GatewayEvent::MessageUpdate => {
                         let message = facet_value::from_value::<Message>(self.d)?;
 
-                        let channel_id_hash = message.channel_id;
-                        let msg_id_hash = message.id;
-
                         trace!("{}", message.pretty());
+
+                        // Record before emitting: if a concurrent
+                        // `rest_get_messages` is in flight, its merge step
+                        // must observe this update — emitting first would
+                        // race the UI consuming the event before the
+                        // recording window captures it. See
+                        // `crate/messenger_interface/docs/races.md`.
+                        gateway.maybe_record(|| RecordedEvent::MessageUpdated {
+                            channel_id: message.channel_id,
+                            message: message.clone(),
+                        });
+
                         let (content, history) = message.revisions();
                         let icon = match &message.author.avatar {
                             Some(hash) => cache_cdn_image(
@@ -279,7 +289,7 @@ impl GatewayPayload<Opcode> {
                             },
                         );
                         let msg_identifier = Identifier::new(
-                            msg_id_hash,
+                            message.id,
                             GlobalMessage {
                                 content,
                                 history,
@@ -289,7 +299,7 @@ impl GatewayPayload<Opcode> {
                         );
 
                         discord.text_events.push(TextEvent::MessageUpdated {
-                            room: Identifier::new(channel_id_hash, ()),
+                            room: Identifier::new(message.channel_id, ()),
                             message: msg_identifier,
                         });
                     }
@@ -298,12 +308,16 @@ impl GatewayPayload<Opcode> {
 
                         trace!("{}", payload.pretty());
 
-                        // Tombstone BEFORE pushing the event: a concurrent
-                        // rest_get_messages response landing after the UI
-                        // consumes this delete must still find the ID in
-                        // the ring so it can be filtered. See
+                        // Record BEFORE emitting: a concurrent
+                        // rest_get_messages whose window is open must
+                        // observe this delete so the UI doesn't see a
+                        // resurrected message after consuming the
+                        // TextEvent::MessageDeleted. See
                         // `crate/messenger_interface/docs/races.md`.
-                        gateway.deleted_message_ids.push(payload.id);
+                        gateway.maybe_record(|| RecordedEvent::MessageDeleted {
+                            channel_id: payload.channel_id,
+                            message_id: payload.id,
+                        });
 
                         discord.text_events.push(TextEvent::MessageDeleted {
                             room: Identifier::new(payload.channel_id, ()),
@@ -317,14 +331,12 @@ impl GatewayPayload<Opcode> {
                         // case becoming "bulk of one"). At that point this
                         // handler should:
                         //   1. Iterate the bulk payload's `ids` field and
-                        //      call `gateway.deleted_message_ids.push(id)`
-                        //      for each, BEFORE emitting any TextEvent, to
-                        //      preserve the ordering invariant documented
-                        //      in `crate/messenger_interface/docs/races.md`.
+                        //      call `gateway.maybe_record(|| RecordedEvent::
+                        //      MessageDeleted { ... })` for each, BEFORE
+                        //      emitting any TextEvent, to preserve the
+                        //      record-before-emit invariant documented in
+                        //      `crate/messenger_interface/docs/races.md`.
                         //   2. Emit one unified TextEvent carrying all IDs.
-                        // Discord caps MESSAGE_DELETE_BULK at 100 IDs per
-                        // event, matching MESSAGE_DELETE_TOMBSTONE_CAP, so
-                        // a single bulk event fits the ring exactly.
                         warn!("MessageDeleteBulk received but not yet handled");
                     }
                     GatewayEvent::MessageReactionAdd => {
@@ -333,11 +345,29 @@ impl GatewayPayload<Opcode> {
 
                         trace!("{}", payload.pretty());
 
+                        let is_self = discord
+                            .profile
+                            .load()
+                            .as_ref()
+                            .map(|p| p.id == payload.user_id)
+                            .unwrap_or(false);
+                        let channel_id = payload.channel_id;
+                        let message_id = payload.message_id;
+                        let user_id = payload.user_id;
+                        let emoji_name = payload.emoji.name.clone();
+
+                        gateway.maybe_record(|| RecordedEvent::ReactionAdded {
+                            channel_id,
+                            message_id,
+                            emoji: payload.emoji,
+                            is_self,
+                        });
+
                         discord.text_events.push(TextEvent::ReactionAdded {
-                            room: Identifier::new(payload.channel_id, ()),
-                            message_id: payload.message_id,
-                            user_id: payload.user_id,
-                            emoji: payload.emoji.name,
+                            room: Identifier::new(channel_id, ()),
+                            message_id,
+                            user_id,
+                            emoji: emoji_name,
                         });
                     }
                     GatewayEvent::MessageReactionRemove => {
@@ -346,11 +376,29 @@ impl GatewayPayload<Opcode> {
 
                         trace!("{}", payload.pretty());
 
+                        let is_self = discord
+                            .profile
+                            .load()
+                            .as_ref()
+                            .map(|p| p.id == payload.user_id)
+                            .unwrap_or(false);
+                        let channel_id = payload.channel_id;
+                        let message_id = payload.message_id;
+                        let user_id = payload.user_id;
+                        let emoji_name = payload.emoji.name.clone();
+
+                        gateway.maybe_record(|| RecordedEvent::ReactionRemoved {
+                            channel_id,
+                            message_id,
+                            emoji: payload.emoji,
+                            is_self,
+                        });
+
                         discord.text_events.push(TextEvent::ReactionRemoved {
-                            room: Identifier::new(payload.channel_id, ()),
-                            message_id: payload.message_id,
-                            user_id: payload.user_id,
-                            emoji: payload.emoji.name,
+                            room: Identifier::new(channel_id, ()),
+                            message_id,
+                            user_id,
+                            emoji: emoji_name,
                         });
                     }
                     GatewayEvent::ChannelCreate => {

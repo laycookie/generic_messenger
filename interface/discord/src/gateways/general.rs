@@ -1,4 +1,8 @@
-use std::{error::Error, io, pin::pin, sync::OnceLock, time::Duration};
+use std::{
+    error::Error, io, pin::pin,
+    sync::{Mutex, OnceLock, atomic::AtomicUsize},
+    time::Duration,
+};
 
 use async_tungstenite::{async_std::connect_async, tungstenite::Message as WebsocketMessage};
 use facet::Facet;
@@ -7,12 +11,9 @@ use num_enum::TryFromPrimitive;
 use surf::http::convert::json;
 use tracing::debug;
 
-use overwrite_ring::Ring;
-
 use self::payloads::HelloPayload;
 use crate::{
-    InnerDiscord, MESSAGE_DELETE_TOMBSTONE_CAP, UnitStruct,
-    api_types::SNOWFLAKE,
+    InnerDiscord, UnitStruct,
     gateways::{
         Gateway, GatewayStreamReciver as _, HeartBeatingData, Websocket, voice::VoiceGateway,
     },
@@ -20,6 +21,7 @@ use crate::{
 
 mod events;
 pub(crate) mod payloads;
+pub(crate) mod recording;
 
 // Implementation of:
 // https://discord.com/developers/docs/events/gateway
@@ -98,12 +100,15 @@ pub enum GatewayEvent {
 
 pub struct General {
     pub voice: VoiceGateway,
-    /// Tombstones for messages deleted via gateway events, used to filter
-    /// concurrent `rest_get_messages` responses that race the delete.
+    /// Number of in-flight REST calls currently recording. Non-zero
+    /// gates whether event handlers acquire the state lock at all.
     /// Lives on the gateway so it drops automatically when the gateway
-    /// disconnects — at that point REST becomes the unfiltered source of
-    /// truth. See `crate/messenger_interface/docs/races.md`.
-    pub deleted_message_ids: Ring<SNOWFLAKE, MESSAGE_DELETE_TOMBSTONE_CAP>,
+    /// disconnects — at that point REST becomes the unfiltered source
+    /// of truth. See `crate/messenger_interface/docs/races.md`.
+    pub recording_refs: AtomicUsize,
+    /// Shared recording state: the event buffer plus enough bookkeeping
+    /// to drop front slots no window still references. See `recording`.
+    pub recorded: Mutex<recording::RecordingState>,
 }
 
 impl Gateway<General> {
@@ -168,7 +173,8 @@ impl Gateway<General> {
             last_sequence_number: OnceLock::new(),
             type_specific_data: General {
                 voice: VoiceGateway::default(),
-                deleted_message_ids: Ring::new(),
+                recording_refs: AtomicUsize::new(0),
+                recorded: Mutex::new(recording::RecordingState::default()),
             },
         })
     }

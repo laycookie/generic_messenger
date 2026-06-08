@@ -36,7 +36,7 @@ pub struct Profile {
     // verified: bool,
 }
 
-#[derive(Facet)]
+#[derive(Facet, Clone)]
 pub struct User {
     pub avatar: Option<String>,
     // avatar_decoration_data: Option<String>,
@@ -207,13 +207,13 @@ pub struct CountDetails {
     // normal: u32,
 }
 
-#[derive(Facet)]
+#[derive(Facet, Clone)]
 pub struct Emoji {
     pub id: Option<SNOWFLAKE>,
     pub name: String,
 }
 
-#[derive(Facet)]
+#[derive(Facet, Clone)]
 pub struct Reaction {
     // burst_colors: Vec<String>,
     // burst_count: u32,
@@ -225,7 +225,7 @@ pub struct Reaction {
     // me_burst: bool,
 }
 
-#[derive(Facet)]
+#[derive(Facet, Clone)]
 pub struct Message {
     // attachments: Vec<String>,
     pub author: User,

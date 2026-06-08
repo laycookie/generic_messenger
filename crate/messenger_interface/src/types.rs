@@ -153,7 +153,7 @@ bitflags! {
     /// Bitflags representing the capabilities supported by a room/channel.
     ///
     /// Rooms can support text chat, voice chat, or both.
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Copy)]
     pub struct RoomCapabilities: u8 {
         /// Room supports text messaging.
         const Text = 0b0000_0001;
@@ -161,39 +161,6 @@ bitflags! {
         const Voice = 0b0000_0010;
     }
 }
-
-// === Legacy Interface (Deprecated) ===
-//
-// The following types were part of the old interface design and have been
-// replaced by the new type-safe generic approach below. Kept for reference
-// during migration.
-//
-// #[derive(Debug, Clone)]
-// pub enum QueryPlace {
-//     Room,
-//     House,
-//     All,
-// }
-// #[derive(Debug, Clone)]
-// pub struct Room {
-//     pub name: String,
-//     pub icon: Option<PathBuf>,
-//     pub room_capabilities: RoomCapabilities,
-//     pub participants: Vec<Identifier<User>>,
-// }
-// #[derive(Debug, Clone)]
-// pub struct House {
-//     pub name: String,
-//     pub icon: Option<PathBuf>,
-//     pub rooms: Vec<Identifier<Room>>,
-// }
-// #[derive(Debug, Clone)]
-// pub enum Place {
-//     Room(Room),
-//     House(House),
-// }
-
-// === New Interface ===
 
 /// Type alias for optionally fetched data.
 ///

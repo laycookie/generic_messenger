@@ -340,22 +340,30 @@ impl Text for InnerDiscord<Owned> {
             None => None,
         };
 
+        // Open a recording window *before* firing REST so any
+        // MessageUpdate / MessageDelete / Reaction events that arrive
+        // during the fetch are captured for the post-response merge.
+        // If the gateway is down, skip — REST is then the only source
+        // of truth and there is nothing to merge against. See
+        // `crate/messenger_interface/docs/races.md`.
+        let gateway = self.gateway.load_full();
+        let window = gateway.as_ref().map(|g| g.start_recording());
+
         let messages = self
             .rest_get_messages(channel_location.channel_id(), before)
             .await?;
 
-        // Drop any messages that a concurrent MessageDelete gateway event
-        // has already tombstoned — Discord's REST view occasionally returns
-        // deleted messages before catching up. If the gateway is
-        // disconnected, the ring doesn't exist and REST passes through
-        // unfiltered. See `crate/messenger_interface/docs/races.md`.
-        let gateway = self.gateway.load_full();
-        let messages = messages.into_iter().filter(move |m| {
-            gateway
-                .as_ref()
-                .map(|g| !g.deleted_message_ids.contains(m.id))
-                .unwrap_or(true)
-        });
+        // Drain the recording window and fold captured deltas onto the
+        // REST snapshot: deletes drop entries, updates replace them,
+        // reaction events mutate the cached vec in place.
+        let messages = match window {
+            Some(w) => crate::gateways::general::recording::apply_to_messages(
+                messages,
+                w.take(),
+                channel_location.channel_id(),
+            ),
+            None => messages,
+        };
 
         // Discord returns messages newest-first. For `Ordering::Time` we
         // reverse so callers get oldest-first; `Unordered` keeps the
