@@ -17,7 +17,7 @@ use iced::{
     widget::{Responsive, Text, column, row},
 };
 use messenger_interface::types::{
-    ID, Identifier, Message as InterfaceMessage, Place, Revision, Room,
+    ID, Identifier, Message as InterfaceMessage, Place, Revision, RichText, Room,
 };
 use tracing::error;
 
@@ -168,6 +168,7 @@ impl Messenger {
                         if let Some(room) = data.room_mut(room_id) {
                             room.messages.get_or_insert_with(Vec::new).push(message);
                         }
+                        data.move_conversation_to_front(room_id);
                     }),
                 }
             }
@@ -230,6 +231,8 @@ impl Messenger {
                                 let id = interface.id;
                                 let room_id = *room.id();
                                 let pending_id = self.next_pending_id();
+                                let author =
+                                    messengers.data(id).and_then(|data| data.profile.clone());
 
                                 // TODO: Verify if we actually need to create an InterfaceMessage here,
                                 // as we are already in the UI and all data in here is in the unified format.
@@ -238,11 +241,11 @@ impl Messenger {
                                     InterfaceMessage {
                                         content: Revision {
                                             at: None,
-                                            text: contents.clone(),
+                                            text: RichText::plain(contents.clone()),
                                         },
                                         history: Vec::new(),
                                         reactions: Vec::new(),
-                                        author: None,
+                                        author,
                                     },
                                 );
 
@@ -266,7 +269,7 @@ impl Messenger {
                                                     InterfaceMessage {
                                                         content: Revision {
                                                             at: None,
-                                                            text: contents,
+                                                            text: RichText::plain(contents),
                                                         },
                                                         history: Vec::new(),
                                                         reactions: Vec::new(),

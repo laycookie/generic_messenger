@@ -29,13 +29,21 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = FmtSubscriber::builder()
         .without_time()
         .with_line_number(true)
-        .with_env_filter(tracing_subscriber::EnvFilter::new(
-            "record_v2=trace,discord=trace,info",
-        ))
+        .with_env_filter(
+            // Honor RUST_LOG when set (e.g. `steam=debug,steam_vent=debug` for
+            // voice-signaling capture); otherwise keep the default verbosity.
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("record_v2=trace,discord=trace,info")
+            }),
+        )
         .with_ansi(true)
         .with_ansi_sanitization(false)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
+    // Reclaim any `.part` temp files orphaned by a previous hard kill. Safe to
+    // run here since no downloads are in flight yet.
+    messenger_interface::types::sweep_stale_temp_files();
 
     let fonts_handle = SystemSource::new()
         .select_best_match(&[FamilyName::SansSerif], &Default::default())
@@ -136,19 +144,18 @@ impl App {
                             error!("Text not impl");
                             return None;
                         };
-                        let Ok(v) = api.clone().arc_voice() else {
-                            error!("Voice not impl");
-                            return None;
-                        };
+                        // Voice is optional: messengers without it (e.g. Steam)
+                        // must still load. Query/Text above remain required.
+                        let voice = api.clone().arc_voice().ok();
 
                         let (profile, contacts, conversations, servers) =
                             join!(q.client_user(), q.contacts(), q.rooms(), q.houses());
 
                         let profile = match profile {
-                            Ok(p) => p,
+                            Ok(p) => Some(p),
                             Err(err) => {
                                 error!("Failed to fetch profile: {err:#?}");
-                                return None;
+                                None
                             }
                         };
 
@@ -160,7 +167,10 @@ impl App {
                             servers.unwrap_or_default(),
                             q.listen().await,
                             t.listen().await,
-                            v.listen().await,
+                            match voice {
+                                Some(v) => v.listen().await,
+                                None => Err("Voice not supported".into()),
+                            },
                         ))
                     }
                 })))
@@ -178,7 +188,7 @@ impl App {
                         ) = m?;
 
                         let task = Task::done(AppMessage::modify_data(id, move |data| {
-                            data.profile = Some(profile);
+                            data.profile = profile;
                             data.contacts = contacts;
                             data.conversations = conversations;
                             data.guilds = servers;
@@ -253,10 +263,33 @@ impl App {
             AppMessage::Login(message) => match self.login.update(message) {
                 login::Action::None => Task::none(),
                 login::Action::Login(api) => {
-                    Task::done(AppMessage::modify_messengers(move |messengers| {
-                        messengers.add(api);
-                    }))
-                    .chain(Task::done(AppMessage::StartUp))
+                    // Verify the credentials before committing: `client_user`
+                    // drives the username/password -> token exchange (or token
+                    // check) and fails fast on bad credentials. Only on success
+                    // do we add the messenger and run StartUp (which navigates
+                    // to the chat page and saves credentials) — so a failed
+                    // login neither saves nor leaves the login page.
+                    Task::future(async move {
+                        let result = match api.clone().arc_query() {
+                            Ok(query) => {
+                                query.client_user().await.map(|_| ()).map_err(|err| err.to_string())
+                            }
+                            // No query capability to verify against (e.g. Test):
+                            // let it through unchanged.
+                            Err(_) => Ok(()),
+                        };
+                        (api, result)
+                    })
+                    .then(|(api, result)| match result {
+                        Ok(()) => Task::done(AppMessage::modify_messengers(move |messengers| {
+                            messengers.add(api);
+                        }))
+                        .chain(Task::done(AppMessage::StartUp)),
+                        Err(err) => {
+                            error!("Login failed: {err}");
+                            Task::done(AppMessage::Login(login::Message::LoginFailed(err)))
+                        }
+                    })
                 }
             },
             AppMessage::Chat(message) => match self.messenger.update(message, &self.messengers) {

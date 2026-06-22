@@ -8,7 +8,7 @@ use std::{
 
 use arc_swap::ArcSwapOption;
 use async_tungstenite::async_std::connect_async;
-use crossbeam::queue::SegQueue;
+use crossbeam::queue::ArrayQueue;
 use dashmap::DashMap;
 use davey::{DAVE_PROTOCOL_VERSION, DaveSession};
 use facet_pretty::FacetPretty;
@@ -19,11 +19,11 @@ use futures::{
 };
 use messenger_interface::interface::AudioEvent;
 use surf::http::convert::json;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use super::{
     AudioChannel, Endpoint, SessionId, VoiceOpcode,
-    connection::{Connection, RecvAudioFuture, Ssrc, UdpPacket},
+    connection::{Connection, Ssrc},
     payloads::HelloPayload,
 };
 use crate::gateways::{Gateway, HeartBeatingData, Websocket};
@@ -32,7 +32,6 @@ use crate::{api_types::SNOWFLAKE, gateways::GatewayStreamReciver as _};
 pub struct Voice {
     heartbeat_version: u8,
     pub channel_id: SNOWFLAKE,
-    pub guild_id: Option<SNOWFLAKE>,
     pub dave_pending_transitions: DashMap<u16, NonZeroU16>, // transition_id, dave_protocol_version
     pub dave_session: AsyncMutex<Option<DaveSession>>,
     pub connection: ArcSwapOption<Connection>,
@@ -58,7 +57,11 @@ impl std::ops::DerefMut for DaveSessionGuard<'_> {
 
 impl Voice {
     pub(crate) async fn require_dave_session(&self) -> Result<DaveSessionGuard<'_>, io::Error> {
+        // Freeze suspect: the audio loop holds this lock across its UDP
+        // send, and the SessionDescription handler across DAVE reinit.
+        trace!("require_dave_session: waiting for dave_session lock");
         let guard = self.dave_session.lock().await;
+        trace!("require_dave_session: dave_session lock acquired");
         if guard.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -73,7 +76,7 @@ impl Voice {
     /// Returns `false` if a new channel is being initialized and the caller should yield.
     pub(crate) fn dispatch_incoming_audio(
         &self,
-        audio_events: &SegQueue<AudioEvent>,
+        audio_events: &ArrayQueue<AudioEvent>,
         ssrc: Ssrc,
         samples: &[i16],
     ) -> bool {
@@ -82,7 +85,7 @@ impl Voice {
             dashmap::Entry::Vacant(vacant_entry) => {
                 let (sender, receiver) = oneshot::channel();
                 vacant_entry.insert(AudioChannel::Initializing(receiver).into());
-                audio_events.push(AudioEvent::AddAudioSource(sender));
+                let _ = audio_events.force_push(AudioEvent::AddAudioSource(sender));
                 // TODO: Save samples for when channel is ready
                 return false;
             }
@@ -94,8 +97,15 @@ impl Voice {
                     Ok(Some(producer)) => {
                         drop(channel);
                         channel_entry.insert(AudioChannel::Connected(producer).into());
+                        // Re-enter the loop so this frame is delivered to
+                        // the freshly connected channel.
+                        continue;
                     }
-                    Ok(None) => continue,
+                    // Producer not ready yet: drop this frame and keep
+                    // receiving. Spinning here (the previous behavior)
+                    // blocks the executor thread until the UI task — which
+                    // may need this very thread — sends the producer.
+                    Ok(None) => break,
                     Err(_) => {
                         drop(channel);
                         channel_entry.remove();
@@ -104,11 +114,9 @@ impl Voice {
                     }
                 },
                 AudioChannel::Connected(producer) => {
-                    let samples_pushed = producer.push_iter(
-                        samples
-                            .iter()
-                            .map(|sample| *sample as f32 / i16::MAX as f32),
-                    );
+                    // The channel is declared as i16; the mixer converts to
+                    // the device format itself.
+                    let samples_pushed = producer.push_iter(samples);
                     if samples.len() != samples_pushed {
                         error!(
                             "Audio buffer overflow. Pushed: {}, Succeeded: {}",
@@ -116,39 +124,11 @@ impl Voice {
                             samples_pushed
                         );
                     }
+                    break;
                 }
             };
-            break;
         }
         true
-    }
-
-    /// Receive and classify UDP packets, dispatching audio to playback channels.
-    ///
-    /// Returns when a new audio channel is initializing (caller should re-enter).
-    pub(crate) async fn poll_udp(
-        &self,
-        audio_events: &SegQueue<AudioEvent>,
-        receiver: &mut RecvAudioFuture<'_>,
-    ) {
-        loop {
-            match receiver.recv().await {
-                Ok(UdpPacket::Voice { ssrc, samples }) => {
-                    if !self.dispatch_incoming_audio(audio_events, ssrc, samples) {
-                        return;
-                    }
-                }
-                Ok(UdpPacket::Rtcp(rtcp_type)) => {
-                    trace!("RTCP: {rtcp_type:?}");
-                }
-                Ok(UdpPacket::UnhandledRtp { ssrc, payload_type }) => {
-                    debug!("Unhandled RTP payload type {payload_type} from SSRC {ssrc}");
-                }
-                Err(err) => {
-                    error!("{err}");
-                }
-            }
-        }
     }
 }
 
@@ -161,10 +141,14 @@ impl Gateway<Voice> {
         channel_id: SNOWFLAKE,
         user_id: u64,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // No timeout on any of the steps below (TLS connect, identify
+        // send, hello wait) — each is a freeze suspect during VC entry.
+        trace!("voice gateway: connecting websocket to {}", endpoint.wss);
         let (voice_websocket, _) = connect_async(
             "wss://".to_string() + &endpoint.wss + "/?v=" + &Self::VERSION.to_string(),
         )
         .await?;
+        trace!("voice gateway: websocket connected, sending identify");
         let websocket = Websocket::new(voice_websocket);
 
         // <https://discord.com/developers/docs/topics/voice-connections#establishing-a-voice-websocket-connection>
@@ -183,6 +167,7 @@ impl Gateway<Voice> {
         debug!("{identify_payload:#?}");
         websocket.send(identify_payload.to_string().into()).await?;
 
+        trace!("voice gateway: identify sent, waiting for hello");
         let hello_event = {
             let mut receiver = websocket.receiver.lock().await;
             pin!(receiver.filter_payload()).next().await
@@ -213,7 +198,6 @@ impl Gateway<Voice> {
             type_specific_data: Voice {
                 heartbeat_version: hello_d.v,
                 channel_id,
-                guild_id,
                 dave_pending_transitions: DashMap::new(),
                 dave_session: AsyncMutex::new(None),
                 connection: Default::default(),

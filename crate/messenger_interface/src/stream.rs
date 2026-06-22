@@ -26,9 +26,17 @@ pub trait ArcStream: Send + Sync {
 /// A stream adapter that wraps a Weak reference to an [`ArcStream`] and
 /// automatically stops when the underlying Arc is dropped.
 ///
-/// Note that next_future holds Arc ref to ArcStream data, this means that
-/// before the underlying Arc gets dropped we need to finish polling the
-/// current next_future.
+/// # Termination contract
+///
+/// While a `next()` future is in flight it holds a strong `Arc` to the
+/// [`ArcStream`], so dropping every external `Arc` does *not* by itself
+/// terminate the stream — the weak upgrade keeps succeeding until the
+/// in-flight future completes. Implementors whose `next()` can pend
+/// indefinitely (sockets, queues) must therefore provide cooperative
+/// termination: detect that the owner is gone (e.g. count in-flight
+/// `next()` futures and compare against `Arc::strong_count`, as the
+/// discord backend does) and return `None` from `next()`. Once `next()`
+/// resolves, the next poll re-upgrades the weak and ends the stream.
 ///
 /// Yields `Event` items directly. Implements [`Stream`] for use with `StreamExt`, iced, etc.
 pub struct WeakSocketStream<Event> {
@@ -88,11 +96,54 @@ where
                     self.next_future = None;
                     Poll::Ready(Some(event))
                 }
-                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Ready(None) => {
+                    // Clear the completed future so a poll after the end
+                    // (legal for non-fused consumers) doesn't re-poll a
+                    // finished future and panic.
+                    self.next_future = None;
+                    Poll::Ready(None)
+                }
                 Poll::Pending => Poll::Pending,
             }
         } else {
             Poll::Pending
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    struct Ended;
+    #[async_trait]
+    impl ArcStream for Ended {
+        type Item = u8;
+        async fn next(self: Arc<Self>) -> Option<u8> {
+            None
+        }
+    }
+
+    /// Polling past the end must yield `None` again instead of re-polling
+    /// the completed inner future (which would panic).
+    #[test]
+    fn poll_after_end_is_safe() {
+        futures::executor::block_on(async {
+            let source = Arc::new(Ended);
+            let mut stream = WeakSocketStream::from_arc(source);
+            assert_eq!(stream.next().await, None);
+            assert_eq!(stream.next().await, None);
+        });
+    }
+
+    #[test]
+    fn ends_when_source_dropped() {
+        futures::executor::block_on(async {
+            let source = Arc::new(Ended);
+            let mut stream = WeakSocketStream::from_arc(source.clone());
+            drop(source);
+            assert_eq!(stream.next().await, None);
+        });
     }
 }

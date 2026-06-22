@@ -1,11 +1,10 @@
 use chrono::{DateTime, Utc};
 use facet::Facet;
-use messenger_interface::types::{
-    CacheCategory, Identifier, Place, Revision, Room, RoomCapabilities,
-};
+use futures::future::join_all;
+use messenger_interface::types::{Identifier, Place, Revision, RichText, Room, RoomCapabilities};
 use tracing::error;
 
-use crate::downloaders::cache_cdn_image;
+use crate::downloaders::CdnImage;
 
 pub type SNOWFLAKE = u64;
 
@@ -129,7 +128,7 @@ impl Channel {
     /// Extract room data, name, and icon from a channel.
     /// Returns (name, icon, room_data).
     pub async fn to_room_data(&self) -> Place<Room> {
-        let name = self.name.to_owned().unwrap_or_else(|| {
+        let name = self.name.clone().unwrap_or_else(|| {
             self.recipients
                 .as_ref()
                 .map(|recipients| {
@@ -142,43 +141,40 @@ impl Channel {
                 .unwrap_or_else(|| "Unknown channel".to_string())
         });
 
-        let mut icon = None;
-        let mut participants = Vec::new();
-
-        if let Some(recipients) = self.recipients.as_ref() {
-            for recipient in recipients {
+        let recipients = join_all(self.recipients.as_deref().unwrap_or(&[]).iter().map(
+            async |recipient| {
                 let recipient_icon = match &recipient.avatar {
-                    Some(hash) => {
-                        match cache_cdn_image("avatars", CacheCategory::Users, recipient.id, hash)
-                            .await
-                        {
-                            Ok(path) => Some(path),
-                            Err(e) => {
-                                error!("Failed to download icon for channel: {}\n{}", name, e);
-                                None
-                            }
+                    Some(hash) => match CdnImage::avatar(recipient.id, hash).fetch().await {
+                        Ok(path) => Some(path),
+                        Err(e) => {
+                            error!("Failed to download icon for channel: {}\n{}", name, e);
+                            None
                         }
-                    }
+                    },
                     None => None,
                 };
 
-                if icon.is_none() {
-                    icon = recipient_icon.clone();
-                }
-
-                participants.push(Identifier::new(
+                Identifier::new(
                     recipient.id,
                     messenger_interface::types::User {
                         name: recipient.username.clone(),
                         icon: recipient_icon,
                     },
-                ));
-            }
-        }
+                )
+            },
+        ))
+        .await;
+
+        // Deterministic fallback icon: the first recipient (in roster
+        // order) that has an avatar — not whichever download finished
+        // first.
+        let mut icon = recipients
+            .iter()
+            .find_map(|recipient| recipient.icon.clone());
 
         // If channel has icon, use that
         if let Some(hash) = &self.icon {
-            match cache_cdn_image("channel-icons", CacheCategory::Channels, self.id, hash).await {
+            match CdnImage::channel_icon(self.id, hash).fetch().await {
                 Ok(path) => icon = Some(path),
                 Err(e) => {
                     error!("Failed to download icon for channel: {}\n{}", name, e);
@@ -189,7 +185,7 @@ impl Channel {
         let room = Room::new(
             // NOTE: DMs can have voice calls; treat as both for now.
             RoomCapabilities::from(self.channel_type),
-            Some(participants),
+            Some(recipients),
             None,
         );
 
@@ -225,6 +221,15 @@ pub struct Reaction {
     // me_burst: bool,
 }
 
+/// One sticker attached to a message (Discord `sticker_items`).
+#[derive(Facet, Clone)]
+pub struct StickerItem {
+    pub id: SNOWFLAKE,
+    pub name: String,
+    /// 1 = PNG, 2 = APNG, 3 = Lottie (JSON), 4 = GIF.
+    pub format_type: u8,
+}
+
 #[derive(Facet, Clone)]
 pub struct Message {
     // attachments: Vec<String>,
@@ -241,12 +246,36 @@ pub struct Message {
     // mentions: Vec<String>,
     // pinned: bool,
     pub reactions: Option<Vec<Reaction>>,
+    pub sticker_items: Option<Vec<StickerItem>>,
     pub timestamp: String,
     // tts: bool,
     // type: u32,
 }
 
 impl Message {
+    /// Map the Discord reaction objects onto interface reactions. An absent
+    /// `reactions` field maps to an empty list.
+    pub async fn interface_reactions(&self) -> Vec<messenger_interface::types::Reaction> {
+        let mut reactions = Vec::new();
+        for reaction in self.reactions.as_deref().unwrap_or(&[]) {
+            // A custom emoji carries an id (→ resolve its image); a Unicode
+            // emoji has no id and renders from its name alone.
+            let image = match reaction.emoji.id {
+                Some(id) => crate::rich::resolve_emoji(id, false).await,
+                None => None,
+            };
+            reactions.push(messenger_interface::types::Reaction {
+                emoji: messenger_interface::types::Emoji {
+                    shortcode: reaction.emoji.name.clone(),
+                    image,
+                },
+                count: reaction.count,
+                reacted: reaction.me,
+            });
+        }
+        reactions
+    }
+
     /// Split this Discord message into `(content, history)` for the
     /// `messenger_interface::types::Message` fields.
     ///
@@ -258,28 +287,30 @@ impl Message {
     /// whose `text` is empty — enough to drive the UI's "edited"
     /// indicator while being honest that we don't know what the message
     /// used to say.
-    pub fn revisions(&self) -> (Revision, Vec<Revision>) {
+    pub async fn revisions(&self) -> (Revision, Vec<Revision>) {
         let parse = |s: &str| {
             DateTime::parse_from_rfc3339(s)
                 .ok()
                 .map(|dt| dt.with_timezone(&Utc))
         };
         let created_at = parse(&self.timestamp);
+        let stickers = self.sticker_items.as_deref().unwrap_or(&[]);
+        let content = crate::rich::build_content(&self.content, stickers).await;
         match self.edited_timestamp.as_deref().and_then(parse) {
             Some(edit_at) => (
                 Revision {
                     at: Some(edit_at),
-                    text: self.content.clone(),
+                    text: content,
                 },
                 vec![Revision {
                     at: created_at,
-                    text: String::new(),
+                    text: RichText::default(),
                 }],
             ),
             None => (
                 Revision {
                     at: created_at,
-                    text: self.content.clone(),
+                    text: content,
                 },
                 Vec::new(),
             ),
@@ -306,6 +337,62 @@ pub struct CreateMessage {
     //
     pub flags: Option<u32>, // Bitfield (only certain flags allowed)
                             // poll: Option<Poll>, // Poll object
+}
+
+// === Auth / Login ===
+// Username + password login, as used by the official client (not the bot API).
+// Field/endpoint shapes verified against: https://docs.discord.food/authentication
+
+/// Body for `POST /auth/login`. Per the docs `login` and `password` are
+/// required (`password` is 8-72 chars); `undelete` is optional. The remaining
+/// optional fields (`login_source`, `gift_code_sku_id`) are omitted.
+/// <https://docs.discord.food/authentication#login-account>
+#[derive(Facet)]
+pub struct LoginRequest {
+    /// Email or E.164-formatted phone number of the account.
+    pub login: String,
+    pub password: String,
+    /// Whether to reactivate a disabled/deleted account on login.
+    pub undelete: bool,
+}
+
+/// Response to `POST /auth/login`. On a plain login `token` is populated; when
+/// the account has two-factor enabled Discord instead returns `mfa: true` plus
+/// a `ticket` (and `login_instance_id`) to be redeemed via one of the
+/// `/auth/mfa/{type}` endpoints. Unknown fields (`user_settings`,
+/// `required_actions`, captcha challenge, ...) are ignored by facet.
+/// <https://docs.discord.food/authentication#login-account>
+#[derive(Facet)]
+pub struct LoginResponse {
+    pub token: Option<String>,
+    pub mfa: Option<bool>,
+    pub ticket: Option<String>,
+    /// Whether a TOTP (authenticator app) code is an accepted MFA method.
+    pub totp: Option<bool>,
+    /// Opaque instance id for the MFA flow, echoed back in the MFA request.
+    pub login_instance_id: Option<String>,
+}
+
+/// Body for `POST /auth/mfa/totp` — redeems the login `ticket` with a TOTP code.
+/// Per the docs the fields are `ticket` (required), `code` (required), and the
+/// optional `login_instance_id`/`login_source`/`gift_code_sku_id`; there is no
+/// `login_type` field.
+/// <https://docs.discord.food/authentication#verify-mfa>
+#[derive(Facet)]
+pub struct MfaTotpRequest {
+    /// The MFA ticket received from the login response.
+    pub ticket: String,
+    /// The TOTP (authenticator app) code.
+    pub code: String,
+    /// Echoed from `LoginResponse::login_instance_id` when present.
+    pub login_instance_id: Option<String>,
+}
+
+/// Response to `POST /auth/mfa/totp`.
+/// <https://docs.discord.food/authentication#verify-mfa>
+#[derive(Facet)]
+pub struct MfaResponse {
+    pub token: Option<String>,
 }
 
 // https://discord.com/developers/docs/events/gateway-events#message-delete

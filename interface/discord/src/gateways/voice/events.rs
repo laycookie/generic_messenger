@@ -9,7 +9,7 @@ use davey::DaveSession;
 use messenger_interface::interface::VoiceEvent;
 use smol::net::UdpSocket;
 use surf::http::convert::json;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 use async_tungstenite::tungstenite::Message;
 
@@ -59,7 +59,8 @@ impl From<u32> for u32be {
 
 #[repr(C, packed)]
 struct IpDiscovery {
-    _req_or_res: u16be,
+    /// 1 = request, 2 = response.
+    req_or_res: u16be,
     _length: u16be,
     ssrc: u32be,
     address_ascii: [u8; 64],
@@ -97,7 +98,9 @@ impl GatewayPayload<VoiceOpcode> {
                 let session_description = facet_value::from_value::<SessionDescription>(self.d)?;
 
                 // Init DAVE
+                trace!("SessionDescription: waiting for dave_session lock");
                 let mut dave_session = voice_gateway.dave_session.lock().await;
+                trace!("SessionDescription: dave_session lock acquired");
                 let profile = discord.profile.load();
                 let profile = profile.as_ref().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "user profile not loaded")
@@ -110,27 +113,33 @@ impl GatewayPayload<VoiceOpcode> {
                     profile.id,
                 )
                 .await?;
+                trace!("SessionDescription: DAVE session initialized, key package sent");
 
-                // Commit description to connection
-                if let Some(connection) = voice_gateway.connection.load().as_ref() {
-                    connection
-                        .set_description(session_description)
-                        .map_err(|_| {
-                            io::Error::new(
-                                io::ErrorKind::AlreadyExists,
-                                "session description already set",
-                            )
-                        })?;
+                // Commit description to connection. A repeated session
+                // description is a key rotation: the swap makes the new
+                // keys take effect (send/recv load per packet), and we
+                // must not announce a second call stream for it.
+                let first_description = match voice_gateway.connection.load().as_ref() {
+                    Some(connection) => connection.set_description(session_description),
+                    None => {
+                        warn!("Session description arrived before the UDP connection was set up");
+                        true
+                    }
                 };
 
-                let stream = discord
-                    .clone()
-                    .listen_as::<AudioDiscord, _>()
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-                discord
-                    .voice_events
-                    .push(VoiceEvent::CallStreamReady(stream));
+                if first_description {
+                    // Runs while holding dave_session + both receiver locks.
+                    trace!("SessionDescription: creating audio stream (listen_as)");
+                    let stream = discord
+                        .clone()
+                        .listen_as::<AudioDiscord, _>()
+                        .await
+                        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                    let _ = discord
+                        .voice_events
+                        .force_push(VoiceEvent::CallStreamReady(stream));
+                    trace!("SessionDescription: CallStreamReady emitted");
+                }
             }
             VoiceOpcode::Speaking => {
                 let speaking = facet_value::from_value::<SpeakingPayload>(self.d)?;
@@ -159,7 +168,7 @@ impl GatewayPayload<VoiceOpcode> {
 
                 let send_ip_discovery = unsafe {
                     std::mem::transmute::<IpDiscovery, [u8; 74]>(IpDiscovery {
-                        _req_or_res: 1.into(),
+                        req_or_res: 1.into(),
                         _length: 70.into(),
                         ssrc: ready.ssrc.into(),
                         address_ascii,
@@ -171,12 +180,33 @@ impl GatewayPayload<VoiceOpcode> {
                 udp.connect((ready.ip.as_str(), ready.port)).await?;
                 udp.send(&send_ip_discovery).await?;
 
+                // Wait for the discovery *response* (type 2). A recv error
+                // is fatal — proceeding would select the protocol with a
+                // zeroed address. Skip unrelated packets (keepalives/early
+                // RTP can land before the response), within a sane bound.
+                const MAX_DISCOVERY_ATTEMPTS: usize = 64;
                 let mut buf = [0u8; 74];
-                match udp.recv(&mut buf).await {
-                    Ok(len) => debug!("Got {len} bytes\n{buf:?}"),
-                    Err(e) => error!("No response: {e:?}"),
-                }
-                let recv_ip_discovery = unsafe { mem::transmute::<[u8; 74], IpDiscovery>(buf) };
+                let recv_ip_discovery = 'discovery: {
+                    for _ in 0..MAX_DISCOVERY_ATTEMPTS {
+                        let len = udp.recv(&mut buf).await?;
+                        if len != buf.len() {
+                            debug!("Ignoring non-discovery packet ({len} bytes)");
+                            continue;
+                        }
+                        let response = unsafe { mem::transmute::<[u8; 74], IpDiscovery>(buf) };
+                        if response.req_or_res.get() != 2 {
+                            debug!("Ignoring IP discovery packet that is not a response");
+                            continue;
+                        }
+                        debug!("Got IP discovery response\n{buf:?}");
+                        break 'discovery response;
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "no IP discovery response among received packets",
+                    )
+                    .into());
+                };
 
                 let mut ip_address = str::from_utf8(&recv_ip_discovery.address_ascii)?;
                 if let Some(null_position) =

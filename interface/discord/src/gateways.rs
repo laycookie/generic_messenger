@@ -118,7 +118,17 @@ pub struct Gateway<T> {
     last_sequence_number: OnceLock<AtomicUsize>,
     type_specific_data: T,
 }
-impl<T> Gateway<T> {}
+impl<T> Gateway<T> {
+    /// Send a message on this gateway's websocket. The websocket is private to
+    /// the `gateways` module; this is the seam other modules (e.g. the `Voice`
+    /// trait impl pushing opcode 4) use to transmit a frame.
+    pub(crate) async fn send(
+        &self,
+        msg: WebsocketMessage,
+    ) -> Result<(), async_tungstenite::tungstenite::Error> {
+        self.websocket.send(msg).await
+    }
+}
 impl<T> Deref for Gateway<T> {
     type Target = T;
 

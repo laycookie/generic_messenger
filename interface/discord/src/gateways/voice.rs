@@ -6,11 +6,13 @@ use futures::channel::oneshot;
 use futures::lock::Mutex as AsyncMutex;
 use num_enum::TryFromPrimitive;
 use simple_audio_channels::output::SampleProducer;
+use tracing::trace;
 
 pub(super) use self::gateway::Voice;
 use crate::gateways::Gateway;
 use crate::{ChannelLocation, api_types::SNOWFLAKE};
 
+mod audio;
 pub(super) mod connection;
 mod events;
 mod gateway;
@@ -208,10 +210,6 @@ impl VoiceGateway {
         let mut status = self.status.lock().await;
         *status = VoiceGatewayStatus::AwaitingData { channel };
     }
-    pub async fn replace_status(&self, new_status: VoiceGatewayStatus) {
-        let mut status = self.status.lock().await;
-        *status = new_status;
-    }
     pub async fn insert_endpoint(&self, endpoint: Endpoint) {
         let mut status = self.status.lock().await;
         status.insert_endpoint(endpoint);
@@ -223,7 +221,12 @@ impl VoiceGateway {
     pub fn full_load_gateway(&self) -> Option<Arc<Gateway<Voice>>> {
         self.voice_gateway.load_full()
     }
-    pub async fn connect(&self, user_id: SNOWFLAKE) -> Result<(), Box<dyn Error + Send + Sync>> {
+    /// Open the voice gateway websocket if the handshake data is complete.
+    ///
+    /// Returns `Ok(false)` when the status isn't [`VoiceGatewayStatus::Ready`]
+    /// yet — VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE arrive in either
+    /// order, so callers retry from whichever handler completes the pair.
+    pub async fn connect(&self, user_id: SNOWFLAKE) -> Result<bool, Box<dyn Error + Send + Sync>> {
         let status = self.status.lock().await;
 
         let (endpoint, session_id, channel) = match &*status {
@@ -232,13 +235,13 @@ impl VoiceGateway {
                 session_id,
                 channel,
             } => (endpoint, session_id, channel),
-            _ => {
-                return Err(
-                    io::Error::new(io::ErrorKind::NotConnected, "voice gateway not ready").into(),
-                );
-            }
+            _ => return Ok(false),
         };
 
+        // Freeze suspect: the whole voice websocket handshake (TLS connect,
+        // identify, hello wait) runs here with no timeout, while the caller
+        // holds the main receiver lock and we hold the status lock.
+        trace!("VoiceGateway::connect: handshake data ready, opening voice websocket");
         let gateway = Gateway::<Voice>::new(
             endpoint,
             session_id,
@@ -248,11 +251,13 @@ impl VoiceGateway {
         )
         .await?;
         self.voice_gateway.store(Some(Arc::new(gateway)));
+        trace!("VoiceGateway::connect: voice gateway stored");
 
-        Ok(())
+        Ok(true)
     }
 
     pub async fn disconnect(&self) {
+        trace!("VoiceGateway::disconnect: clearing status and stored gateway");
         let mut status = self.status.lock().await;
         *status = VoiceGatewayStatus::default();
         self.voice_gateway.store(None);

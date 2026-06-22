@@ -1,75 +1,53 @@
 use iced::{
-    Color, Element, Font, Length, Padding,
+    Alignment, Color, Element, Font, Length, Padding,
     advanced::graphics::core::font,
     widget::{
-        Button, Row, Text, column, container, image, row,
+        Button, Column, Row, Text, column, container, image, row,
         text::{Rich, Span},
     },
 };
-use messenger_interface::types::{Identifier, Message};
-use nom::{
-    IResult, Parser,
-    branch::alt,
-    bytes::complete::{tag, tag_no_case, take_until},
-    character::complete::{alphanumeric1, one_of},
-    combinator::recognize,
-    multi::many1,
-    sequence::delimited,
-};
-
-/// Excludes regular text type
-#[derive(Debug)]
-enum Markdown<'a> {
-    Bold(&'a str),
-    Italicized(&'a str),
-    Link(&'a str),
-}
-
-// === Parsers ===
-fn bold_parser(input: &str) -> IResult<&str, Markdown<'_>> {
-    let (left, parsed) = delimited(tag("**"), take_until("**"), tag("**")).parse(input)?;
-    Ok((left, Markdown::Bold(parsed)))
-}
-fn italicized_parser(input: &str) -> IResult<&str, Markdown<'_>> {
-    let (left, parsed) = delimited(tag("*"), take_until("*"), tag("*")).parse(input)?;
-    Ok((left, Markdown::Italicized(parsed)))
-}
-
-// TODO: Very loose rn, solidify it
-fn url_parser(input: &str) -> IResult<&str, Markdown<'_>> {
-    let protocol_scheme = alt((tag_no_case("https://"), tag_no_case("http://")));
-    let valid_url_char = alt((alphanumeric1, recognize(one_of("-._~:/?#[]@!$&'()*+,;=%"))));
-
-    let (left, parsed) = recognize((protocol_scheme, many1(valid_url_char))).parse(input)?;
-    Ok((left, Markdown::Link(parsed)))
-}
-
-// === Special parsers ===
-fn until_parser<'a, F>(
-    mut parser: F,
-) -> impl FnMut(&'a str) -> IResult<&'a str, (&'a str, Markdown<'a>)>
-where
-    F: Parser<&'a str, Output = Markdown<'a>, Error = nom::error::Error<&'a str>>,
-{
-    move |input: &str| {
-        let err = match parser.parse(input) {
-            Ok(val) => return Ok(("", val)),
-            Err(err) => err,
-        };
-
-        for (i, _) in input.char_indices().skip(1) {
-            if let Ok((left, parsed)) = parser.parse(&input[i..]) {
-                return Ok((&input[..i], (left, parsed)));
-            }
-        }
-
-        Err(err)
-    }
-}
-// ======================
+use iced_aw::Wrap;
+use messenger_interface::types::{Emoji, Identifier, Message, Span as RichSpan, TextStyle};
 
 /// IDs at or above this value are pending (optimistic send, not yet confirmed).
 const PENDING_ID_THRESHOLD: u64 = u64::MAX - 1_000_000;
+
+const LINK_COLOR: Color = Color::from_rgb(0.0, 0.0, 1.0);
+const PENDING_COLOR: Color = Color::from_rgb(0.0, 0.8, 0.0);
+const EDITED_COLOR: Color = Color::from_rgb(0.5, 0.5, 0.5);
+/// Inline emoji image edge length, ~matching the text line height.
+const EMOJI_SIZE: f32 = 20.0;
+const STICKER_SIZE: f32 = 120.0;
+
+fn font_for(style: TextStyle) -> Font {
+    Font {
+        weight: if style.bold {
+            font::Weight::Bold
+        } else {
+            font::Weight::Normal
+        },
+        style: if style.italic {
+            font::Style::Italic
+        } else {
+            font::Style::Normal
+        },
+        ..Default::default()
+    }
+}
+
+/// One iced rich-text span for a styled run (the no-inline-image path).
+fn styled_span<'a>(text: &'a str, style: TextStyle) -> Span<'a> {
+    Span::new(text).font(font_for(style))
+}
+
+/// One word as a `Text` widget (the inline-image flow path).
+fn word<'a>(text: &'a str, style: TextStyle, color: Option<Color>) -> Text<'a> {
+    let text = Text::new(text).font(font_for(style));
+    match color {
+        Some(color) => text.color(color),
+        None => text,
+    }
+}
 
 pub fn message_text<'a, M: Clone + 'static>(
     msg: &'a Identifier<Message>,
@@ -90,60 +68,123 @@ pub fn message_text<'a, M: Clone + 'static>(
         .unwrap_or("Unknown");
     let author = Text::from(author_name);
 
-    // === Create Message text box ===
-    let mut spans: std::vec::Vec<Span<'_>> = Vec::new();
+    let spans = &msg.content.text.spans;
+    let stickers: Vec<&'a std::path::PathBuf> = spans
+        .iter()
+        .filter_map(|span| match span {
+            RichSpan::Sticker {
+                image: Some(path), ..
+            } => Some(path),
+            _ => None,
+        })
+        .collect();
+    // iced rich text can't embed images inline, so only switch to the flowing
+    // word/image layout when an emoji actually resolved to an image; plain and
+    // emoji-less messages keep the simpler, better-shaped `Rich` text.
+    let has_inline_image = spans
+        .iter()
+        .any(|span| matches!(span, RichSpan::Emoji(Emoji { image: Some(_), .. })));
 
-    let mut text_left = msg.content.text.as_str();
-    while let Ok((regular_text_parsed, (unparssed, parsed_markdown))) =
-        until_parser(alt((url_parser, italicized_parser, bold_parser))).parse(text_left)
-    {
-        if !regular_text_parsed.is_empty() {
-            spans.push(Span::new(regular_text_parsed));
+    let text_content: Element<'a, M> = if has_inline_image {
+        let text_color = pending.then_some(PENDING_COLOR);
+        let link_color = if pending { PENDING_COLOR } else { LINK_COLOR };
+        let mut elements: Vec<Element<'a, M>> = Vec::new();
+        for span in spans {
+            match span {
+                RichSpan::Text { text, style } => {
+                    for w in text.split_whitespace() {
+                        elements.push(word(w, *style, text_color).into());
+                    }
+                }
+                RichSpan::Link { text, .. } => {
+                    for w in text.split_whitespace() {
+                        elements.push(word(w, TextStyle::default(), Some(link_color)).into());
+                    }
+                }
+                RichSpan::Emoji(emoji) => match &emoji.image {
+                    Some(path) => elements.push(
+                        image(path)
+                            .width(Length::Fixed(EMOJI_SIZE))
+                            .height(Length::Fixed(EMOJI_SIZE))
+                            .into(),
+                    ),
+                    None => {
+                        let shortcode = Text::new(format!(":{}:", emoji.shortcode));
+                        let shortcode = match text_color {
+                            Some(color) => shortcode.color(color),
+                            None => shortcode,
+                        };
+                        elements.push(shortcode.into());
+                    }
+                },
+                RichSpan::Sticker { .. } => {}
+            }
         }
-        spans.push(match parsed_markdown {
-            Markdown::Italicized(text) => Span::new(text).font(Font {
-                style: font::Style::Italic,
-                ..Default::default()
-            }),
-            Markdown::Bold(text) => Span::new(text).font(Font {
-                weight: font::Weight::Bold,
-                ..Default::default()
-            }),
-            Markdown::Link(link) => Span::new(link).color(Color::from_rgb(0.0, 0.0, 1.0)),
-        });
-        text_left = unparssed;
-    }
-    spans.push(Span::new(text_left));
-
-    if pending {
-        for span in &mut spans {
-            *span = span.clone().color(Color::from_rgb(0.0, 0.8, 0.0));
+        if msg.is_edited() {
+            elements.push(Text::new("(edited)").size(12.0).color(EDITED_COLOR).into());
         }
-    }
+        Wrap::with_elements(elements)
+            .spacing(3.0)
+            .line_spacing(3.0)
+            .align_items(Alignment::Center)
+            .width_items(Length::Fill)
+            .into()
+    } else {
+        let mut rich_spans: Vec<Span<'_>> = Vec::new();
+        for span in spans {
+            match span {
+                RichSpan::Text { text, style } => rich_spans.push(styled_span(text, *style)),
+                RichSpan::Emoji(emoji) => {
+                    rich_spans.push(Span::new(format!(":{}:", emoji.shortcode)))
+                }
+                RichSpan::Link { text, .. } => {
+                    rich_spans.push(Span::new(text.as_str()).color(LINK_COLOR))
+                }
+                // Sticker images render below; a sticker with no image falls
+                // back to its alt text here.
+                RichSpan::Sticker { alt, image } => {
+                    if image.is_none() {
+                        rich_spans.push(Span::new(alt.as_str()));
+                    }
+                }
+            }
+        }
+        if pending {
+            for span in &mut rich_spans {
+                *span = span.clone().color(PENDING_COLOR);
+            }
+        }
+        if msg.is_edited() {
+            rich_spans.push(Span::new(" (edited)").color(EDITED_COLOR).size(12.0));
+        }
+        Rich::from_iter(rich_spans).into()
+    };
 
-    if msg.is_edited() {
-        spans.push(
-            Span::new(" (edited)")
-                .color(Color::from_rgb(0.5, 0.5, 0.5))
-                .size(12.0),
-        );
+    // === Message body: text content, then any sticker images ===
+    let mut body = Column::new().push(text_content);
+    for sticker in stickers {
+        body = body.push(image(sticker).height(Length::Fixed(STICKER_SIZE)));
     }
-
-    let message = Rich::from_iter(spans);
 
     // === Reactions ===
     let reactions = Row::from_iter(msg.reactions.iter().map(|reaction| {
         Button::new(row![
-            Rich::with_spans([Span::<M>::new(reaction.emoji.clone())]),
+            Rich::with_spans([Span::<M>::new(reaction.emoji.shortcode.clone())]),
             Text::new(reaction.count)
         ])
-        .on_press(on_reaction(msg, &reaction.emoji, reaction.reacted))
+        .on_press(on_reaction(
+            msg,
+            &reaction.emoji.shortcode,
+            reaction.reacted,
+        ))
         .into()
     }));
 
     row![
         image(&icon).height(image_height),
-        container(column![author, message, reactions]).padding(Padding::new(0.0).left(5.0))
+        container(column![author, body, reactions])
+            .width(Length::Fill)
+            .padding(Padding::new(0.0).left(5.0))
     ]
     .into()
 }

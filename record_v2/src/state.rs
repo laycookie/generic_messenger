@@ -124,6 +124,18 @@ impl MessengerData {
 
         None
     }
+
+    pub fn move_conversation_to_front(&mut self, room_id: ID) {
+        if let Some(pos) = self
+            .conversations
+            .iter()
+            .position(|room| *room.id() == room_id)
+            && pos != 0
+        {
+            let conversation = self.conversations.remove(pos);
+            self.conversations.insert(0, conversation);
+        }
+    }
 }
 
 pub struct MessengerEntry {

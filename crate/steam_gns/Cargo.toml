@@ -1,0 +1,11 @@
+[package]
+name = "steam_gns"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Valve's open-source GameNetworkingSockets (the `-sys` crate compiles GNS via
+# cargo). Isolated here because of the heavy C++ build. See the media build plan
+# in interface/steam/VOICE_PROTOCOL.md.
+game-networking-sockets = "0.2"

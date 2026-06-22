@@ -114,10 +114,10 @@ where
     fn create_messenger(auth_obj: &str) -> Arc<dyn Messenger>
     where
         Self: Sized;
-    /// Stable unique id for this backend instance (e.g. includes account/server context).
-    fn id(&self) -> String;
     /// Human-readable backend name (e.g. `"discord"`).
     fn name(&self) -> &'static str;
+    /// Stable unique id for this backend instance (e.g. includes account/server context).
+    fn id(&self) -> String;
     /// Backend-provided auth identifier (token, session id, etc).
     ///
     /// Note: the exact format is backend-defined.

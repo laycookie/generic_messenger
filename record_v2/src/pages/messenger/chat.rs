@@ -2,7 +2,7 @@ use iced::{
     Element, Length, Task,
     widget::{Button, Column, Scrollable, Text, TextInput, column, row, text::LineHeight},
 };
-use messenger_interface::types::{ID, Identifier, Message as InterfaceMessage, Place, Room};
+use messenger_interface::types::{ID, Identifier, Place, Room, RoomCapabilities};
 
 use crate::{
     components::message_text::message_text,
@@ -64,13 +64,13 @@ impl Chat {
     }
 
     pub fn get_element<'a>(&'a self, messengers: &'a MessengerRegistry) -> Element<'a, Action> {
-        let channel_info = row![
-            Text::new(self.room.name.clone()),
-            Button::new("CALL").on_press(Action::Call {
+        let mut channel_info = row![Text::new(self.room.name.clone())];
+        if self.room.room_capabilities.contains(RoomCapabilities::Voice) {
+            channel_info = channel_info.push(Button::new("CALL").on_press(Action::Call {
                 interface: self.interface.clone(),
-                room: self.room.clone()
-            })
-        ];
+                room: self.room.clone(),
+            }));
+        }
 
         // TODO: Either streamline this, or make it more intuituve
         // to why we grab msgs from where we do.

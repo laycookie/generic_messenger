@@ -1,0 +1,46 @@
+[package]
+name = "steam"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Logs
+tracing = { workspace = true }
+# Async
+async-trait = { workspace = true }
+# Futures compatibility for the steam-vent protocol crate.
+async-compat = "0.2.5"
+futures = { workspace = true }
+futures-timer = "3.0.3"
+# Files/networking for adapter-local cache work, matching the Discord interface stack.
+async-fs = "2.2.0"
+surf = "2.3.2"
+# Collision-proof temp files for atomic download-then-rename caching.
+tempfile = "3"
+# Data structs
+dashmap = "6.1.0"
+# Bitflags
+bitflags = { workspace = true }
+# Time
+chrono = { workspace = true }
+# Security
+secure-string = "0.3.0"
+# Ed25519 identity keypair for the GNS networking cert (key_data) + handshake.
+ed25519-dalek = "2"
+# Random seed for the identity key.
+getrandom = "0.2"
+# Steam network protocol (reverse-engineered Steam client protocol, SteamKit-style)
+steam-vent = "0.5.0"
+# Protobuf message types (CFriendMessages_*, CMsgClient*); not re-exported by
+# steam-vent 0.5, so depend on it directly.
+steam-vent-proto = "0.5.2"
+# Interface
+messenger_interface = { path = "../../crate/messenger_interface" }
+
+[dev-dependencies]
+# Native tokio runtime for the manual voice-signaling capture test. steam-vent is
+# tokio-based; the app bridges via async-compat, but the test runs on tokio directly.
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time"] }
+# Surfaces tracing output (incl. steam-vent's per-message debug logs) during capture.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

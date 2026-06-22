@@ -32,11 +32,14 @@
 		devShells.${system} = {
 			default = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
     		    packages = with pkgs; [
+					nodejs
+
 				  rust-bin.nightly.latest.default
 				  # rust-bin.stable.latest.default
     		      # cargo
     		      # rustc
     		      rust-analyzer
+				  cargo-modules
     		      # rustfmt
 
 				  cargo-expand
@@ -50,12 +53,20 @@
 
 				  openssl
 				  pkg-config
+
+				  # Build deps for game-networking-sockets-sys (compiles Valve's GNS):
+				  # protoc + libprotobuf and abseil. See interface/steam/VOICE_PROTOCOL.md.
+				  protobuf
+				  abseil-cpp
     		    ];
 				LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
 					pkgs.libxkbcommon
 					pkgs.wayland
 					pkgs.vulkan-loader
 				];
+
+				# bindgen (game-networking-sockets-sys) needs libclang to parse headers.
+				LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
     		    # RUST_BACKTRACE = "full";
 				

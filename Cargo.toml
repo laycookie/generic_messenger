@@ -6,8 +6,18 @@ members = [
 	"crate/audio",
 	"crate/messenger_interface",
 	"crate/overwrite_ring",
-	"interface/discord"
+	"crate/steam_gns",
+	"interface/discord",
+	"interface/steam"
 ]
+# Local fork of steam-vent (see [patch.crates-io] below); built as a patched
+# dependency, not a workspace member.
+exclude = ["crate/vendor/steam-vent"]
+
+# Fork steam-vent to dump unpublished service-method payloads (VoiceChatClient.*)
+# during voice-signaling capture. See interface/steam/VOICE_PROTOCOL.md.
+[patch.crates-io]
+steam-vent = { path = "crate/vendor/steam-vent" }
 
 [workspace.dependencies]
 # Logs

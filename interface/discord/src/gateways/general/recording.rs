@@ -11,10 +11,7 @@
 //! front slots that no window still references. See
 //! `crate/messenger_interface/docs/races.md`.
 
-use std::{
-    collections::VecDeque,
-    sync::atomic::Ordering,
-};
+use std::{collections::VecDeque, sync::atomic::Ordering};
 
 use crate::api_types::{self, Message, Reaction, SNOWFLAKE};
 
@@ -115,9 +112,7 @@ impl Drop for RecordingWindow<'_> {
             state.front_seq = new_front;
         }
 
-        self.gateway
-            .recording_refs
-            .fetch_sub(1, Ordering::AcqRel);
+        self.gateway.recording_refs.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -169,7 +164,14 @@ pub fn apply_to_messages(
                 message,
             } if c == channel_id => {
                 if let Some(slot) = messages.iter_mut().find(|m| m.id == message.id) {
+                    let prev_reactions = slot.reactions.take();
                     *slot = message;
+                    // MESSAGE_UPDATE payloads frequently omit `reactions`;
+                    // absent means "unchanged", not "cleared" — keep the
+                    // REST snapshot's reactions in that case.
+                    if slot.reactions.is_none() {
+                        slot.reactions = prev_reactions;
+                    }
                 }
             }
             RecordedEvent::MessageDeleted {
@@ -231,4 +233,112 @@ pub fn apply_to_messages(
 
 fn reaction_matches(reaction: &Reaction, emoji: &api_types::Emoji) -> bool {
     reaction.emoji.id == emoji.id && reaction.emoji.name == emoji.name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api_types::{Emoji, User};
+
+    fn message(id: SNOWFLAKE, content: &str, reactions: Option<Vec<Reaction>>) -> Message {
+        Message {
+            author: User {
+                avatar: None,
+                id: 1,
+                username: "user".to_string(),
+            },
+            channel_id: 10,
+            content: content.to_string(),
+            edited_timestamp: None,
+            id,
+            reactions,
+            sticker_items: None,
+            timestamp: "2026-01-01T00:00:00+00:00".to_string(),
+        }
+    }
+
+    fn reaction(name: &str, count: u32, me: bool) -> Reaction {
+        Reaction {
+            count,
+            emoji: Emoji {
+                id: None,
+                name: name.to_string(),
+            },
+            me,
+        }
+    }
+
+    #[test]
+    fn update_without_reactions_preserves_snapshot_reactions() {
+        let snapshot = vec![message(1, "old", Some(vec![reaction("👍", 2, true)]))];
+        let events = vec![RecordedEvent::MessageUpdated {
+            channel_id: 10,
+            message: message(1, "new", None),
+        }];
+
+        let merged = apply_to_messages(snapshot, events, 10);
+        assert_eq!(merged[0].content, "new");
+        let reactions = merged[0].reactions.as_ref().expect("reactions kept");
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].count, 2);
+    }
+
+    #[test]
+    fn update_with_reactions_replaces_snapshot_reactions() {
+        let snapshot = vec![message(1, "old", Some(vec![reaction("👍", 2, true)]))];
+        let events = vec![RecordedEvent::MessageUpdated {
+            channel_id: 10,
+            message: message(1, "new", Some(vec![reaction("🎉", 1, false)])),
+        }];
+
+        let merged = apply_to_messages(snapshot, events, 10);
+        let reactions = merged[0].reactions.as_ref().unwrap();
+        assert_eq!(reactions[0].emoji.name, "🎉");
+    }
+
+    #[test]
+    fn delete_removes_and_other_channels_ignored() {
+        let snapshot = vec![message(1, "a", None), message(2, "b", None)];
+        let events = vec![
+            RecordedEvent::MessageDeleted {
+                channel_id: 10,
+                message_id: 1,
+            },
+            RecordedEvent::MessageDeleted {
+                channel_id: 99, // different channel — must be ignored
+                message_id: 2,
+            },
+        ];
+
+        let merged = apply_to_messages(snapshot, events, 10);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, 2);
+    }
+
+    #[test]
+    fn reaction_add_and_remove_roundtrip() {
+        let snapshot = vec![message(1, "a", None)];
+        let emoji = Emoji {
+            id: None,
+            name: "👍".to_string(),
+        };
+        let events = vec![
+            RecordedEvent::ReactionAdded {
+                channel_id: 10,
+                message_id: 1,
+                emoji: emoji.clone(),
+                is_self: true,
+            },
+            RecordedEvent::ReactionRemoved {
+                channel_id: 10,
+                message_id: 1,
+                emoji,
+                is_self: true,
+            },
+        ];
+
+        let merged = apply_to_messages(snapshot, events, 10);
+        // Count dropped to zero → reaction entry removed entirely.
+        assert!(merged[0].reactions.as_ref().unwrap().is_empty());
+    }
 }

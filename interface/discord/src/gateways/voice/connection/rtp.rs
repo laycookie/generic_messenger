@@ -33,10 +33,11 @@ pub enum RtcpType {
 ///
 /// Byte 1 of the packet determines the type:
 /// - 200..=207 → RTCP (the byte is the RTCP packet type)
-/// - Anything else → RTP (marker = bit 7, payload type = bits 0..6)
+/// - Anything else → RTP (payload type = bits 0..6; bit 7 is the marker,
+///   which nothing consumes today)
 #[derive(Clone, Copy)]
 pub enum PacketClass {
-    Rtp { marker: bool, payload_type: u8 },
+    Rtp { payload_type: u8 },
     Rtcp(RtcpType),
 }
 
@@ -52,7 +53,6 @@ impl PacketClass {
             206 => Self::Rtcp(RtcpType::PayloadFeedback),
             207 => Self::Rtcp(RtcpType::ExtendedReport),
             other => Self::Rtp {
-                marker: other & 0x80 != 0,
                 payload_type: other & 0x7F,
             },
         }

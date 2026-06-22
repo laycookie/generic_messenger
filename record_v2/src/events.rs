@@ -1,9 +1,9 @@
 use futures::StreamExt;
 use iced::Task;
 use messenger_interface::interface::{AudioEvent, CallState, QueryEvent, TextEvent, VoiceEvent};
-use messenger_interface::types::{ID, Identifier, User};
-use simple_audio_channels::{AudioMixer, SampleFormat};
-use tracing::{debug, error, trace, warn};
+use messenger_interface::types::{Emoji, ID, Identifier, User};
+use simple_audio_channels::{AudioMixer, SampleFormat, StreamFormat, effects::{Gate, GateSettings}};
+use tracing::{debug, trace, warn};
 
 use crate::pages::{AppMessage, StreamDirection};
 use crate::state::{MessengerData, MessengerId, MessengerRegistry};
@@ -113,13 +113,7 @@ pub fn process_text_event(
                     }
                 }
 
-                // Move this conversation to the front of the DM list (most recent first)
-                if let Some(pos) = data.conversations.iter().position(|c| c.id() == room.id())
-                    && pos != 0
-                {
-                    let conv = data.conversations.remove(pos);
-                    data.conversations.insert(0, conv);
-                }
+                data.move_conversation_to_front(room_id);
             }
         }
         TextEvent::MessageUpdated { room, message } => {
@@ -152,14 +146,18 @@ pub fn process_text_event(
                     && let Some(msgs) = room.messages.as_mut()
                     && let Some(msg) = msgs.iter_mut().find(|m| *m.id() == message_id)
                 {
-                    if let Some(reaction) = msg.reactions.iter_mut().find(|r| r.emoji == emoji) {
+                    if let Some(reaction) = msg
+                        .reactions
+                        .iter_mut()
+                        .find(|r| r.emoji.shortcode == emoji)
+                    {
                         reaction.count += 1;
                         if is_self {
                             reaction.reacted = true;
                         }
                     } else {
                         msg.reactions.push(messenger_interface::types::Reaction {
-                            emoji,
+                            emoji: Emoji::shortcode(emoji),
                             count: 1,
                             reacted: is_self,
                         });
@@ -179,14 +177,17 @@ pub fn process_text_event(
                 if let Some(room) = data.room_mut(*room.id())
                     && let Some(msgs) = room.messages.as_mut()
                     && let Some(msg) = msgs.iter_mut().find(|m| *m.id() == message_id)
-                    && let Some(reaction) = msg.reactions.iter_mut().find(|r| r.emoji == emoji)
+                    && let Some(reaction) = msg
+                        .reactions
+                        .iter_mut()
+                        .find(|r| r.emoji.shortcode == emoji)
                 {
                     reaction.count = reaction.count.saturating_sub(1);
                     if is_self {
                         reaction.reacted = false;
                     }
                     if reaction.count == 0 {
-                        msg.reactions.retain(|r| r.emoji != emoji);
+                        msg.reactions.retain(|r| r.emoji.shortcode != emoji);
                     }
                 }
             }
@@ -230,9 +231,11 @@ pub fn process_voice_event(
 
                 if let Some(room) = data.room_mut(*room.id()) {
                     add(&mut room.participants);
-                } else {
-                    error!("Failed to add user to vc");
                 }
+                // Otherwise the containing guild hasn't been opened in the
+                // UI yet — the discord crate owns the authoritative voice
+                // roster and will fold it into `Room.participants` when
+                // `house_details` is fetched, so nothing is lost here.
 
                 for call in &mut data.calls {
                     if call.id() == *room.id() {
@@ -271,8 +274,16 @@ pub fn process_audio_event(
 ) -> Task<AppMessage> {
     match event {
         AudioEvent::AddAudioSource(sender) => {
+            // Discord voice pushes opus-decoded i16 stereo at 48kHz.
             let producer = audio
-                .create_output_channel(2, SampleFormat::I16, 48_000)
+                .create_output_channel(
+                    StreamFormat {
+                        channels: 2,
+                        sample_format: SampleFormat::I16,
+                        sample_rate: 48_000,
+                    },
+                    Vec::new(),
+                )
                 .unwrap();
 
             if sender.send(producer).is_err() {
@@ -284,8 +295,22 @@ pub fn process_audio_event(
             }
         }
         AudioEvent::AddAudioInput(sender) => {
+            // Discord voice encodes f32 stereo frames at 48kHz.
             let input = audio
-                .create_input_channel(2, SampleFormat::I16, 48_000)
+                .create_input_channel(
+                    StreamFormat {
+                        channels: 2,
+                        sample_format: SampleFormat::F32,
+                        sample_rate: 48_000,
+                    },
+                    // Noise-gate the microphone near the device noise floor,
+                    // holding across the gaps between words so transmission is
+                    // not chopped, then closing fully so silence parks.
+                    vec![Box::new(Gate::new(GateSettings {
+                        threshold_db: -54.0,
+                        ..Default::default()
+                    }))],
+                )
                 .unwrap();
 
             if sender.send(input).is_err() {

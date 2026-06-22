@@ -11,6 +11,14 @@ use messenger_interface::types::{ID, Identifier, Place, Room, RoomCapabilities};
 use super::PLACEHOLDER_PFP;
 use crate::state::{Call, MessengerId, MessengerRegistry};
 
+/// Green tint marking a voice channel/button as joinable.
+fn call_button_style(_theme: &iced::Theme, _status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(0.0, 1.0, 0.2))),
+        ..Default::default()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Server {
     pub messenger_id: MessengerId,
@@ -65,57 +73,74 @@ impl Sidebar {
             .padding(Padding::new(0.0).left(8.0).top(6.0).bottom(6.0));
 
         let rooms_list = Column::from_iter(channels.iter().map(move |chan| {
-            if chan.room_capabilities.is_empty() {
+            let caps = chan.room_capabilities;
+
+            if caps.is_empty() {
                 return container(Text::new(chan.name.as_str()))
                     .padding(Padding::new(0.0).left(8.0).top(6.0).bottom(2.0))
                     .into();
             }
 
-            if chan.room_capabilities.contains(RoomCapabilities::Voice)
-                && !chan.room_capabilities.contains(RoomCapabilities::Text)
-            {
-                let channel_button = Button::new(chan.name.as_str())
-                    .on_press(Action::Call(chan.clone()))
-                    .width(Length::Fill)
-                    .style(|_, _| button::Style {
-                        background: Some(iced::Background::Color(Color::from_rgb(0.0, 1.0, 0.2))),
-                        ..Default::default()
-                    });
+            let has_text = caps.contains(RoomCapabilities::Text);
+            let has_voice = caps.contains(RoomCapabilities::Voice);
 
-                let participants =
-                    Column::from_iter(chan.participants.as_deref().unwrap_or(&[]).iter().map(
-                        |participant| {
-                            let avatar = match participant.icon.as_ref() {
-                                Some(icon) => image(icon),
-                                None => image(PLACEHOLDER_PFP),
-                            };
-
-                            Element::from(
-                                row![
-                                    container(
-                                        avatar
-                                            .height(Length::Fixed(18.0))
-                                            .width(Length::Fixed(18.0))
-                                            .content_fit(ContentFit::Cover),
-                                    )
-                                    .padding(Padding::new(0.0).right(6.0).left(18.0)),
-                                    ellipsized_text(participant.name.as_str())
-                                        .wrapping(Wrapping::None),
-                                ]
-                                .width(Length::Fill),
-                            )
-                        },
-                    ));
-
-                return column![channel_button, participants].into();
-            }
-            Button::new(chan.name.as_str())
-                .on_press(Action::OpenChat {
-                    id: server.messenger_id,
-                    conversation: chan.to_owned(),
-                })
+            // The channel name opens the text chat when the room supports text;
+            // a voice-only channel joins its call directly from the name.
+            let name_button = Button::new(chan.name.as_str())
                 .width(Length::Fill)
-                .into()
+                .on_press(if has_text {
+                    Action::OpenChat {
+                        id: server.messenger_id,
+                        conversation: chan.to_owned(),
+                    }
+                } else {
+                    Action::Call(chan.clone())
+                });
+
+            if !has_voice {
+                return name_button.into();
+            }
+
+            // Voice-capable. Steam group voice rooms are BOTH text and voice, so
+            // keep the name as the text entry and add a dedicated join button;
+            // a voice-only (Discord-style) room's name already calls, so just tint it.
+            let header = if has_text {
+                row![
+                    name_button,
+                    Button::new("Call")
+                        .on_press(Action::Call(chan.clone()))
+                        .style(call_button_style),
+                ]
+            } else {
+                row![name_button.style(call_button_style)]
+            };
+
+            let participants =
+                Column::from_iter(chan.participants.as_deref().unwrap_or(&[]).iter().map(
+                    |participant| {
+                        let avatar = match participant.icon.as_ref() {
+                            Some(icon) => image(icon),
+                            None => image(PLACEHOLDER_PFP),
+                        };
+
+                        Element::from(
+                            row![
+                                container(
+                                    avatar
+                                        .height(Length::Fixed(18.0))
+                                        .width(Length::Fixed(18.0))
+                                        .content_fit(ContentFit::Cover),
+                                )
+                                .padding(Padding::new(0.0).right(6.0).left(18.0)),
+                                ellipsized_text(participant.name.as_str())
+                                    .wrapping(Wrapping::None),
+                            ]
+                            .width(Length::Fill),
+                        )
+                    },
+                ));
+
+            column![header, participants].into()
         }));
 
         column![header, rooms_list]

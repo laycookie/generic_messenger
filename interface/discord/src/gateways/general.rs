@@ -1,5 +1,7 @@
 use std::{
-    error::Error, io, pin::pin,
+    error::Error,
+    io,
+    pin::pin,
     sync::{Mutex, OnceLock, atomic::AtomicUsize},
     time::Duration,
 };
@@ -22,6 +24,7 @@ use crate::{
 mod events;
 pub(crate) mod payloads;
 pub(crate) mod recording;
+mod voice_state;
 
 // Implementation of:
 // https://discord.com/developers/docs/events/gateway
@@ -38,6 +41,8 @@ pub enum Opcode {
     Identify = 2,
     PresenceUpdate = 3,
     VoiceStateUpdate = 4,
+    Reconnect = 7,
+    InvalidSession = 9,
     Hello = 10,
     HeartbeatAck = 11,
     CallConnect = 13,
@@ -145,7 +150,10 @@ impl Gateway<General> {
         // TODO: People are dumb (me included) so later maybe check the token for trailing spaces
         // the REST_API already filters for them on Discords end anyways (presumably or at least
         // the ones trailing at the end)
-        let token = discord.token.unsecure();
+        // Resolves a username/password login into a token on first use; a token
+        // login returns the cached token immediately.
+        let token = discord.ensure_token().await?;
+        let token = token.unsecure().trim();
         websocket
             .send(WebsocketMessage::Text(
                 json!({

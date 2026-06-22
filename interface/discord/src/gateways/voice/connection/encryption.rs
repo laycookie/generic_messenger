@@ -25,17 +25,6 @@ impl EncryptionMode {
             EncryptionMode::xsalsa20_poly1305_lite => "xsalsa20_poly1305_lite",
         }
     }
-    pub fn tag_len(&self) -> usize {
-        match self {
-            EncryptionMode::aead_aes256_gcm => 16,
-            EncryptionMode::aead_aes256_gcm_rtpsize => unimplemented!(),
-            EncryptionMode::aead_xchacha20_poly1305_rtpsize => 16,
-            EncryptionMode::xsalsa20_poly1305 => unimplemented!(),
-            EncryptionMode::xsalsa20_poly1305_suffix => unimplemented!(),
-            EncryptionMode::xsalsa20_poly1305_lite => unimplemented!(),
-            EncryptionMode::xsalsa20_poly1305_lite_rtpsize => unimplemented!(),
-        }
-    }
     pub fn nonce_size(&self) -> usize {
         match self {
             EncryptionMode::aead_aes256_gcm => unimplemented!(),

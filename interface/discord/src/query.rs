@@ -1,10 +1,11 @@
 //! High-level query layer.
 //!
-//! This module implements the `Query` and `Text` traits from
-//! `messenger_interface` on top of the raw REST calls in `rest_api.rs` and
-//! the cached state populated by gateway events. It is also the place where
-//! data returned to the UI gets reconciled against the cache so that
-//! HTTP results and gateway events stay coherent.
+//! This module implements the `Query` trait from `messenger_interface` on top
+//! of the raw REST calls in `rest_api.rs` and the cached state populated by
+//! gateway events. It is also the place where data returned to the UI gets
+//! reconciled against the cache so that HTTP results and gateway events stay
+//! coherent. The sibling `Text` (messaging) layer lives in `text.rs` and
+//! shares the same cache/REST reconciliation model described below.
 //!
 //! # Two query shapes
 //!
@@ -50,24 +51,55 @@
 //! See `crate/messenger_interface/docs/races.md` for the full reconciliation
 //! policy and the per-fetch audit table.
 use crate::{
-    AudioDiscord, Discord, InnerDiscord, Owned, QueryDiscord, TextDiscord, VoiceDiscord,
+    Discord, InnerDiscord, Owned, QueryDiscord, StreamPollGuard,
     api_types::{self, SNOWFLAKE},
-    downloaders::cache_cdn_image,
+    downloaders::CdnImage,
 };
 use async_trait::async_trait;
-use futures::future::join_all;
+use futures::future::{Either, join_all, select};
+use futures_timer::Delay;
 use messenger_interface::{
-    interface::{AudioEvent, Ordering, Query, QueryEvent, Text, TextEvent, VoiceEvent},
+    interface::{Query, QueryEvent},
     stream::{ArcStream, WeakSocketStream},
-    types::{
-        CacheCategory, House, Identifier, Message, Place, Reaction, Room, RoomCapabilities, User,
-    },
+    types::{House, Identifier, Place, Room, RoomCapabilities, User},
 };
 use tracing::{error, warn};
 
-use std::{error::Error, sync::Arc};
+use std::{error::Error, sync::Arc, time::Duration};
+
+const GATEWAY_CACHE_POLL_ATTEMPTS: usize = 8;
+const GATEWAY_CACHE_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl InnerDiscord<Owned> {
+    // TODO: Depricate
+    async fn poll_gateway_until(&self, ready: impl Fn(&Self) -> bool) -> bool {
+        if ready(self) {
+            return true;
+        }
+        if let Err(err) = self.ensure_gateway().await {
+            warn!("Discord: failed to open gateway for REST fallback: {err}");
+            return false;
+        }
+
+        for _ in 0..GATEWAY_CACHE_POLL_ATTEMPTS {
+            if ready(self) {
+                return true;
+            }
+
+            let poll = self.poll_gateway_cache_event();
+            futures::pin_mut!(poll);
+            let timeout = Delay::new(GATEWAY_CACHE_POLL_TIMEOUT);
+            futures::pin_mut!(timeout);
+            match select(poll, timeout).await {
+                Either::Left((Some(()), _)) => {}
+                Either::Left((None, _)) => return false,
+                Either::Right((_, _)) => {}
+            }
+        }
+
+        ready(self)
+    }
+
     async fn process_dm_channels(
         &self,
         channels: &[api_types::Channel],
@@ -99,10 +131,32 @@ impl InnerDiscord<Owned> {
         places
     }
 
+    async fn process_contacts(&self, friends: &[api_types::Friend]) -> Vec<Identifier<User>> {
+        let contact_producer = friends
+            .iter()
+            .map(async move |friend| {
+                let hash = match &friend.user.avatar {
+                    Some(hash) => CdnImage::avatar(friend.id, hash).fetch().await.ok(),
+                    None => None,
+                };
+
+                Discord::identifier_generator(
+                    friend.id,
+                    User {
+                        name: friend.user.username.clone(),
+                        icon: hash,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        join_all(contact_producer).await
+    }
+
     async fn process_guilds(&self, guilds: &[api_types::Guild]) -> Vec<Identifier<Place<House>>> {
         let house_producer = guilds.iter().map(async move |guild| {
             let icon = guild.icon.as_ref().map(async move |hash| {
-                match cache_cdn_image("icons", CacheCategory::Servers, guild.id, hash).await {
+                match CdnImage::guild_icon(guild.id, hash).fetch().await {
                     Ok(path) => Some(path),
                     Err(e) => {
                         error!("Failed to download icon for guild: {}\n{}", guild.name, e);
@@ -195,6 +249,14 @@ impl InnerDiscord<Owned> {
                     .name
                     .clone()
                     .unwrap_or_else(|| "Unknown".to_string());
+                // Seed participants from the live voice roster so a guild
+                // loaded after Ready already contains the users currently
+                // in voice — no extra fetch, no race with gateway events.
+                let participants = self
+                    .voice_participants
+                    .get(&channel.id)
+                    .map(|entry| entry.clone())
+                    .unwrap_or_default();
                 let identifier = Discord::identifier_generator(
                     channel.id,
                     Place::new(
@@ -202,7 +264,7 @@ impl InnerDiscord<Owned> {
                         None,
                         Room::new(
                             RoomCapabilities::from(channel.channel_type),
-                            Some(Vec::new()),
+                            Some(participants),
                             None,
                         ),
                     ),
@@ -219,9 +281,7 @@ impl InnerDiscord<Owned> {
 
     async fn process_profile(&self, profile: &api_types::Profile) -> Identifier<User> {
         let icon = match &profile.avatar {
-            Some(hash) => cache_cdn_image("avatars", CacheCategory::Users, profile.id, hash)
-                .await
-                .ok(),
+            Some(hash) => CdnImage::avatar(profile.id, hash).fetch().await.ok(),
             None => None,
         };
 
@@ -241,50 +301,84 @@ impl Query for InnerDiscord<Owned> {
         if let Some(profile) = self.profile.load_full() {
             return Ok(self.process_profile(&profile).await);
         }
-        let profile = self.rest_get_profile().await?;
-        Ok(self.process_profile(&profile).await)
+        let rest_err = match self.rest_get_profile().await {
+            Ok(profile) => return Ok(self.process_profile(&profile).await),
+            Err(err) => err,
+        };
+
+        warn!("Discord: REST profile fetch failed; trying gateway Ready cache: {rest_err}");
+        if self
+            .poll_gateway_until(|discord| discord.profile.load().is_some())
+            .await
+            && let Some(profile) = self.profile.load_full()
+        {
+            return Ok(self.process_profile(&profile).await);
+        }
+
+        Err(rest_err)
     }
 
     async fn contacts(&self) -> Result<Vec<Identifier<User>>, Box<dyn Error + Sync + Send>> {
-        let friends = self.rest_get_contacts().await?;
+        if let Some(cached) = self.relationships.load_full() {
+            return Ok(self.process_contacts(&cached).await);
+        }
+        let rest_err = match self.rest_get_contacts().await {
+            Ok(friends) => return Ok(self.process_contacts(&friends).await),
+            Err(err) => err,
+        };
 
-        let contact_producer = friends
-            .iter()
-            .map(async move |friend| {
-                let hash = match &friend.user.avatar {
-                    Some(hash) => cache_cdn_image("avatars", CacheCategory::Users, friend.id, hash)
-                        .await
-                        .ok(),
-                    None => None,
-                };
+        warn!("Discord: REST contacts fetch failed; trying gateway Ready cache: {rest_err}");
+        if self
+            .poll_gateway_until(|discord| discord.relationships.load().is_some())
+            .await
+            && let Some(cached) = self.relationships.load_full()
+        {
+            return Ok(self.process_contacts(&cached).await);
+        }
 
-                Discord::identifier_generator(
-                    friend.id,
-                    User {
-                        name: friend.user.username.clone(),
-                        icon: hash,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-
-        Ok(join_all(contact_producer).await)
+        Err(rest_err)
     }
 
     async fn rooms(&self) -> Result<Vec<Identifier<Place<Room>>>, Box<dyn Error + Sync + Send>> {
         if let Some(cached) = self.dm_channels.load_full() {
             return Ok(self.process_dm_channels(&cached).await);
         }
-        let channels = self.rest_get_dms().await?;
-        Ok(self.process_dm_channels(&channels).await)
+        let rest_err = match self.rest_get_dms().await {
+            Ok(channels) => return Ok(self.process_dm_channels(&channels).await),
+            Err(err) => err,
+        };
+
+        warn!("Discord: REST DM fetch failed; trying gateway Ready cache: {rest_err}");
+        if self
+            .poll_gateway_until(|discord| discord.dm_channels.load().is_some())
+            .await
+            && let Some(cached) = self.dm_channels.load_full()
+        {
+            return Ok(self.process_dm_channels(&cached).await);
+        }
+
+        Err(rest_err)
     }
 
     async fn houses(&self) -> Result<Vec<Identifier<Place<House>>>, Box<dyn Error + Sync + Send>> {
         if let Some(cached) = self.guilds.load_full() {
             return Ok(self.process_guilds(&cached).await);
         }
-        let guilds = self.rest_get_guilds().await?;
-        Ok(self.process_guilds(&guilds).await)
+        let rest_err = match self.rest_get_guilds().await {
+            Ok(guilds) => return Ok(self.process_guilds(&guilds).await),
+            Err(err) => err,
+        };
+
+        warn!("Discord: REST guild fetch failed; trying gateway Ready cache: {rest_err}");
+        if self
+            .poll_gateway_until(|discord| discord.guilds.load().is_some())
+            .await
+            && let Some(cached) = self.guilds.load_full()
+        {
+            return Ok(self.process_guilds(&cached).await);
+        }
+
+        Err(rest_err)
     }
 
     // TODO: Implement room_details and house_details if needed
@@ -318,245 +412,23 @@ impl Query for InnerDiscord<Owned> {
 }
 
 #[async_trait]
-impl Text for InnerDiscord<Owned> {
-    async fn get_messages(
-        &self,
-        location: &Identifier<Place<Room>>,
-        load_messages_before: Option<Identifier<Message>>,
-        ordering: Ordering,
-    ) -> Result<Vec<Identifier<Message>>, Box<dyn Error + Sync + Send>> {
-        let channel_location = *self
-            .channel_id_mappings
-            .get(location.id())
-            .ok_or("No discord channel id mapping for this room")?;
-
-        let before = match load_messages_before {
-            Some(msg) => Some(
-                *self
-                    .message_id_mappings
-                    .get(msg.id())
-                    .ok_or("No discord message id mapping for before-pagination")?,
-            ),
-            None => None,
-        };
-
-        // Open a recording window *before* firing REST so any
-        // MessageUpdate / MessageDelete / Reaction events that arrive
-        // during the fetch are captured for the post-response merge.
-        // If the gateway is down, skip — REST is then the only source
-        // of truth and there is nothing to merge against. See
-        // `crate/messenger_interface/docs/races.md`.
-        let gateway = self.gateway.load_full();
-        let window = gateway.as_ref().map(|g| g.start_recording());
-
-        let messages = self
-            .rest_get_messages(channel_location.channel_id(), before)
-            .await?;
-
-        // Drain the recording window and fold captured deltas onto the
-        // REST snapshot: deletes drop entries, updates replace them,
-        // reaction events mutate the cached vec in place.
-        let messages = match window {
-            Some(w) => crate::gateways::general::recording::apply_to_messages(
-                messages,
-                w.take(),
-                channel_location.channel_id(),
-            ),
-            None => messages,
-        };
-
-        // Discord returns messages newest-first. For `Ordering::Time` we
-        // reverse so callers get oldest-first; `Unordered` keeps the
-        // newest-first arrival order.
-        let messages_iter: Box<dyn Iterator<Item = api_types::Message> + Send> = match ordering {
-            Ordering::Time => Box::new(messages.into_iter().rev()),
-            Ordering::Unordered => Box::new(messages.into_iter()),
-        };
-        let identifiers = join_all(messages_iter.map(async |message| {
-            let (content, history) = message.revisions();
-            let reactions = message
-                .reactions
-                .unwrap_or(Vec::new())
-                .iter()
-                .map(|reaction| Reaction {
-                    emoji: reaction.emoji.name.clone(),
-                    count: reaction.count,
-                    reacted: reaction.me,
-                })
-                .collect();
-
-            let icon = match &message.author.avatar {
-                Some(hash) => {
-                    cache_cdn_image("avatars", CacheCategory::Users, message.author.id, hash)
-                        .await
-                        .ok()
-                }
-                None => None,
-            };
-
-            let author = messenger_interface::types::Identifier::new(
-                message.author.id,
-                messenger_interface::types::User {
-                    name: message.author.username,
-                    icon,
-                },
-            );
-            let identifier = Discord::identifier_generator(
-                message.id,
-                Message {
-                    content,
-                    history,
-                    reactions,
-                    author: Some(author),
-                },
-            );
-
-            (identifier, message.id)
-        }))
-        .await;
-
-        Ok(identifiers
-            .into_iter()
-            .map(|(identifier, discord_msg_id)| {
-                self.message_id_mappings
-                    .insert(*identifier.id(), discord_msg_id);
-                identifier
-            })
-            .collect())
-    }
-
-    async fn add_reaction(
-        &self,
-        location: &Identifier<Place<Room>>,
-        message: &Identifier<Message>,
-        emoji: &str,
-    ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let channel_location = *self
-            .channel_id_mappings
-            .get(location.id())
-            .ok_or("No discord channel id mapping for this room")?;
-        let msg_id = *self
-            .message_id_mappings
-            .get(message.id())
-            .ok_or("No discord message id mapping")?;
-        self.rest_add_reaction(channel_location.channel_id(), msg_id, emoji)
-            .await
-    }
-
-    async fn remove_reaction(
-        &self,
-        location: &Identifier<Place<Room>>,
-        message: &Identifier<Message>,
-        emoji: &str,
-    ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let channel_location = *self
-            .channel_id_mappings
-            .get(location.id())
-            .ok_or("No discord channel id mapping for this room")?;
-        let msg_id = *self
-            .message_id_mappings
-            .get(message.id())
-            .ok_or("No discord message id mapping")?;
-        self.rest_remove_reaction(channel_location.channel_id(), msg_id, emoji)
-            .await
-    }
-
-    async fn send_message(
-        &self,
-        location: &Identifier<Place<Room>>,
-        contents: Message,
-    ) -> Result<Identifier<Message>, Box<dyn Error + Sync + Send>> {
-        let channel_location = *self
-            .channel_id_mappings
-            .get(location.id())
-            .ok_or("No discord channel id mapping for this room")?;
-
-        let msg = self
-            .rest_send_message(channel_location.channel_id(), contents.content.text)
-            .await?;
-
-        let (content, history) = msg.revisions();
-        let icon = match &msg.author.avatar {
-            Some(hash) => cache_cdn_image("avatars", CacheCategory::Users, msg.author.id, hash)
-                .await
-                .ok(),
-            None => None,
-        };
-        let author = Identifier::new(
-            msg.author.id,
-            User {
-                name: msg.author.username,
-                icon,
-            },
-        );
-
-        Ok(Identifier::new(
-            msg.id,
-            Message {
-                content,
-                history,
-                reactions: Vec::new(),
-                author: Some(author),
-            },
-        ))
-    }
-    async fn listen(
-        self: Arc<Self>,
-    ) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
-        self.listen_as::<TextDiscord, _>().await
-    }
-}
-
-#[async_trait]
 impl ArcStream for InnerDiscord<QueryDiscord> {
     type Item = QueryEvent;
     /// Await the next item. Works with shared ownership via `Arc`.
     async fn next(self: Arc<Self>) -> Option<<Self as ArcStream>::Item> {
+        let _guard = StreamPollGuard::new(&self.active_streams);
         loop {
+            if self.killed.load(std::sync::atomic::Ordering::Acquire) {
+                return None;
+            }
+            if self.owner_dropped() {
+                self.kill();
+                return None;
+            }
             if let Some(event) = self.query_events.pop() {
                 return Some(event);
             }
-            self.poll_for_events().await;
-        }
-    }
-}
-#[async_trait]
-impl ArcStream for InnerDiscord<TextDiscord> {
-    type Item = TextEvent;
-    /// Await the next item. Works with shared ownership via `Arc`.
-    async fn next(self: Arc<Self>) -> Option<<Self as ArcStream>::Item> {
-        loop {
-            if let Some(event) = self.text_events.pop() {
-                return Some(event);
-            }
-            self.poll_for_events().await;
-        }
-    }
-}
-#[async_trait]
-impl ArcStream for InnerDiscord<VoiceDiscord> {
-    type Item = VoiceEvent;
-    /// Await the next item. Works with shared ownership via `Arc`.
-    async fn next(self: Arc<Self>) -> Option<<Self as ArcStream>::Item> {
-        loop {
-            if let Some(event) = self.voice_events.pop() {
-                return Some(event);
-            }
-            self.poll_for_events().await;
-        }
-    }
-}
-
-#[async_trait]
-impl ArcStream for InnerDiscord<AudioDiscord> {
-    type Item = AudioEvent;
-    /// Await the next item. Works with shared ownership via `Arc`.
-    async fn next(self: Arc<Self>) -> Option<<Self as ArcStream>::Item> {
-        loop {
-            if let Some(event) = self.audio_events.pop() {
-                return Some(event);
-            }
-            self.poll_audio().await?;
+            self.poll_for_events().await?;
         }
     }
 }

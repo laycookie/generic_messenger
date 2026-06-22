@@ -5,9 +5,10 @@ use std::{
 };
 
 use facet_pretty::FacetPretty;
+use futures::future::join_all;
 use messenger_interface::{
-    interface::{QueryEvent, TextEvent, VoiceEvent},
-    types::{CacheCategory, Identifier, Message as GlobalMessage, User as GlobalUser},
+    interface::{QueryEvent, TextEvent},
+    types::{Identifier, Message as GlobalMessage, User as GlobalUser},
 };
 use tracing::{debug, error, trace, warn};
 
@@ -19,50 +20,9 @@ use super::{
 use crate::{
     ChannelLocation, Discord, InnerDiscord, UnitStruct,
     api_types::{self, Message},
-    downloaders::cache_cdn_image,
+    downloaders::CdnImage,
     gateways::{GatewayPayload, voice::Endpoint},
 };
-
-async fn emit_voice_state_participant<T: UnitStruct>(
-    discord: &InnerDiscord<T>,
-    user_id: api_types::SNOWFLAKE,
-    mut voice_state: VoiceStatePayload,
-    member_user: Option<api_types::User>,
-) {
-    let Some(channel_id) = voice_state.channel_id else {
-        discord.voice_states.remove(&user_id);
-        discord
-            .voice_events
-            .push(VoiceEvent::ParticipantLeft { user_id });
-        return;
-    };
-
-    let member = voice_state.member.take();
-    discord.voice_states.insert(user_id, voice_state);
-
-    let Some(user) = member.map(|m| m.user).or(member_user) else {
-        warn!("Voice state for user {user_id} is missing member data");
-        return;
-    };
-
-    let icon = match &user.avatar {
-        Some(hash) => cache_cdn_image("avatars", CacheCategory::Users, user.id, hash)
-            .await
-            .ok(),
-        None => None,
-    };
-
-    discord.voice_events.push(VoiceEvent::ParticipantJoined {
-        room: Identifier::new(channel_id, ()),
-        user: Identifier::new(
-            user.id,
-            GlobalUser {
-                name: user.username,
-                icon,
-            },
-        ),
-    });
-}
 
 impl GatewayPayload<Opcode> {
     pub(in crate::gateways) async fn exec<T: UnitStruct>(
@@ -94,6 +54,12 @@ impl GatewayPayload<Opcode> {
                 // https://discord.com/developers/docs/events/gateway-events#receive-events
                 match event_name {
                     GatewayEvent::Ready => {
+                        // Reconnects reuse `InnerDiscord`, so wipe per-channel
+                        // voice rosters before rebuilding from this Ready's
+                        // voice_states — otherwise stale entries linger.
+                        discord.voice_states.clear();
+                        discord.voice_participants.clear();
+
                         let ready = facet_value::from_value::<ReadyPayload>(self.d)?;
 
                         if let Some(user) = ready.user {
@@ -108,9 +74,33 @@ impl GatewayPayload<Opcode> {
                             discord.dm_channels.store(Some(Arc::new(private_channels)));
                         }
 
+                        if let Some(relationships) = ready.relationships {
+                            let mut cached_relationships = Vec::new();
+                            for relationship in relationships {
+                                match facet_value::from_value::<api_types::Friend>(relationship) {
+                                    Ok(relationship) => cached_relationships.push(relationship),
+                                    Err(err) => warn!("Skipping unparseable relationship: {err}"),
+                                }
+                            }
+                            discord
+                                .relationships
+                                .store(Some(Arc::new(cached_relationships)));
+                        }
+
                         let mut merged_members =
                             ready.merged_members.unwrap_or_default().into_iter();
                         let mut cached_guilds = Vec::new();
+                        // Collect one future per voice participant and resolve
+                        // them concurrently below instead of awaiting each in
+                        // turn. Every future awaits an avatar download; doing
+                        // them sequentially blocks the dispatch task — and with
+                        // it the heartbeat (see the `select!` in `polling.rs`) —
+                        // for the *sum* of every download, which on a cold image
+                        // cache can exceed the heartbeat interval and get the
+                        // gateway dropped. `voice_states` was just cleared and a
+                        // user appears in at most one voice state, so these are
+                        // independent (no cross-eviction) and order-free.
+                        let mut voice_participant_futures = Vec::new();
 
                         for guild_payload in ready.guilds.unwrap_or_default() {
                             if let (Some(guild_id), Some(channels)) =
@@ -135,15 +125,17 @@ impl GatewayPayload<Opcode> {
 
                             for voice_state in guild_payload.voice_states.unwrap_or_default() {
                                 let member_user = members.remove(&voice_state.user_id);
-                                emit_voice_state_participant(
-                                    discord,
-                                    voice_state.user_id,
-                                    voice_state,
-                                    member_user,
-                                )
-                                .await;
+                                voice_participant_futures.push(
+                                    discord.emit_voice_state_participant(
+                                        voice_state.user_id,
+                                        voice_state,
+                                        member_user,
+                                    ),
+                                );
                             }
                         }
+
+                        join_all(voice_participant_futures).await;
 
                         if !cached_guilds.is_empty() {
                             discord.guilds.store(Some(Arc::new(cached_guilds)));
@@ -160,20 +152,33 @@ impl GatewayPayload<Opcode> {
                         let current_user_id =
                             discord.profile.load().as_ref().map(|profile| profile.id);
 
-                        if current_user_id == Some(voice_state.user_id) {
+                        let event_user_id = voice_state.user_id;
+                        let is_own_state = current_user_id == Some(event_user_id);
+                        if is_own_state {
                             gateway
                                 .voice
                                 .insert_session_id(voice_state.session_id.clone())
                                 .await;
                         }
 
-                        emit_voice_state_participant(
-                            discord,
-                            voice_state.user_id,
-                            voice_state,
-                            None,
-                        )
-                        .await;
+                        discord
+                            .emit_voice_state_participant(voice_state.user_id, voice_state, None)
+                            .await;
+
+                        // VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE can
+                        // arrive in either order. If the endpoint got here
+                        // first, the connect attempt in the VoiceServerUpdate
+                        // handler bailed with "not ready" — retry now that
+                        // the session id completed the handshake data.
+                        if is_own_state && gateway.voice.full_load_gateway().is_none() {
+                            trace!("VoiceStateUpdate: attempting voice gateway connect");
+                            match gateway.voice.connect(event_user_id).await {
+                                Ok(true) => debug!("Voice connected via VoiceStateUpdate path"),
+                                Ok(false) => (), // endpoint not received yet — the normal order
+                                Err(err) => error!("{err:?}"),
+                            }
+                            trace!("VoiceStateUpdate: voice connect attempt finished");
+                        }
                     }
                     GatewayEvent::VoiceServerUpdate => {
                         let server_update =
@@ -201,12 +206,19 @@ impl GatewayPayload<Opcode> {
                             })?
                             .id;
 
+                        trace!("VoiceServerUpdate: attempting voice gateway connect");
                         match gateway.voice.connect(user_id).await {
-                            Ok(_) => (),
+                            Ok(true) => (),
+                            // Session id hasn't arrived yet; the
+                            // VoiceStateUpdate handler retries when it does.
+                            Ok(false) => {
+                                debug!("Voice handshake incomplete (awaiting session id)")
+                            }
                             Err(err) => {
                                 error!("{err:?}");
                             }
                         };
+                        trace!("VoiceServerUpdate: voice connect attempt finished");
                     }
                     GatewayEvent::MessageCreate => {
                         let message = facet_value::from_value::<Message>(self.d)?;
@@ -215,16 +227,11 @@ impl GatewayPayload<Opcode> {
                         let msg_id_hash = message.id;
 
                         trace!("{}", message.pretty());
-                        let (content, history) = message.revisions();
+                        let (content, history) = message.revisions().await;
                         let icon = match &message.author.avatar {
-                            Some(hash) => cache_cdn_image(
-                                "avatars",
-                                CacheCategory::Users,
-                                message.author.id,
-                                hash,
-                            )
-                            .await
-                            .ok(),
+                            Some(hash) => {
+                                CdnImage::avatar(message.author.id, hash).fetch().await.ok()
+                            }
                             None => None,
                         };
                         let author = Identifier::new(
@@ -248,13 +255,24 @@ impl GatewayPayload<Opcode> {
                             .message_id_mappings
                             .insert(*msg_identifier.id(), msg_id_hash);
 
-                        discord.text_events.push(TextEvent::MessageCreated {
+                        discord.text_events.force_push(TextEvent::MessageCreated {
                             room: Identifier::new(channel_id_hash, ()),
                             message: msg_identifier,
                         });
                     }
                     GatewayEvent::MessageUpdate => {
-                        let message = facet_value::from_value::<Message>(self.d)?;
+                        // MESSAGE_UPDATE payloads can be partial: embed
+                        // unfurls (someone posts a link) arrive without
+                        // author/content/timestamp. We track none of the
+                        // fields such updates carry, so skip them instead
+                        // of failing the whole dispatch.
+                        let message = match facet_value::from_value::<Message>(self.d) {
+                            Ok(message) => message,
+                            Err(err) => {
+                                debug!("Skipping partial MESSAGE_UPDATE: {err}");
+                                return Ok(());
+                            }
+                        };
 
                         trace!("{}", message.pretty());
 
@@ -269,16 +287,14 @@ impl GatewayPayload<Opcode> {
                             message: message.clone(),
                         });
 
-                        let (content, history) = message.revisions();
+                        let (content, history) = message.revisions().await;
+                        // Edit payloads often omit `reactions`; map what we
+                        // got so reactions survive when they are included.
+                        let reactions = message.interface_reactions().await;
                         let icon = match &message.author.avatar {
-                            Some(hash) => cache_cdn_image(
-                                "avatars",
-                                CacheCategory::Users,
-                                message.author.id,
-                                hash,
-                            )
-                            .await
-                            .ok(),
+                            Some(hash) => {
+                                CdnImage::avatar(message.author.id, hash).fetch().await.ok()
+                            }
                             None => None,
                         };
                         let author = Identifier::new(
@@ -293,12 +309,12 @@ impl GatewayPayload<Opcode> {
                             GlobalMessage {
                                 content,
                                 history,
-                                reactions: Vec::new(),
+                                reactions,
                                 author: Some(author),
                             },
                         );
 
-                        discord.text_events.push(TextEvent::MessageUpdated {
+                        discord.text_events.force_push(TextEvent::MessageUpdated {
                             room: Identifier::new(message.channel_id, ()),
                             message: msg_identifier,
                         });
@@ -319,7 +335,7 @@ impl GatewayPayload<Opcode> {
                             message_id: payload.id,
                         });
 
-                        discord.text_events.push(TextEvent::MessageDeleted {
+                        discord.text_events.force_push(TextEvent::MessageDeleted {
                             room: Identifier::new(payload.channel_id, ()),
                             message_id: payload.id,
                         });
@@ -363,7 +379,7 @@ impl GatewayPayload<Opcode> {
                             is_self,
                         });
 
-                        discord.text_events.push(TextEvent::ReactionAdded {
+                        discord.text_events.force_push(TextEvent::ReactionAdded {
                             room: Identifier::new(channel_id, ()),
                             message_id,
                             user_id,
@@ -394,7 +410,7 @@ impl GatewayPayload<Opcode> {
                             is_self,
                         });
 
-                        discord.text_events.push(TextEvent::ReactionRemoved {
+                        discord.text_events.force_push(TextEvent::ReactionRemoved {
                             room: Identifier::new(channel_id, ()),
                             message_id,
                             user_id,
@@ -406,6 +422,7 @@ impl GatewayPayload<Opcode> {
 
                         let place_room = channel.to_room_data().await;
                         let room = Discord::identifier_generator(channel.id, place_room);
+                        let guild_id = channel.guild_id;
 
                         // Top-level ChannelCreate carries guild_id directly,
                         // so no parent context is needed.
@@ -418,9 +435,22 @@ impl GatewayPayload<Opcode> {
                             );
                         }
 
-                        discord.query_events.push(QueryEvent::ChannelCreated {
-                            r#where: channel
-                                .guild_id
+                        // Append to the per-guild channel cache so a later
+                        // `house_details` fetch for this guild sees the new
+                        // channel — without this, the cache reflects only
+                        // the Ready snapshot and freshly-created channels
+                        // vanish until the gateway reconnects. DM/group-DM
+                        // creates (no guild_id) aren't cached here yet.
+                        if let Some(guild_id) = guild_id {
+                            discord
+                                .guild_channels
+                                .entry(guild_id)
+                                .or_default()
+                                .push(channel);
+                        }
+
+                        discord.query_events.force_push(QueryEvent::ChannelCreated {
+                            r#where: guild_id
                                 .map(|guild_id| Discord::identifier_generator(guild_id, ())),
                             room,
                         });
@@ -434,6 +464,16 @@ impl GatewayPayload<Opcode> {
                     }
                     _ => warn!("Unknown event_name received: {}", event_name.pretty()),
                 }
+            }
+            Opcode::Reconnect | Opcode::InvalidSession => {
+                // The server wants this connection gone (and we don't
+                // implement RESUME). Tear the gateway down: the event
+                // streams end, and a later `listen()` establishes a
+                // fresh connection with a fresh `Ready` snapshot.
+                warn!(
+                    "Server requested reconnect / invalidated the session; tearing down the gateway"
+                );
+                discord.gateway.store(None);
             }
             Opcode::HeartbeatAck => {
                 trace!("HeartbeatAck");
