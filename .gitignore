@@ -5,7 +5,11 @@ LoginInfo
 
 /.idea
 /.cursor
-/.claude
+# Claude Code: ignore local state, keep shared caveman config
+/.claude/*
+!/.claude/settings.json
+!/.claude/skills/
+!/.claude/skills/**
 
 Cargo.lock
 # Note that flake.lock is not supposed to be here, unlike other packet
