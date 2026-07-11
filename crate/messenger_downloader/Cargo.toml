@@ -1,0 +1,15 @@
+[package]
+name = "messenger_downloader"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+async-fs = "2.2.0"
+facet = { workspace = true }
+facet-json = { workspace = true }
+futures-timer = "3.0.3"
+messenger_interface = { path = "../messenger_interface" }
+surf = "2.3.2"
+tempfile = "3"
+tracing = { workspace = true }

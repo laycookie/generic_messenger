@@ -8,7 +8,7 @@
 
 use messenger_interface::{
     interface::VoiceEvent,
-    types::{Identifier, User as GlobalUser},
+    types::{Identifier, User as GlobalUser, VoiceState},
 };
 use tracing::warn;
 
@@ -54,6 +54,12 @@ impl<T: UnitStruct> InnerDiscord<T> {
         };
 
         let member = voice_state.member.take();
+        // Server-applied and self-applied states are folded together: the UI
+        // only cares whether the user can hear/be heard, not who flipped it.
+        let call_state = VoiceState {
+            muted: voice_state.mute || voice_state.self_mute,
+            deafened: voice_state.deaf || voice_state.self_deaf,
+        };
         // Capture the previous channel (if any) so we can evict the user from
         // its roster after the insert overwrites the state.
         let prev_channel_id = self
@@ -67,7 +73,28 @@ impl<T: UnitStruct> InnerDiscord<T> {
         }
 
         let Some(user) = member.map(|m| m.user).or(member_user) else {
-            warn!("Voice state for user {user_id} is missing member data");
+            // Flag-only updates (mute/deafen toggles) can arrive without
+            // member data, and DM-call states never carry it. When the user
+            // is already on the roster we still know who they are: refresh
+            // the flags in place and re-emit instead of dropping the update.
+            let known = self
+                .voice_participants
+                .get_mut(&channel_id)
+                .and_then(|mut entry| {
+                    entry.iter_mut().find(|u| *u.id() == user_id).map(|user| {
+                        user.voice = Some(call_state);
+                        user.clone()
+                    })
+                });
+            match known {
+                Some(user) => {
+                    let _ = self.voice_events.force_push(VoiceEvent::ParticipantJoined {
+                        room: Identifier::new(channel_id, ()),
+                        user,
+                    });
+                }
+                None => warn!("Voice state for user {user_id} is missing member data"),
+            }
             return;
         };
 
@@ -79,8 +106,14 @@ impl<T: UnitStruct> InnerDiscord<T> {
         let user_identifier = Identifier::new(
             user.id,
             GlobalUser {
-                name: user.username,
+                name: user
+                    .global_name
+                    .clone()
+                    .unwrap_or_else(|| user.username.clone()),
+                tag: Some(user.username),
                 icon,
+                status: self.interface_user_status(user.id),
+                voice: Some(call_state),
             },
         );
 

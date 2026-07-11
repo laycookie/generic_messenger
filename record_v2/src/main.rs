@@ -1,21 +1,19 @@
 use std::borrow::Cow;
 
-use auth::MessengersGenerator;
 use font_kit::{family_name::FamilyName, source::SystemSource};
 use futures::{StreamExt, future::join_all, join};
 use iced::{Element, Subscription, Task, window};
+use messenger_interface::auth::Credential;
 use messenger_interface::interface::{CallState, CallStatus};
+use messenger_unifier::MessengerRegistry;
 use pages::{AppMessage, StreamDirection, login, messenger};
 use simple_audio_channels::AudioMixer;
-use state::MessengerRegistry;
 
-mod auth;
 mod components;
 mod events;
 mod pages;
-mod state;
 
-use tracing::{error, trace, warn};
+use tracing::{debug, error, trace, warn};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,41 +73,74 @@ struct App {
 
 impl App {
     fn boot() -> (Self, Task<AppMessage>) {
-        let mut messengers = MessengerRegistry::default();
-        let mut screen = Screen::Loading;
+        // Read each saved `name:credential` line into a (backend, credential)
+        // pair. Construction is async, so we only parse here and build the
+        // messengers in the task below once the window is up.
+        let stored: Vec<(String, Credential)> = login_store::load("./LoginInfo", |name, blob| {
+            let backend = login::backend(name)?;
+            let keys: Vec<&'static str> = (backend.auth_methods)()
+                .iter()
+                .flat_map(|method| method.fields.iter().map(|field| field.key))
+                .collect();
+            match login_store::from_line(blob, &keys) {
+                Some(cred) => Some((backend.name.to_owned(), cred)),
+                None => {
+                    error!("Ignoring unparsable saved credentials for {name}");
+                    None
+                }
+            }
+        })
+        .unwrap_or_else(|err| {
+            error!("{err}");
+            Vec::new()
+        });
 
-        let has_credentials = match MessengersGenerator::load("./LoginInfo".into(), &mut messengers)
-        {
-            Ok(loaded) if loaded => true,
-            Ok(_) => {
-                trace!("No messengers were found");
-                screen = Screen::Login;
-                false
-            }
-            Err(err) => {
-                error!("{err}");
-                screen = Screen::Login;
-                false
-            }
-        };
+        if stored.is_empty() {
+            trace!("No saved credentials were found");
+        }
+        let has_credentials = !stored.is_empty();
 
         let app = Self {
-            screen,
+            screen: if has_credentials {
+                Screen::Loading
+            } else {
+                Screen::Login
+            },
             login: login::Login::default(),
             messenger: messenger::Messenger::new(),
             audio: AudioMixer::default(),
-            messengers,
+            messengers: MessengerRegistry::default(),
         };
 
         let (_window_id, window_task) = window::open(window::Settings::default());
         (
             app,
             window_task.then(move |_| {
-                if has_credentials {
-                    Task::done(AppMessage::StartUp)
-                } else {
-                    Task::none()
+                if stored.is_empty() {
+                    return Task::none();
                 }
+                let stored = stored.clone();
+                Task::future(async move {
+                    let mut built = Vec::new();
+                    for (name, cred) in stored {
+                        match login::backend(&name) {
+                            Some(backend) => match (backend.create)(cred).await {
+                                Ok(api) => built.push(api),
+                                Err(err) => error!("Failed to restore {name} session: {err}"),
+                            },
+                            None => warn!("Unknown backend in LoginInfo: {name}"),
+                        }
+                    }
+                    built
+                })
+                .then(|built| {
+                    Task::done(AppMessage::modify_messengers(move |messengers| {
+                        for api in built {
+                            messengers.add(api);
+                        }
+                    }))
+                    .chain(Task::done(AppMessage::StartUp))
+                })
             }),
         )
     }
@@ -123,7 +154,17 @@ impl App {
             }
             // === Credentials ===
             AppMessage::SaveCredentials => {
-                MessengersGenerator::save(&self.messengers, "./LoginInfo".into());
+                if let Err(err) = login_store::save(
+                    "./LoginInfo",
+                    self.messengers.iter().map(|(_, entry)| {
+                        (
+                            entry.interface.name(),
+                            login_store::to_line(&entry.interface.auth()),
+                        )
+                    }),
+                ) {
+                    error!("{err}");
+                }
                 Task::none()
             }
             // === Messenger Data ===
@@ -135,6 +176,7 @@ impl App {
             AppMessage::StartUp => {
                 Task::future(join_all(self.messengers.iter().map(|(id, entry)| {
                     let api = entry.interface.api.clone();
+                    let user_statuses = entry.interface.user_statuses.clone();
                     async move {
                         let Ok(q) = api.clone().arc_query() else {
                             error!("Query not impl");
@@ -159,12 +201,28 @@ impl App {
                             }
                         };
 
+                        let contacts = contacts.unwrap_or_default();
+                        let conversations = conversations.unwrap_or_default();
+                        let servers = servers.unwrap_or_default();
+
+                        let status_updates = match user_statuses {
+                            Some(statuses) => statuses
+                                .user_statuses(&contacts)
+                                .await
+                                .unwrap_or_else(|err| {
+                                    debug!("Failed to fetch user statuses: {err}");
+                                    Vec::new()
+                                }),
+                            None => Vec::new(),
+                        };
+
                         Some((
                             id,
                             profile,
-                            contacts.unwrap_or_default(),
-                            conversations.unwrap_or_default(),
-                            servers.unwrap_or_default(),
+                            contacts,
+                            conversations,
+                            servers,
+                            status_updates,
                             q.listen().await,
                             t.listen().await,
                             match voice {
@@ -182,6 +240,7 @@ impl App {
                             contacts,
                             conversations,
                             servers,
+                            status_updates,
                             query_socket,
                             text_socket,
                             voice_socket,
@@ -192,6 +251,9 @@ impl App {
                             data.contacts = contacts;
                             data.conversations = conversations;
                             data.guilds = servers;
+                            for (user_id, status) in status_updates {
+                                events::apply_user_status(data, user_id, status);
+                            }
                         }));
 
                         let mut streams = Vec::new();
@@ -262,26 +324,29 @@ impl App {
             // === Pages ===
             AppMessage::Login(message) => match self.login.update(message) {
                 login::Action::None => Task::none(),
-                login::Action::Login(api) => {
-                    // Verify the credentials before committing: `client_user`
-                    // drives the username/password -> token exchange (or token
-                    // check) and fails fast on bad credentials. Only on success
-                    // do we add the messenger and run StartUp (which navigates
-                    // to the chat page and saves credentials) — so a failed
-                    // login neither saves nor leaves the login page.
+                login::Action::Login {
+                    backend,
+                    credential,
+                } => {
+                    // Build, then verify, before committing. create_messenger may
+                    // perform an eager credential->token exchange that can fail;
+                    // client_user then confirms the token/session actually works.
                     Task::future(async move {
-                        let result = match api.clone().arc_query() {
-                            Ok(query) => {
-                                query.client_user().await.map(|_| ()).map_err(|err| err.to_string())
-                            }
-                            // No query capability to verify against (e.g. Test):
-                            // let it through unchanged.
-                            Err(_) => Ok(()),
+                        let Some(backend) = login::backend(backend) else {
+                            return Err(format!("Unknown backend: {backend}"));
                         };
-                        (api, result)
+                        let api = (backend.create)(credential)
+                            .await
+                            .map_err(|err| err.to_string())?;
+                        if let Ok(query) = api.clone().arc_query()
+                            && let Err(err) = query.client_user().await
+                        {
+                            return Err(err.to_string());
+                        }
+                        Ok(api)
                     })
-                    .then(|(api, result)| match result {
-                        Ok(()) => Task::done(AppMessage::modify_messengers(move |messengers| {
+                    .then(|result| match result {
+                        Ok(api) => Task::done(AppMessage::modify_messengers(move |messengers| {
                             messengers.add(api);
                         }))
                         .chain(Task::done(AppMessage::StartUp)),
@@ -321,7 +386,7 @@ impl App {
                         };
 
                         Task::done(AppMessage::modify_data(messenger_id, move |data| {
-                            data.calls.push(state::Call::new(
+                            data.calls.push(messenger_unifier::Call::new(
                                 messenger_id,
                                 channel,
                                 CallState::Pending(status),

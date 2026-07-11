@@ -1,0 +1,9 @@
+[package]
+name = "login_store"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[dependencies]
+messenger_interface = { path = "../messenger_interface" }
+secure-string = "0.3.0"

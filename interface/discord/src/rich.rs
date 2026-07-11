@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use messenger_interface::types::{Emoji, RichText, Span, TextStyle};
+use messenger_interface::types::{Emoji, RichText, Span, Sticker, TextStyle};
 
 use crate::{
     api_types::{self, SNOWFLAKE},
@@ -185,6 +185,16 @@ pub(crate) async fn resolve_emoji(id: SNOWFLAKE, animated: bool) -> Option<PathB
     CdnImage::emoji(id, animated).fetch().await.ok()
 }
 
+/// The wire tag that sends a custom emoji inside message content. Stored as
+/// the [`Emoji::reference`] so outgoing serialization is a straight copy.
+pub(crate) fn emoji_wire_tag(name: &str, id: SNOWFLAKE, animated: bool) -> String {
+    if animated {
+        format!("<a:{name}:{id}>")
+    } else {
+        format!("<:{name}:{id}>")
+    }
+}
+
 /// Download+cache a Discord sticker image. Lottie (format 3) has no static
 /// image, so it falls back to alt text (`None`).
 async fn resolve_sticker(sticker: &api_types::StickerItem) -> Option<PathBuf> {
@@ -204,21 +214,59 @@ pub async fn build_content(content: &str, stickers: &[api_types::StickerItem]) -
             Piece::Link { text, href } => spans.push(Span::Link { text, href }),
             Piece::Emoji { name, id, animated } => {
                 let image = resolve_emoji(id, animated).await;
+                let reference = Some(emoji_wire_tag(&name, id, animated));
                 spans.push(Span::Emoji(Emoji {
                     shortcode: name,
                     image,
+                    reference,
                 }));
             }
         }
     }
     for sticker in stickers {
         let image = resolve_sticker(sticker).await;
-        spans.push(Span::Sticker {
+        spans.push(Span::Sticker(Sticker {
             alt: sticker.name.clone(),
             image,
-        });
+            reference: sticker.id.to_string(),
+        }));
     }
     RichText { spans }
+}
+
+/// Serialize outgoing [`RichText`] into Discord wire form: the `content`
+/// string plus the sticker ids that ride in the separate `sticker_ids`
+/// field of the create-message payload. An emoji span's [`Emoji::reference`]
+/// already is its wire tag; one without a reference (composed for another
+/// platform) degrades to `:shortcode:` text. Links use their target so the
+/// URL stays functional.
+pub(crate) fn serialize_content(text: &RichText) -> (String, Vec<SNOWFLAKE>) {
+    let mut content = String::new();
+    let mut sticker_ids = Vec::new();
+    for span in &text.spans {
+        match span {
+            Span::Text { text, .. } => content.push_str(text),
+            Span::Link { href, .. } => content.push_str(href),
+            Span::Emoji(emoji) => match &emoji.reference {
+                Some(tag) => content.push_str(tag),
+                None => {
+                    content.push(':');
+                    content.push_str(&emoji.shortcode);
+                    content.push(':');
+                }
+            },
+            Span::Sticker(sticker) => {
+                match sticker.reference.parse::<SNOWFLAKE>() {
+                    Ok(id) => sticker_ids.push(id),
+                    // A sticker we can't reference (foreign platform or
+                    // unresolved incoming) has no sendable form; drop it
+                    // rather than leak its alt text into the message.
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+    (content, sticker_ids)
 }
 
 #[cfg(test)]
@@ -290,5 +338,48 @@ mod tests {
                 style: TextStyle::default()
             }]
         );
+    }
+
+    #[test]
+    fn serialize_emits_emoji_wire_tags() {
+        let rich = RichText {
+            spans: vec![
+                Span::Text {
+                    text: "hi ".to_owned(),
+                    style: TextStyle::default(),
+                },
+                Span::Emoji(Emoji {
+                    shortcode: "wave".to_owned(),
+                    image: None,
+                    reference: Some(emoji_wire_tag("wave", 67890, true)),
+                }),
+            ],
+        };
+        let (content, sticker_ids) = serialize_content(&rich);
+        assert_eq!(content, "hi <a:wave:67890>");
+        assert!(sticker_ids.is_empty());
+    }
+
+    #[test]
+    fn serialize_splits_stickers_out_of_content() {
+        let rich = RichText {
+            spans: vec![Span::Sticker(Sticker {
+                alt: "cat".to_owned(),
+                image: None,
+                reference: "42".to_owned(),
+            })],
+        };
+        let (content, sticker_ids) = serialize_content(&rich);
+        assert!(content.is_empty());
+        assert_eq!(sticker_ids, vec![42]);
+    }
+
+    #[test]
+    fn serialize_referenceless_emoji_degrades_to_shortcode() {
+        let rich = RichText {
+            spans: vec![Span::Emoji(Emoji::shortcode("steamhappy"))],
+        };
+        let (content, _) = serialize_content(&rich);
+        assert_eq!(content, ":steamhappy:");
     }
 }

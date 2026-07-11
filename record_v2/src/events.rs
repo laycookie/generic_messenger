@@ -1,13 +1,73 @@
 use futures::StreamExt;
 use iced::Task;
 use messenger_interface::interface::{AudioEvent, CallState, QueryEvent, TextEvent, VoiceEvent};
-use messenger_interface::types::{Emoji, ID, Identifier, User};
-use simple_audio_channels::{AudioMixer, SampleFormat, StreamFormat, effects::{Gate, GateSettings}};
+use messenger_interface::types::{Emoji, ID, Identifier, Place, Room, User, UserStatus};
+use messenger_unifier::{MessengerData, MessengerId, MessengerRegistry};
+use simple_audio_channels::{
+    AudioMixer, SampleFormat, StreamFormat,
+    effects::{Gate, GateSettings},
+};
 use tracing::{debug, trace, warn};
 
 use crate::pages::{AppMessage, StreamDirection};
-use crate::state::{MessengerData, MessengerId, MessengerRegistry};
 
+fn apply_user_status_to_user(user: &mut Identifier<User>, user_id: ID, status: UserStatus) {
+    if *user.id() == user_id {
+        user.status = Some(status);
+    }
+}
+
+fn apply_user_status_to_room(room: &mut Identifier<Place<Room>>, user_id: ID, status: UserStatus) {
+    if let Some(members) = room.members.as_mut() {
+        for member in members {
+            apply_user_status_to_user(member, user_id, status);
+        }
+    }
+
+    if let Some(participants) = room.participants.as_mut() {
+        for participant in participants {
+            apply_user_status_to_user(participant, user_id, status);
+        }
+    }
+
+    if let Some(messages) = room.messages.as_mut() {
+        for message in messages {
+            if let Some(author) = message.author.as_mut() {
+                apply_user_status_to_user(author, user_id, status);
+            }
+        }
+    }
+}
+
+pub fn apply_user_status(data: &mut MessengerData, user_id: ID, status: UserStatus) {
+    if let Some(profile) = data.profile.as_mut() {
+        apply_user_status_to_user(profile, user_id, status);
+    }
+
+    for contact in &mut data.contacts {
+        apply_user_status_to_user(contact, user_id, status);
+    }
+
+    for room in &mut data.conversations {
+        apply_user_status_to_room(room, user_id, status);
+    }
+
+    for guild in &mut data.guilds {
+        if let Some(rooms) = guild.rooms.as_mut() {
+            for room in rooms {
+                apply_user_status_to_room(room, user_id, status);
+            }
+        }
+    }
+
+    for call in &mut data.calls {
+        apply_user_status_to_room(call.source_mut(), user_id, status);
+    }
+}
+
+/// Drop a user from every room's voice roster (`Room.participants`).
+/// Room membership (`Room.members`) is deliberately untouched: leaving a
+/// call does not remove someone from the room itself.
 fn remove_voice_participant(data: &mut MessengerData, user_id: ID) -> Vec<ID> {
     let mut removed_from = Vec::new();
 
@@ -76,6 +136,11 @@ pub fn process_query_event(
                         }
                     }
                 }
+            }
+        }
+        QueryEvent::UserStatusChanged { user_id, status } => {
+            if let Some(data) = messengers.data_mut(id) {
+                apply_user_status(data, user_id, status);
             }
         }
     }
@@ -273,7 +338,7 @@ pub fn process_audio_event(
     audio: &mut AudioMixer,
 ) -> Task<AppMessage> {
     match event {
-        AudioEvent::AddAudioSource(sender) => {
+        AudioEvent::AddAudioSource { channel, .. } => {
             // Discord voice pushes opus-decoded i16 stereo at 48kHz.
             let producer = audio
                 .create_output_channel(
@@ -286,7 +351,7 @@ pub fn process_audio_event(
                 )
                 .unwrap();
 
-            if sender.send(producer).is_err() {
+            if channel.send(producer).is_err() {
                 warn!("Couldn't send audio channel to the adapter");
             }
 

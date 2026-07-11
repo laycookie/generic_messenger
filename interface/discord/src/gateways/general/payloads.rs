@@ -124,6 +124,18 @@ pub(crate) struct VoiceStateMemberPayload {
     pub(crate) user: User,
 }
 
+/// <https://discord.com/developers/docs/events/gateway-events#presence-update>
+#[derive(Facet)]
+pub(super) struct PresencePayload {
+    pub(super) user: PresenceUserPayload,
+    pub(super) status: String,
+}
+
+#[derive(Facet)]
+pub(super) struct PresenceUserPayload {
+    pub(super) id: SNOWFLAKE,
+}
+
 /// https://docs.discord.food/resources/presence#session-object
 #[derive(Debug, Facet)]
 pub(super) struct SessionObjectPayload {

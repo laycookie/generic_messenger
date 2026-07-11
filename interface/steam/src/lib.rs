@@ -71,11 +71,16 @@ use std::{
 };
 
 use async_compat::CompatExt;
+use dashmap::DashMap;
+use futures::channel::mpsc;
 use futures::lock::Mutex as AsyncMutex;
 use secure_string::SecureString;
 use tracing::{error, info};
 
-use messenger_interface::interface::Messenger;
+use async_trait::async_trait;
+use messenger_interface::auth::{AuthMethod, Credential, CredentialField, CredentialSchema};
+use messenger_interface::interface::{Messenger, VoiceEvent};
+use messenger_interface::types::ID;
 
 use crate::session::Connected;
 
@@ -92,19 +97,18 @@ mod voice;
 /// Public entry point, mirroring `discord::Discord`.
 pub struct Steam;
 impl Steam {
-    /// `auth` is expected to be `"username:secret"`, where `secret` is a saved
-    /// refresh token (or, on a never-logged-in entry, the password). Used by
-    /// the session-restore path; Steam Guard, if needed, is mobile approval.
-    pub fn new_messenger(auth: &str) -> Arc<dyn Messenger> {
-        SteamMessenger::create_messenger(auth)
+    /// Construct a Steam messenger from a [`Credential`]; see
+    /// [`Messenger::create_messenger`]. Both supported variants build
+    /// synchronously — the actual login happens lazily on first use (Steam Guard,
+    /// if needed, is mobile approval unless a code is supplied).
+    pub async fn create_messenger(
+        cred: Credential,
+    ) -> Result<Arc<dyn Messenger>, Box<dyn Error + Send + Sync>> {
+        <SteamMessenger as Messenger>::create_messenger(cred).await
     }
-
-    /// Build a Steam messenger for an interactive login with username +
-    /// password, optionally with a Steam Guard code (TOTP from the authenticator
-    /// app, or an emailed code). Leave `guard_code` `None`/empty to approve the
-    /// login on the mobile app.
-    pub fn login(username: &str, password: &str, guard_code: Option<String>) -> Arc<dyn Messenger> {
-        SteamMessenger::build(username.to_owned(), password.to_owned(), guard_code)
+    /// The login methods Steam offers (username + password, optional Steam Guard).
+    pub fn auth_methods() -> &'static [AuthMethod] {
+        <SteamMessenger as Messenger>::auth_methods()
     }
 }
 
@@ -119,6 +123,17 @@ pub(crate) struct SteamMessenger {
     /// Lazily-established session, behind an async mutex so concurrent first
     /// callers log in exactly once.
     connected: AsyncMutex<Option<Arc<Connected>>>,
+    /// Sink for [`Voice::listen`]'s event stream, set when the app starts
+    /// listening. `connect` pushes `CallStreamReady` here to hand the UI the
+    /// call's audio stream. `None` until `listen` is called.
+    voice_events: Mutex<Option<mpsc::UnboundedSender<VoiceEvent>>>,
+    /// Strong handle to the `listen()` stream object. `WeakSocketStream` only
+    /// holds a `Weak`, so the source must be kept alive here or the app's stream
+    /// dies immediately.
+    voice_stream: Mutex<Option<Arc<gns::call::VoiceEventStream>>>,
+    /// Active calls by room, keeping each audio session alive (again, the app
+    /// holds only a `Weak`). `disconnect` removes + kills the entry.
+    active_calls: DashMap<ID, Arc<gns::call::SteamAudioSession>>,
 }
 
 impl SteamMessenger {
@@ -128,6 +143,9 @@ impl SteamMessenger {
             secret: Mutex::new(secret.into()),
             guard_code,
             connected: AsyncMutex::new(None),
+            voice_events: Mutex::new(None),
+            voice_stream: Mutex::new(None),
+            active_calls: DashMap::new(),
         })
     }
 
@@ -144,6 +162,9 @@ impl SteamMessenger {
             secret: Mutex::new(secret.into()),
             guard_code,
             connected: AsyncMutex::new(None),
+            voice_events: Mutex::new(None),
+            voice_stream: Mutex::new(None),
+            active_calls: DashMap::new(),
         })
     }
 
@@ -191,17 +212,55 @@ impl SteamMessenger {
     }
 }
 
+/// Steam's login shapes. `Password` is the interactive form; `Session` is the
+/// hidden shape (username + refreshed token) reconstructed from storage, never
+/// shown as a login method.
+#[derive(CredentialSchema)]
+enum SteamAuth {
+    #[credential(method = "Username & password")]
+    Password {
+        #[credential(label = "Username")]
+        username: SecureString,
+        #[credential(label = "Password", secret)]
+        password: SecureString,
+        #[credential(label = "Steam Guard code (blank = approve on mobile)")]
+        otp: Option<SecureString>,
+    },
+    #[credential(hidden)]
+    Session {
+        username: SecureString,
+        token: SecureString,
+    },
+}
+
+#[async_trait]
 impl Messenger for SteamMessenger {
-    /// `auth_obj` is parsed as `"username:secret"` (secret = saved token or password).
-    fn create_messenger(auth_obj: &str) -> Arc<dyn Messenger>
-    where
-        Self: Sized,
-    {
-        let (username, secret) = match auth_obj.split_once(':') {
-            Some((user, secret)) => (user.to_owned(), secret.to_owned()),
-            None => (auth_obj.to_owned(), String::new()),
-        };
-        SteamMessenger::build(username, secret, None)
+    /// `Password` (username + password [+ Steam Guard]) and `Session` (username +
+    /// refreshed token) both build synchronously; login happens lazily on first
+    /// use.
+    async fn create_messenger(
+        cred: Credential,
+    ) -> Result<Arc<dyn Messenger>, Box<dyn Error + Send + Sync>> {
+        match SteamAuth::try_from(cred)? {
+            SteamAuth::Password {
+                username,
+                password,
+                otp,
+            } => Ok(SteamMessenger::build(
+                username.unsecure().to_owned(),
+                password.unsecure().to_owned(),
+                otp.map(|otp| otp.unsecure().to_owned()),
+            )),
+            SteamAuth::Session { username, token } => Ok(SteamMessenger::build(
+                username.unsecure().to_owned(),
+                token.unsecure().to_owned(),
+                None,
+            )),
+        }
+    }
+
+    fn auth_methods() -> &'static [AuthMethod] {
+        SteamAuth::auth_methods()
     }
 
     /// Client-local identifier only; never sent anywhere.
@@ -211,13 +270,12 @@ impl Messenger for SteamMessenger {
     fn name(&self) -> &'static str {
         "Steam"
     }
-    /// `"username:secret"` — the secret is the refresh token once logged in, so
-    /// this is what persists the session to the host app's `LoginInfo`.
-    fn auth(&self) -> String {
-        format!(
-            "{}:{}",
-            self.username,
-            self.secret.lock().unwrap().unsecure()
-        )
+    /// Username + refreshed session token, persisted so the next start restores
+    /// the session (and skips Steam Guard).
+    fn auth(&self) -> Credential {
+        Credential(vec![
+            CredentialField::new("username", self.username.clone()),
+            CredentialField::new("token", self.secret.lock().unwrap().clone()),
+        ])
     }
 }

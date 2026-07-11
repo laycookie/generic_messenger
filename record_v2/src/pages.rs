@@ -2,8 +2,8 @@ pub mod login;
 pub mod messenger;
 
 use crate::Screen;
-use crate::state::{MessengerId, MessengerRegistry};
 use messenger_interface::interface::{AudioEvent, QueryEvent, TextEvent, VoiceEvent};
+use messenger_unifier::{MessengerId, MessengerRegistry};
 
 #[derive(Debug, Clone, Copy)]
 pub enum StreamDirection {
@@ -48,7 +48,7 @@ impl AppMessage {
 
     pub fn modify_data(
         id: MessengerId,
-        f: impl FnOnce(&mut crate::state::MessengerData) + Send + 'static,
+        f: impl FnOnce(&mut messenger_unifier::MessengerData) + Send + 'static,
     ) -> Self {
         Self::modify_messengers(move |messengers| {
             if let Some(entry) = messengers.get_mut(id) {

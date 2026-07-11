@@ -6,7 +6,7 @@ use iced::{ContentFit, Element, Length};
 use messenger_interface::types::{House, Identifier, Place};
 
 use crate::pages::messenger::PLACEHOLDER_PFP;
-use crate::state::{MessengerId, MessengerRegistry};
+use messenger_unifier::{MessengerId, MessengerRegistry};
 
 #[derive(Debug)]
 pub struct Navbar;

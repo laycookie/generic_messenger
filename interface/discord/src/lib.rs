@@ -9,15 +9,17 @@ use std::{
 };
 
 use arc_swap::ArcSwapOption;
+use async_trait::async_trait;
 use asyncs_sync::Notify;
 use bitflags::bitflags;
 use crossbeam::queue::ArrayQueue;
 use dashmap::DashMap;
 use futures::{channel::oneshot, future::poll_fn, lock::Mutex as AsyncMutex};
 use messenger_interface::{
+    auth::{AuthMethod, Credential, CredentialField, CredentialSchema},
     interface::{AudioEvent, Messenger, QueryEvent, TextEvent, VoiceEvent},
     stream::{ArcStream, WeakSocketStream},
-    types::{ID, Identifier, User as GlobalUser},
+    types::{ID, Identifier, User as GlobalUser, UserStatus},
 };
 use secure_string::SecureString;
 use simple_audio_channels::input::SampleConsumer;
@@ -131,24 +133,18 @@ type MessageID = SNOWFLAKE;
 /// Public interface for creating the discord messenger
 pub struct Discord;
 impl Discord {
-    pub fn new_messenger(token: &str) -> Arc<dyn Messenger> {
-        InnerDiscord::create_messenger(token)
+    /// Construct a Discord messenger from a [`Credential`]; see
+    /// [`Messenger::create_messenger`]. A `Token` builds immediately; a
+    /// `Password` (email/phone + password, optional MFA) fetches the token from
+    /// Discord up front, so a rejected login surfaces here rather than on first use.
+    pub async fn create_messenger(
+        cred: Credential,
+    ) -> Result<Arc<dyn Messenger>, Box<dyn std::error::Error + Send + Sync>> {
+        <InnerDiscord<Owned> as Messenger>::create_messenger(cred).await
     }
-
-    /// Build a Discord messenger that authenticates with a username (email or
-    /// phone) and password instead of a token. The token is fetched lazily on
-    /// first use; if the account has two-factor enabled, supply the TOTP code
-    /// via `mfa_code`. Once logged in, [`Messenger::auth`] yields the resolved
-    /// token, so the host app persists the token (not the password).
-    pub fn login(login: &str, password: &str, mfa_code: Option<String>) -> Arc<dyn Messenger> {
-        InnerDiscord::build(
-            ArcSwapOption::empty(),
-            Some(Credentials {
-                login: login.to_owned(),
-                password: password.into(),
-                mfa_code: mfa_code.filter(|code| !code.trim().is_empty()),
-            }),
-        )
+    /// The login methods Discord offers (a token, or email/phone + password).
+    pub fn auth_methods() -> &'static [AuthMethod] {
+        <InnerDiscord<Owned> as Messenger>::auth_methods()
     }
     fn identifier_generator<D>(id: SNOWFLAKE, data: D) -> Identifier<D> {
         Identifier::new(id, data)
@@ -182,33 +178,12 @@ struct AudioManager {
     microphone_retries: u8,
 }
 
-/// Account credentials for the username/password login flow. Held only when
-/// the messenger was built via [`Discord::login`]; the resulting token is
-/// fetched lazily into `InnerDiscord::token` on first use (see
-/// [`InnerDiscord::ensure_token`]).
-struct Credentials {
-    /// Email or phone number used to log in.
-    login: String,
-    password: SecureString,
-    /// Optional two-factor (TOTP) code for accounts with MFA enabled.
-    mfa_code: Option<String>,
-}
-
 struct InnerDiscord<T: UnitStruct> {
     // === Metadata ===
-    /// The Discord user token used for every authenticated request. Populated
-    /// immediately for a token login, or lazily resolved from `credentials` on
-    /// first use for a username/password login. `None` until resolved.
-    token: ArcSwapOption<SecureString>,
-    /// Present only for a username/password login; consumed once to obtain a
-    /// `token`. `None` for a token login.
-    credentials: Option<Credentials>,
-    /// Serializes concurrent first-use token resolution so the credential
-    /// login exchange runs exactly once. Holds a cached fatal login error once
-    /// one occurs, so the many startup queries that race to resolve the token
-    /// fail fast instead of each re-POSTing `auth/login` (which would hammer
-    /// Discord and risk rate-limiting or flagging the account).
-    token_lock: AsyncMutex<Option<String>>,
+    /// The Discord user token used for every authenticated request. Known at
+    /// construction for both login paths: a token login receives it directly,
+    /// a username/password login ([`Discord::login`]) fetches it up front.
+    token: SecureString,
     intents: Intents,
     capabilities: Capabilities,
     // Microphone
@@ -242,6 +217,8 @@ struct InnerDiscord<T: UnitStruct> {
     /// fetch — see `process_guild_channels`. Mutated alongside `voice_states`
     /// in `emit_voice_state_participant`.
     voice_participants: DashMap<SNOWFLAKE, Vec<Identifier<GlobalUser>>>,
+    /// Latest known user presence/status, keyed by Discord user snowflake.
+    presences: DashMap<SNOWFLAKE, UserStatus>,
     // Gateway-owned caches. The `Ready` dispatch handler in
     // `gateways::general::events` is currently the *sole* writer; the REST
     // fallback in `query.rs` reads through these for the cold-start path but
@@ -257,6 +234,10 @@ struct InnerDiscord<T: UnitStruct> {
     dm_channels: ArcSwapOption<Vec<api_types::Channel>>,
     guilds: ArcSwapOption<Vec<api_types::Guild>>,
     guild_channels: DashMap<SNOWFLAKE, Vec<api_types::Channel>>,
+    /// Per-guild custom emoji / stickers from the `Ready` snapshot, feeding
+    /// the picker via `pickable_emojis`/`pickable_stickers` in `text.rs`.
+    guild_emojis: DashMap<SNOWFLAKE, Vec<api_types::GuildEmoji>>,
+    guild_stickers: DashMap<SNOWFLAKE, Vec<api_types::GuildSticker>>,
     // External to internal ID mappings (TODO: Remove we can store discord IDs diractly in external
     // IDs)
     channel_id_mappings: DashMap<ID, ChannelLocation>,
@@ -304,49 +285,15 @@ impl Drop for StreamPollGuard<'_> {
 }
 
 impl<T: UnitStruct> InnerDiscord<T> {
-    /// Return the user token, resolving it from stored credentials on first use.
-    ///
-    /// Token logins already have it; credential logins perform the
-    /// username/password (+ optional TOTP) exchange exactly once, guarded by
-    /// `token_lock`, and cache the result so every later caller is cheap.
-    pub(crate) async fn ensure_token(
-        &self,
-    ) -> Result<Arc<SecureString>, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(token) = self.token.load_full() {
-            return Ok(token);
-        }
-        let mut cached_error = self.token_lock.lock().await;
-        // Re-check: another caller may have resolved it while we waited.
-        if let Some(token) = self.token.load_full() {
-            return Ok(token);
-        }
-        // A previous attempt already failed fatally — don't re-hit the network.
-        if let Some(error) = cached_error.as_ref() {
-            return Err(error.clone().into());
-        }
-        let credentials = self
-            .credentials
-            .as_ref()
-            .ok_or("Discord: no token and no credentials to log in with")?;
-        let token = match rest_api::login_with_credentials(
-            &credentials.login,
-            credentials.password.unsecure(),
-            credentials.mfa_code.as_deref(),
+    pub(crate) fn cached_user_status(&self, user_id: SNOWFLAKE) -> Option<UserStatus> {
+        self.presences.get(&user_id).map(|status| *status)
+    }
+
+    pub(crate) fn interface_user_status(&self, user_id: SNOWFLAKE) -> Option<UserStatus> {
+        Some(
+            self.cached_user_status(user_id)
+                .unwrap_or(UserStatus::Offline),
         )
-        .await
-        {
-            Ok(token) => token,
-            Err(error) => {
-                // Cache so the other startup queries fail fast instead of each
-                // retrying the login. A restart builds a fresh messenger and
-                // clears this.
-                *cached_error = Some(error.to_string());
-                return Err(error);
-            }
-        };
-        let token = Arc::new(SecureString::from(token));
-        self.token.store(Some(token.clone()));
-        Ok(token)
     }
 
     async fn ensure_gateway(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -437,16 +384,12 @@ impl<T: UnitStruct> InnerDiscord<T> {
 }
 
 impl InnerDiscord<Owned> {
-    /// Shared constructor for both login paths: a ready `token` (token login)
-    /// or `credentials` to resolve one lazily (username/password login).
-    fn build(
-        token: ArcSwapOption<SecureString>,
-        credentials: Option<Credentials>,
-    ) -> Arc<dyn Messenger> {
+    /// Shared constructor for both login paths. The token is always known up
+    /// front: a token login passes it straight through, a username/password
+    /// login ([`Discord::login`]) fetches it from Discord first.
+    fn build(token: SecureString) -> Arc<dyn Messenger> {
         Arc::new(InnerDiscord {
             token,
-            credentials,
-            token_lock: AsyncMutex::new(None),
             intents: DEFAULT_INTENTS,
             capabilities: DEFAULT_CAPABILITIES,
             audio_manager: Default::default(),
@@ -462,10 +405,13 @@ impl InnerDiscord<Owned> {
             profile: ArcSwapOption::empty(),
             voice_states: DashMap::new(),
             voice_participants: DashMap::new(),
+            presences: DashMap::new(),
             relationships: ArcSwapOption::empty(),
             dm_channels: ArcSwapOption::empty(),
             guilds: ArcSwapOption::empty(),
             guild_channels: DashMap::new(),
+            guild_emojis: DashMap::new(),
+            guild_stickers: DashMap::new(),
             guild_id_mappings: DashMap::new(),
             channel_id_mappings: DashMap::new(),
             message_id_mappings: DashMap::new(),
@@ -474,43 +420,68 @@ impl InnerDiscord<Owned> {
     }
 }
 
+/// Discord's login shapes. `Token` builds immediately; `Password` performs the
+/// username/password (+ optional MFA) exchange first. Discord has no restored
+/// session — its persisted credential is just a `Token`.
+#[derive(CredentialSchema)]
+enum DiscordAuth {
+    #[credential(method = "Token")]
+    Token {
+        #[credential(label = "Token")]
+        token: SecureString,
+    },
+    #[credential(method = "Email & password")]
+    Password {
+        #[credential(label = "Email or phone")]
+        username: SecureString,
+        #[credential(label = "Password", secret)]
+        password: SecureString,
+        #[credential(label = "Two-factor code (if enabled)")]
+        otp: Option<SecureString>,
+    },
+}
+
+#[async_trait]
 impl Messenger for InnerDiscord<Owned> {
-    /// Auth_obj is expected to be a Discord user token. The username/password
-    /// login path is reached through [`Discord::login`] instead.
-    fn create_messenger(auth_obj: &str) -> Arc<dyn Messenger>
-    where
-        Self: Sized,
-    {
-        Self::build(
-            ArcSwapOption::new(Some(Arc::new(SecureString::from(auth_obj)))),
-            None,
-        )
+    /// A `Token` builds immediately; a `Password` performs the username/password
+    /// (+ optional MFA) exchange and builds from the resolved token.
+    async fn create_messenger(
+        cred: Credential,
+    ) -> Result<Arc<dyn Messenger>, Box<dyn std::error::Error + Send + Sync>> {
+        match DiscordAuth::try_from(cred)? {
+            DiscordAuth::Token { token } => Ok(Self::build(token)),
+            DiscordAuth::Password {
+                username,
+                password,
+                otp,
+            } => {
+                let token = rest_api::login_with_credentials(
+                    username.unsecure(),
+                    password.unsecure(),
+                    otp.as_ref().map(SecureString::unsecure),
+                )
+                .await?;
+                Ok(Self::build(SecureString::from(token)))
+            }
+        }
     }
-    /// NOTE: the id is meant to be used only on the client, for
-    /// identification purposes, and is never supposed to be sent anywhere —
-    /// that's why it is safe to embed the token in it. Before a credential
-    /// login resolves its token, the login name stands in.
+
+    fn auth_methods() -> &'static [AuthMethod] {
+        DiscordAuth::auth_methods()
+    }
+
+    /// NOTE: the id is meant to be used only on the client, for identification
+    /// purposes, and is never supposed to be sent anywhere — that's why it is
+    /// safe to embed the token in it.
     fn id(&self) -> String {
-        let suffix = match self.token.load_full() {
-            Some(token) => token.unsecure().to_owned(),
-            None => self
-                .credentials
-                .as_ref()
-                .map(|credentials| credentials.login.clone())
-                .unwrap_or_default(),
-        };
-        INTERFACE_NAME.to_string() + &suffix
+        INTERFACE_NAME.to_string() + self.token.unsecure()
     }
     fn name(&self) -> &'static str {
         INTERFACE_NAME
     }
-    /// The resolved user token, so the host app persists the token (and a
-    /// credential login becomes a token login on the next start). Empty until a
-    /// credential login has resolved its token.
-    fn auth(&self) -> String {
-        self.token
-            .load_full()
-            .map(|token| token.unsecure().to_owned())
-            .unwrap_or_default()
+    /// The resolved user token, persisted so a credential login becomes a token
+    /// login on the next start.
+    fn auth(&self) -> Credential {
+        Credential(vec![CredentialField::new("token", self.token.clone())])
     }
 }

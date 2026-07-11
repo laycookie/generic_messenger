@@ -15,6 +15,12 @@ use std::path::PathBuf;
 pub struct Emoji {
     pub shortcode: String,
     pub image: Option<PathBuf>,
+    /// Platform-opaque token a backend needs to *send* this emoji (e.g.
+    /// Discord's full `<:name:id>` tag). `None` when the shortcode alone
+    /// identifies the emoji on its platform (Steam emoticons, Unicode).
+    /// Produced by the backend (incoming parse / `pickable_emojis`) and
+    /// passed back through untouched by the UI.
+    pub reference: Option<String>,
 }
 impl Emoji {
     /// A shortcode-only emoji with no resolved image (Unicode, or pending).
@@ -22,8 +28,20 @@ impl Emoji {
         Self {
             shortcode: shortcode.into(),
             image: None,
+            reference: None,
         }
     }
+}
+
+/// A sticker: a large standalone image. `alt` is the textual fallback.
+#[derive(Debug, Clone, Default)]
+pub struct Sticker {
+    pub alt: String,
+    pub image: Option<PathBuf>,
+    /// Platform-opaque token a backend needs to *send* this sticker
+    /// (Discord: the sticker snowflake, Steam: the sticker name). Empty when
+    /// unknown, in which case the sticker cannot be re-sent.
+    pub reference: String,
 }
 
 /// Inline text styling for a run of text. Extend as backends/UI grow
@@ -44,8 +62,8 @@ pub enum Span {
     Text { text: String, style: TextStyle },
     /// A custom emoji rendered inline (currently shown as its shortcode).
     Emoji(Emoji),
-    /// A sticker: a large standalone image. `alt` is the textual fallback.
-    Sticker { alt: String, image: Option<PathBuf> },
+    /// A sticker: a large standalone image.
+    Sticker(Sticker),
     /// A hyperlink: display text plus its target URL.
     Link { text: String, href: String },
 }
@@ -56,7 +74,7 @@ impl Span {
         match self {
             Span::Text { text, .. } => text.clone(),
             Span::Emoji(emoji) => format!(":{}:", emoji.shortcode),
-            Span::Sticker { alt, .. } => alt.clone(),
+            Span::Sticker(sticker) => sticker.alt.clone(),
             Span::Link { text, .. } => text.clone(),
         }
     }

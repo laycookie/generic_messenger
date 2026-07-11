@@ -10,8 +10,8 @@ use tracing::error;
 use crate::{
     AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, CHANNEL_HEADROOM, CONVERT_SCRATCH_LEN,
     MIX_SCRATCH_LEN, Notify, SampleConsum, SampleProd, SampleRb, StreamFormat,
-    resample::Resampler,
     effects::EffectChain,
+    resample::Resampler,
     stream::{for_each_sample_format, update_presence},
 };
 

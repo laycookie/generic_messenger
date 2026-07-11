@@ -29,17 +29,21 @@
 //!
 //! # Why each foundation phase is blocked
 //!
-//! - **Signaling carrier (phase 2)** is the gating unknown. Per Valve's P2P
-//!   docs, on Steam the rendezvous "goes through the steam backend": the
-//!   envelope (`CMsgSteamNetworkingP2PRendezvous`) is in the protos, but the CM
-//!   EMsg that *delivers* it to the peer is proprietary and absent from
-//!   `steam_vent_proto`. Recovering it needs a packet capture of a live call.
-//! - **Networking cert (phase 1)** is now implemented ([`cert`]): the reply has
-//!   no `RpcMessageWithKind` binding in `steam_vent_proto`, but a local newtype
-//!   may impl the foreign trait (orphan rule permitting), so `Connection::job`
-//!   round-trips it with no proto fork.
-//! - **SNP transport (phases 3–5)** is a from-scratch port of the GNS data
-//!   channel; large, and only worth starting once phases 1–2 are unblocked.
+//! - **Signaling (phase 2)** is the gating step. The carrier is *not* proprietary
+//!   — per-call signaling rides standard `k_EMsgServiceMethod` `VoiceChatClient.*`
+//!   notifications (see `VOICE_PROTOCOL.md`). The block is that **no rendezvous
+//!   arrives passively**: as the newcomer we must *initiate* the P2P connection,
+//!   which requires a live GNS instance to generate the first
+//!   `CMsgSteamNetworkingP2PRendezvous` and the CM service method that delivers
+//!   it (found only by sending one). So it waits on the transport, not a capture.
+//! - **Networking cert (phase 1)** is implemented and live-confirmed ([`cert`]):
+//!   the reply has no `RpcMessageWithKind` binding in `steam_vent_proto`, but a
+//!   local newtype may impl the foreign trait (orphan rule permitting), so
+//!   `Connection::job` round-trips it with no proto fork.
+//! - **ICE/SNP transport (phases 3–5)** rides on the GNS P2P connection. Rather
+//!   than port Valve's C++ data channel, [`transport::GnsTransport`] will drive
+//!   the open-source GNS (`gns-sys` FFI) with custom signaling relayed over the
+//!   CM. The Opus bridge above it ([`audio`]) is already built and tested.
 //!
 //! See the `project_steam_voice_no_media_transport` memory note for the full
 //! findings.
@@ -52,11 +56,14 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use steam_vent::Connection;
 
 use messenger_interface::types::ID;
 
+pub(crate) mod audio;
+pub(crate) mod call;
 pub(crate) mod cert;
 pub(crate) mod signaling;
 pub(crate) mod transport;
@@ -129,14 +136,25 @@ impl Error for GnsError {}
 /// Bring up the GNS media path for a joined voice session, ultimately yielding
 /// the audio stream that [`crate::voice`] would surface as `CallStreamReady`.
 ///
-/// Sequences the phases in order, so the returned error is the *first* blocking
-/// phase — today [`GnsError::SignalingCarrierUnknown`], since phase 1 (the
-/// networking cert) is now implemented and runs for real.
+/// Runs phase 1 (the networking cert) for real, then hands its identity to
+/// [`transport::GnsTransport::connect`], which sequences phases 2–4. The returned
+/// error is therefore the first blocking phase — today the phase-2 signaling wall
+/// (the newcomer must initiate the P2P connection, which needs the unbuilt GNS
+/// transport).
+///
+/// Once [`transport::GnsTransport::connect`] can succeed, the caller drives
+/// [`audio::run`] over the connected transport (encode mic ↔ decode peers) and
+/// surfaces the stream as `CallStreamReady`. That bridge is already implemented
+/// and tested over an in-memory loopback transport (see [`audio`]); only the
+/// transport bring-up remains.
 pub(crate) async fn establish_voice_media(
     conn: &Connection,
     session: VoiceSession,
-) -> Result<(), GnsError> {
-    let _identity = cert::request_networking_cert(conn).await?; // Phase 1 (implemented)
-    signaling::open_rendezvous(conn, &session).await?; // Phase 2
-    transport::run(conn, &session).await // Phases 3–5
+) -> Result<Arc<dyn transport::VoiceTransport>, GnsError> {
+    let identity = cert::request_networking_cert(conn).await?; // Phase 1 (implemented)
+    let transport = transport::GnsTransport::connect(conn, &session, identity).await?; // Phases 2–4
+    // Reached once `connect` succeeds; `voice.rs` then drives the audio session
+    // (`call::SteamAudioSession`) over this transport and surfaces it as
+    // `CallStreamReady`. Blocked at phase 2 today, so this returns the gating error.
+    Ok(Arc::new(transport))
 }

@@ -17,8 +17,11 @@ font-kit = "0.14.3"
 simple-audio-channels = { path = "../crate/audio" }
 # Interface
 messenger_interface = { path = "../crate/messenger_interface" }
+messenger_unifier = { path = "../crate/messenger_unifier" }
+login_store = { path = "../crate/login_store" }
 discord = { path = "../interface/discord" }
 steam = { path = "../interface/steam" }
 
 futures = { workspace = true }
 strum = { version = "0.28.0", features = ["derive"] }
+emojis = "0.9.0"

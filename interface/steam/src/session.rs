@@ -116,6 +116,15 @@ fn voice_capture_enabled() -> bool {
 /// unprocessed ring after login), so this is safe to call every poll.
 fn drain_voice_capture(conn: &Connection) {
     for raw in conn.take_unprocessed() {
+        // Decisive: if this is a media rendezvous, classify ICE (reachable) vs
+        // SDR (closed relay) — this is the answer to whether voice media can be
+        // implemented at all. See `gns::signaling::classify_rendezvous`.
+        if let Some(classification) = crate::gns::signaling::classify_rendezvous(&raw.data) {
+            warn!(
+                emsg = raw.kind.value(),
+                "voice-capture: >>> {classification} <<<"
+            );
+        }
         let mut hex = String::with_capacity(raw.data.len() * 2);
         for byte in raw.data.iter() {
             let _ = write!(hex, "{byte:02x}");

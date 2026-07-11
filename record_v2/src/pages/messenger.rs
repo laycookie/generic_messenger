@@ -1,8 +1,8 @@
-use std::error::Error;
+use std::{error::Error, path::PathBuf};
 
-use crate::{
-    components::divider::Divider,
-    state::{Call, MessengerData, MessengerId, MessengerInterface, MessengerRegistry, PendingSend},
+use crate::components::divider::Divider;
+use messenger_unifier::{
+    Call, MessengerData, MessengerId, MessengerInterface, MessengerRegistry, PendingSend,
 };
 
 use self::{
@@ -13,13 +13,16 @@ use self::{
 };
 
 use iced::{
-    Task,
-    widget::{Responsive, Text, column, row},
+    Alignment, Color, ContentFit, Element, Length, Task,
+    widget::{
+        Button, Column, Responsive, Row, Text, center, column, container, image, mouse_area,
+        opaque, row, stack,
+    },
 };
 use messenger_interface::types::{
-    ID, Identifier, Message as InterfaceMessage, Place, Revision, RichText, Room,
+    Details, House, ID, Identifier, Message as InterfaceMessage, Place, Revision, Room, User,
 };
-use tracing::error;
+use tracing::{error, warn};
 
 mod chat;
 mod contacts;
@@ -38,6 +41,8 @@ pub struct Messenger {
     sidebar: Sidebar,
     main: Main,
     pending_counter: ID,
+    /// Inspect sheet shown as a modal over the page, if any.
+    inspect: Option<Inspect>,
 }
 
 impl Messenger {
@@ -46,6 +51,7 @@ impl Messenger {
             sidebar: Sidebar::new(168.0),
             main: Main::Contacts(Contacts::default()),
             pending_counter: ID::MAX,
+            inspect: None,
         }
     }
 
@@ -53,6 +59,73 @@ impl Messenger {
         let id = self.pending_counter;
         self.pending_counter = self.pending_counter.wrapping_sub(1);
         id
+    }
+}
+
+/// The inspect modal: an entity's name/icon plus backend detail fields.
+#[derive(Clone)]
+struct Inspect {
+    title: String,
+    icon: Option<PathBuf>,
+    state: InspectState,
+}
+
+#[derive(Clone)]
+enum InspectState {
+    Loading,
+    Loaded(Details),
+    Failed(String),
+}
+
+impl Inspect {
+    fn view(&self) -> Element<'_, Message> {
+        let mut header = Row::new().spacing(10.0).align_y(Alignment::Center);
+        if let Some(icon) = &self.icon {
+            header = header.push(
+                image(icon)
+                    .height(Length::Fixed(48.0))
+                    .width(Length::Fixed(48.0))
+                    .content_fit(ContentFit::Cover),
+            );
+        }
+        header = header.push(Text::new(self.title.as_str()).size(22));
+
+        let body: Element<'_, Message> = match &self.state {
+            InspectState::Loading => Text::new("Loading...").into(),
+            InspectState::Failed(err) => Text::new(err.as_str())
+                .color(Color::from_rgb(0.8, 0.2, 0.2))
+                .into(),
+            InspectState::Loaded(details) if details.fields.is_empty() => {
+                Text::new("No details available").into()
+            }
+            InspectState::Loaded(details) => {
+                Column::from_iter(details.fields.iter().map(|(label, value)| {
+                    row![
+                        Text::new(label.as_str())
+                            .size(13)
+                            .width(Length::Fixed(110.0)),
+                        Text::new(value.as_str()),
+                    ]
+                    .spacing(8.0)
+                    .into()
+                }))
+                .spacing(6.0)
+                .into()
+            }
+        };
+
+        container(
+            column![
+                header,
+                body,
+                Button::new("Close").on_press(Message::CloseInspect)
+            ]
+            .spacing(14.0),
+        )
+        .padding(18.0)
+        .width(Length::Fixed(380.0))
+        .style(container::rounded_box)
+        .into()
     }
 }
 
@@ -95,6 +168,21 @@ pub(crate) enum Message {
         room_id: ID,
         pending_id: ID,
     },
+    /// The inspect sheet fetch resolved.
+    InspectLoaded(Result<Details, String>),
+    CloseInspect,
+    /// An edit was confirmed by the server; replace the stored message.
+    ConfirmEdit {
+        id: MessengerId,
+        room_id: ID,
+        updated: Identifier<InterfaceMessage>,
+    },
+    /// A delete was confirmed by the server; drop the stored message.
+    ConfirmDelete {
+        id: MessengerId,
+        room_id: ID,
+        message_id: ID,
+    },
 }
 
 pub enum Action {
@@ -112,6 +200,50 @@ pub enum Action {
 }
 
 impl Messenger {
+    /// Open the inspect modal for `user` and fetch their detail sheet.
+    fn start_inspect_user(
+        &mut self,
+        interface: MessengerInterface,
+        user: Identifier<User>,
+    ) -> Action {
+        self.inspect = Some(Inspect {
+            title: user.name.clone(),
+            icon: user.icon.clone(),
+            state: InspectState::Loading,
+        });
+        Action::Run(
+            Task::future(async move {
+                let query = interface.query()?;
+                query.inspect_user(&user).await
+            })
+            .then(|result: Result<Details, Box<dyn Error + Send + Sync>>| {
+                Task::done(Message::InspectLoaded(result.map_err(|e| e.to_string())))
+            }),
+        )
+    }
+
+    /// Open the inspect modal for `house` and fetch its detail sheet.
+    fn start_inspect_house(
+        &mut self,
+        interface: MessengerInterface,
+        house: Identifier<Place<House>>,
+    ) -> Action {
+        self.inspect = Some(Inspect {
+            title: house.name.clone(),
+            icon: house.icon.clone(),
+            state: InspectState::Loading,
+        });
+        Action::Run(
+            Task::future(async move {
+                let query = interface.query()?;
+                query.inspect_house(&house).await
+            })
+            .then(|result: Result<Details, Box<dyn Error + Send + Sync>>| {
+                Task::done(Message::InspectLoaded(result.map_err(|e| e.to_string())))
+            }),
+        )
+    }
+
     pub(crate) fn update(&mut self, message: Message, messengers: &MessengerRegistry) -> Action {
         match message {
             Message::SetSidebarServer(server) => {
@@ -207,6 +339,48 @@ impl Messenger {
                     }
                 }),
             },
+            Message::InspectLoaded(result) => {
+                if let Some(inspect) = &mut self.inspect {
+                    inspect.state = match result {
+                        Ok(details) => InspectState::Loaded(details),
+                        Err(err) => InspectState::Failed(err),
+                    };
+                }
+                Action::None
+            }
+            Message::CloseInspect => {
+                self.inspect = None;
+                Action::None
+            }
+            Message::ConfirmEdit {
+                id,
+                room_id,
+                updated,
+            } => Action::ModifyMessengerData {
+                id,
+                modify: Box::new(move |data| {
+                    if let Some(room) = data.room_mut(room_id)
+                        && let Some(msgs) = room.messages.as_mut()
+                        && let Some(existing) = msgs.iter_mut().find(|m| m.id() == updated.id())
+                    {
+                        *existing = updated;
+                    }
+                }),
+            },
+            Message::ConfirmDelete {
+                id,
+                room_id,
+                message_id,
+            } => Action::ModifyMessengerData {
+                id,
+                modify: Box::new(move |data| {
+                    if let Some(room) = data.room_mut(room_id)
+                        && let Some(msgs) = room.messages.as_mut()
+                    {
+                        msgs.retain(|m| *m.id() != message_id);
+                    }
+                }),
+            },
             Message::Chat(msg) => {
                 if let Main::Chat(chat) = &mut self.main {
                     return match msg {
@@ -241,7 +415,7 @@ impl Messenger {
                                     InterfaceMessage {
                                         content: Revision {
                                             at: None,
-                                            text: RichText::plain(contents.clone()),
+                                            text: contents.clone(),
                                         },
                                         history: Vec::new(),
                                         reactions: Vec::new(),
@@ -269,7 +443,7 @@ impl Messenger {
                                                     InterfaceMessage {
                                                         content: Revision {
                                                             at: None,
-                                                            text: RichText::plain(contents),
+                                                            text: contents,
                                                         },
                                                         history: Vec::new(),
                                                         reactions: Vec::new(),
@@ -304,45 +478,159 @@ impl Messenger {
                                     ),
                                 ]))
                             }
+                            ChatUpdateResult::Edit {
+                                interface,
+                                room,
+                                message_id,
+                                contents,
+                            } => {
+                                let id = interface.id;
+                                let room_id = *room.id();
+                                let Some(edit) = interface.edit else {
+                                    error!("Edit not supported by this messenger");
+                                    return Action::None;
+                                };
+                                Action::Run(
+                                    Task::future(async move {
+                                        edit.edit_message(
+                                            &room,
+                                            &Identifier::new(
+                                                message_id,
+                                                InterfaceMessage::default(),
+                                            ),
+                                            InterfaceMessage {
+                                                content: Revision {
+                                                    at: None,
+                                                    text: contents,
+                                                },
+                                                ..Default::default()
+                                            },
+                                        )
+                                        .await
+                                    })
+                                    .then(
+                                        move |result: Result<_, Box<dyn Error + Send + Sync>>| {
+                                            match result {
+                                                Ok(updated) => Task::done(Message::ConfirmEdit {
+                                                    id,
+                                                    room_id,
+                                                    updated,
+                                                }),
+                                                Err(e) => {
+                                                    error!("Failed to edit message: {e:#?}");
+                                                    Task::none()
+                                                }
+                                            }
+                                        },
+                                    ),
+                                )
+                            }
+                            ChatUpdateResult::Delete {
+                                interface,
+                                room,
+                                message_id,
+                            } => {
+                                let id = interface.id;
+                                let room_id = *room.id();
+                                let Some(delete) = interface.delete else {
+                                    error!("Delete not supported by this messenger");
+                                    return Action::None;
+                                };
+                                Action::Run(
+                                    Task::future(async move {
+                                        delete
+                                            .delete_message(
+                                                &room,
+                                                &Identifier::new(
+                                                    message_id,
+                                                    InterfaceMessage::default(),
+                                                ),
+                                            )
+                                            .await
+                                    })
+                                    .then(
+                                        move |result: Result<(), Box<dyn Error + Send + Sync>>| {
+                                            match result {
+                                                Ok(()) => Task::done(Message::ConfirmDelete {
+                                                    id,
+                                                    room_id,
+                                                    message_id,
+                                                }),
+                                                Err(e) => {
+                                                    error!("Failed to delete message: {e:#?}");
+                                                    Task::none()
+                                                }
+                                            }
+                                        },
+                                    ),
+                                )
+                            }
+                            ChatUpdateResult::InspectUser { interface, user } => {
+                                self.start_inspect_user(interface, user)
+                            }
                             ChatUpdateResult::ToggleReaction {
                                 interface,
                                 room,
                                 message_id,
                                 emoji,
                                 reacted,
-                            } => Action::Run(
-                                Task::future(async move {
-                                    let text = match interface.api.text() {
-                                        Ok(t) => t,
-                                        Err(e) => {
-                                            error!("Text not supported: {e:?}");
-                                            return;
+                            } => {
+                                let Some(reactions) = interface.reactions else {
+                                    error!("Reactions not supported by this messenger");
+                                    return Action::None;
+                                };
+                                Action::Run(
+                                    Task::future(async move {
+                                        let msg_ident = Identifier::new(
+                                            message_id,
+                                            InterfaceMessage::default(),
+                                        );
+                                        let result = if reacted {
+                                            reactions
+                                                .remove_reaction(&room, &msg_ident, &emoji)
+                                                .await
+                                        } else {
+                                            reactions.add_reaction(&room, &msg_ident, &emoji).await
+                                        };
+                                        if let Err(e) = result {
+                                            error!("Failed to toggle reaction: {e:#?}");
                                         }
-                                    };
-                                    let msg_ident =
-                                        Identifier::new(message_id, InterfaceMessage::default());
-                                    let result = if reacted {
-                                        text.remove_reaction(&room, &msg_ident, &emoji).await
-                                    } else {
-                                        text.add_reaction(&room, &msg_ident, &emoji).await
-                                    };
-                                    if let Err(e) = result {
-                                        error!("Failed to toggle reaction: {e:#?}");
-                                    }
-                                })
-                                .then(|_| Task::none()),
-                            ),
+                                    })
+                                    .then(|_| Task::none()),
+                                )
+                            }
                         },
                     };
                 }
                 Action::None
             }
-            Message::Contacts(msg) => {
-                if let Main::Contacts(contacts) = &mut self.main {
-                    return Action::Run(contacts.update(msg).map(Message::Contacts));
+            Message::Contacts(msg) => match msg {
+                ContactsAction::OpenDm { id, user } => {
+                    let conversation = messengers.data(id).and_then(|data| {
+                        data.conversations.iter().find(|room| {
+                            room.members
+                                .as_deref()
+                                .is_some_and(|members| matches!(members, [m] if m == &user))
+                        })
+                    });
+                    let Some(conversation) = conversation else {
+                        warn!("No existing DM conversation with {}", user.name);
+                        return Action::None;
+                    };
+
+                    let conversation = conversation.clone();
+                    self.update(
+                        Message::Sidebar(SidebarAction::OpenChat { id, conversation }),
+                        messengers,
+                    )
                 }
-                Action::None
-            }
+                msg => {
+                    if let Main::Contacts(contacts) = &mut self.main {
+                        return Action::Run(contacts.update(msg).map(Message::Contacts));
+                    }
+                    Action::None
+                }
+            },
             Message::Navbar(action) => match action {
                 NavbarAction::GetDMs => Action::Run(Task::done(Message::SetSidebarServer(None))),
                 NavbarAction::GetGuild { id, server } => {
@@ -411,6 +699,12 @@ impl Messenger {
                 SidebarAction::OpenContacts => {
                     self.main = Main::Contacts(Contacts::default());
                     Action::None
+                }
+                SidebarAction::InspectGuild { id, guild } => {
+                    let Some(interface) = messengers.interface(id) else {
+                        return Action::None;
+                    };
+                    self.start_inspect_house(interface.clone(), guild)
                 }
                 SidebarAction::OpenChat { id, conversation } => {
                     let Some(interface) = messengers.interface(id) else {
@@ -507,6 +801,27 @@ impl Messenger {
             .into()
         });
 
-        column![profiles, row![navbar, window]].into()
+        let base = Element::from(column![profiles, row![navbar, window]]);
+
+        let Some(inspect) = &self.inspect else {
+            return base;
+        };
+
+        stack![
+            base,
+            opaque(
+                mouse_area(center(opaque(inspect.view())).style(|_theme| {
+                    container::Style {
+                        background: Some(iced::Background::Color(Color {
+                            a: 0.6,
+                            ..Color::BLACK
+                        })),
+                        ..Default::default()
+                    }
+                }))
+                .on_press(Message::CloseInspect)
+            )
+        ]
+        .into()
     }
 }

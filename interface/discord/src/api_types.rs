@@ -31,6 +31,7 @@ pub struct Profile {
     // phone: Option<String>,
     // premium_type: i32,
     // public_flags: i32,
+    pub global_name: Option<String>,
     pub username: String,
     // verified: bool,
 }
@@ -42,6 +43,7 @@ pub struct User {
     // clan: Option<String>,
     // discriminator: String,
     pub id: SNOWFLAKE,
+    pub global_name: Option<String>,
     pub username: String,
 }
 
@@ -61,7 +63,7 @@ pub struct Recipient {
     // avatar_decoration_data: Option<String>,
     // clan: Option<String>,
     // discriminator: String,
-    // global_name: Option<String>,
+    pub(crate) global_name: Option<String>,
     pub(crate) id: SNOWFLAKE,
     // public_flags: i32,
     pub(crate) username: String,
@@ -157,8 +159,14 @@ impl Channel {
                 Identifier::new(
                     recipient.id,
                     messenger_interface::types::User {
-                        name: recipient.username.clone(),
+                        name: recipient
+                            .global_name
+                            .clone()
+                            .unwrap_or_else(|| recipient.username.clone()),
+                        tag: Some(recipient.username.clone()),
                         icon: recipient_icon,
+                        status: None,
+                        voice: None,
                     },
                 )
             },
@@ -185,7 +193,10 @@ impl Channel {
         let room = Room::new(
             // NOTE: DMs can have voice calls; treat as both for now.
             RoomCapabilities::from(self.channel_type),
+            // Recipients are the room's members; who is in a call is
+            // tracked separately in `participants` via `VoiceEvent`s.
             Some(recipients),
+            None,
             None,
         );
 
@@ -230,6 +241,29 @@ pub struct StickerItem {
     pub format_type: u8,
 }
 
+/// A guild's custom emoji (Ready/GuildCreate `emojis` entry subset).
+/// <https://discord.com/developers/docs/resources/emoji#emoji-object>
+#[derive(Facet, Clone)]
+pub struct GuildEmoji {
+    pub id: SNOWFLAKE,
+    /// `None` only for emoji Discord no longer resolves; those are unusable.
+    pub name: Option<String>,
+    pub animated: Option<bool>,
+    /// False when the emoji is unusable (e.g. lost through a Boost downgrade).
+    pub available: Option<bool>,
+}
+
+/// A guild's sticker (Ready/GuildCreate `stickers` entry subset).
+/// <https://discord.com/developers/docs/resources/sticker#sticker-object>
+#[derive(Facet, Clone)]
+pub struct GuildSticker {
+    pub id: SNOWFLAKE,
+    pub name: String,
+    /// 1 = PNG, 2 = APNG, 3 = Lottie (JSON), 4 = GIF.
+    pub format_type: u8,
+    pub available: Option<bool>,
+}
+
 #[derive(Facet, Clone)]
 pub struct Message {
     // attachments: Vec<String>,
@@ -268,6 +302,9 @@ impl Message {
                 emoji: messenger_interface::types::Emoji {
                     shortcode: reaction.emoji.name.clone(),
                     image,
+                    // Reactions are sent by name:id, not the content wire
+                    // tag; the compose reference doesn't apply here.
+                    reference: None,
                 },
                 count: reaction.count,
                 reacted: reaction.me,
@@ -318,6 +355,60 @@ impl Message {
     }
 }
 
+// https://discord.com/developers/docs/resources/message#edit-message-jsonform-params
+#[derive(Facet)]
+pub struct MessageEdit {
+    pub content: String,
+}
+
+/// `GET /users/{user_id}` — public user object subset.
+/// <https://discord.com/developers/docs/resources/user#user-object>
+#[derive(Facet)]
+pub struct UserDetails {
+    pub id: SNOWFLAKE,
+    pub username: String,
+    pub global_name: Option<String>,
+    pub bot: Option<bool>,
+}
+
+/// The `user_profile` sub-object of the profile endpoint response.
+#[derive(Facet)]
+pub struct UserProfileMeta {
+    pub bio: Option<String>,
+    pub pronouns: Option<String>,
+}
+
+#[derive(Facet)]
+pub struct MutualGuild {
+    pub id: SNOWFLAKE,
+}
+
+/// `GET /users/{user_id}/profile` — rich profile, user-token only endpoint.
+/// Requires a mutual friend or guild with the target; 403s otherwise, in
+/// which case callers fall back to the public user object.
+/// <https://docs.discord.food/resources/user#get-user-profile>
+#[derive(Facet)]
+pub struct UserProfile {
+    pub user: UserDetails,
+    pub user_profile: Option<UserProfileMeta>,
+    pub premium_since: Option<String>,
+    pub mutual_guilds: Option<Vec<MutualGuild>>,
+}
+
+/// `GET /guilds/{guild_id}?with_counts=true` response subset. Kept separate
+/// from [`Guild`] (the list/Ready shape) so extending it can never disturb
+/// parsing of those payloads.
+/// <https://discord.com/developers/docs/resources/guild#get-guild>
+#[derive(Facet)]
+pub struct GuildDetails {
+    pub id: SNOWFLAKE,
+    pub name: String,
+    pub description: Option<String>,
+    pub owner_id: Option<SNOWFLAKE>,
+    pub approximate_member_count: Option<u32>,
+    pub approximate_presence_count: Option<u32>,
+}
+
 // https://discord.com/developers/docs/resources/message#create-message-jsonform-params
 #[derive(Facet)]
 pub struct CreateMessage {
@@ -326,11 +417,12 @@ pub struct CreateMessage {
     pub tts: Option<bool>,     // True if this is a TTS message
     pub content: Option<String>, // Up to 2000 characters
     //
+    pub sticker_ids: Option<Vec<SNOWFLAKE>>, // IDs of up to 3 stickers
+    //
     // embeds: Option<Vec<Embed>>,                // Up to 10 rich embeds (max 6000 chars total)
     // allowed_mentions: Option<AllowedMentions>, // Who can be mentioned
     // message_reference: Option<MessageReference>, // Reply or forward
     // components: Option<Vec<Component>>,        // Components to include with the message
-    // sticker_ids: Option<Vec<Snowflake>>,        // IDs of up to 3 stickers
     // files: Option<Vec<FileContent>>,            // Files being sent
     // payload_json: Option<String>,               // JSON-encoded body for multipart/form-data
     // attachments: Option<Vec<Attachment>>,       // Attachments (filename, description)

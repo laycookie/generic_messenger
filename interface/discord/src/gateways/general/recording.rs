@@ -244,6 +244,7 @@ mod tests {
         Message {
             author: User {
                 avatar: None,
+                global_name: None,
                 id: 1,
                 username: "user".to_string(),
             },

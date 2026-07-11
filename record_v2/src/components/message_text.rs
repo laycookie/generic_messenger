@@ -2,15 +2,19 @@ use iced::{
     Alignment, Color, Element, Font, Length, Padding,
     advanced::graphics::core::font,
     widget::{
-        Button, Column, Row, Text, column, container, image, row,
+        Button, Column, Row, Text, column, container, image, mouse_area, row,
         text::{Rich, Span},
     },
 };
 use iced_aw::Wrap;
-use messenger_interface::types::{Emoji, Identifier, Message, Span as RichSpan, TextStyle};
+use messenger_interface::types::{
+    Emoji, Identifier, Message, Span as RichSpan, Sticker, TextStyle, User,
+};
+
+use crate::components::user_status::status_indicator;
 
 /// IDs at or above this value are pending (optimistic send, not yet confirmed).
-const PENDING_ID_THRESHOLD: u64 = u64::MAX - 1_000_000;
+pub const PENDING_ID_THRESHOLD: u64 = u64::MAX - 1_000_000;
 
 const LINK_COLOR: Color = Color::from_rgb(0.0, 0.0, 1.0);
 const PENDING_COLOR: Color = Color::from_rgb(0.0, 0.8, 0.0);
@@ -52,6 +56,7 @@ fn word<'a>(text: &'a str, style: TextStyle, color: Option<Color>) -> Text<'a> {
 pub fn message_text<'a, M: Clone + 'static>(
     msg: &'a Identifier<Message>,
     on_reaction: impl Fn(&'a Identifier<Message>, &'a str, bool) -> M + 'a,
+    on_author: impl Fn(&'a Identifier<User>) -> M + 'a,
 ) -> Element<'a, M> {
     let pending = *msg.id() >= PENDING_ID_THRESHOLD;
     // === Author ===
@@ -61,20 +66,26 @@ pub fn message_text<'a, M: Clone + 'static>(
         .and_then(|a| a.icon.clone())
         .unwrap_or_else(|| "./public/imgs/placeholder.jpg".into());
     let image_height = Length::Fixed(36.0);
-    let author_name: &str = msg
-        .author
-        .as_ref()
-        .map(|a| a.name.as_str())
-        .unwrap_or("Unknown");
-    let author = Text::from(author_name);
+    // Clicking the author name inspects their profile.
+    let author: Element<'a, M> = match msg.author.as_ref() {
+        Some(author) => {
+            let mut row = Row::new().spacing(4.0).align_y(Alignment::Center);
+            if let Some(status) = status_indicator(author.status) {
+                row = row.push(status);
+            }
+            row.push(mouse_area(Text::from(author.name.as_str())).on_press(on_author(author)))
+                .into()
+        }
+        None => Text::from("Unknown").into(),
+    };
 
     let spans = &msg.content.text.spans;
     let stickers: Vec<&'a std::path::PathBuf> = spans
         .iter()
         .filter_map(|span| match span {
-            RichSpan::Sticker {
+            RichSpan::Sticker(Sticker {
                 image: Some(path), ..
-            } => Some(path),
+            }) => Some(path),
             _ => None,
         })
         .collect();
@@ -117,7 +128,7 @@ pub fn message_text<'a, M: Clone + 'static>(
                         elements.push(shortcode.into());
                     }
                 },
-                RichSpan::Sticker { .. } => {}
+                RichSpan::Sticker(_) => {}
             }
         }
         if msg.is_edited() {
@@ -142,9 +153,9 @@ pub fn message_text<'a, M: Clone + 'static>(
                 }
                 // Sticker images render below; a sticker with no image falls
                 // back to its alt text here.
-                RichSpan::Sticker { alt, image } => {
-                    if image.is_none() {
-                        rich_spans.push(Span::new(alt.as_str()));
+                RichSpan::Sticker(sticker) => {
+                    if sticker.image.is_none() {
+                        rich_spans.push(Span::new(sticker.alt.as_str()));
                     }
                 }
             }

@@ -1,9 +1,14 @@
 use std::sync::Arc;
 
 use discord::Discord;
+use messenger_interface::auth::{Credential, CredentialField};
 
 fn token() -> Option<String> {
     std::env::var("DISCORD_TOKEN").ok()
+}
+
+fn token_credential(token: String) -> Credential {
+    Credential(vec![CredentialField::new("token", token)])
 }
 
 #[test]
@@ -11,7 +16,7 @@ fn messenger_drop_frees_memory() {
     let Some(token) = token() else {
         panic!("SKIPPED: Token wasn't provided");
     };
-    let messenger = Discord::new_messenger(&token);
+    let messenger = smol::block_on(Discord::create_messenger(token_credential(token))).unwrap();
     let weak = Arc::downgrade(&messenger);
 
     drop(messenger);
@@ -25,7 +30,9 @@ fn messenger_drop_frees_streams() {
         panic!("SKIPPED: Token wasn't provided");
     };
     smol::block_on(async {
-        let messenger = Discord::new_messenger(&token);
+        let messenger = Discord::create_messenger(token_credential(token))
+            .await
+            .unwrap();
         let weak = Arc::downgrade(&messenger);
 
         let q = messenger.clone().arc_query().unwrap();

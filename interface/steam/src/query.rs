@@ -36,7 +36,9 @@ use steam_vent_proto::steammessages_friendmessages_steamclient::{
     CFriendMessages_GetRecentMessages_Request, CFriendMessages_SendMessage_Request,
     CFriendsMessages_GetActiveMessageSessions_Request,
 };
-use steam_vent_proto::steammessages_player_steamclient::CPlayer_GetPlayerLinkDetails_Request;
+use steam_vent_proto::steammessages_player_steamclient::{
+    CPlayer_GetEmoticonList_Request, CPlayer_GetPlayerLinkDetails_Request,
+};
 use tracing::{debug, error, warn};
 
 use crate::SteamMessenger;
@@ -45,7 +47,7 @@ use crate::api_types::{
     EFRIENDRELATIONSHIP_FRIEND, FriendEntry, account_id_to_steam_id, hex_avatar, message_id,
     steam_group_room_id,
 };
-use crate::downloaders::{cache_avatar, steam_user_identifier};
+use crate::downloaders::{SteamImage, steam_user_identifier};
 use crate::session::{Connected, TextPoll};
 
 /// Recent-history page size for [`Text::get_messages`].
@@ -401,7 +403,7 @@ fn sort_chat_rooms(rooms: &mut [ChatRoomEntry]) {
 
 async fn steam_group_icon(group: &ChatGroupEntry) -> Option<PathBuf> {
     match &group.avatar_hash {
-        Some(hash) => cache_avatar(group.id, hash).await,
+        Some(hash) => SteamImage::avatar(group.id, hash).fetch().await.ok(),
         None => None,
     }
 }
@@ -416,14 +418,14 @@ fn room_capabilities(room: &ChatRoomEntry) -> RoomCapabilities {
 
 fn chat_room_identifier(
     room: &ChatRoomEntry,
-    participants: Option<Vec<Identifier<User>>>,
+    members: Option<Vec<Identifier<User>>>,
 ) -> Identifier<Place<Room>> {
     Identifier::new(
         steam_group_room_id(room.chat_group_id, room.chat_id),
         Place::new(
             room.name.clone(),
             None,
-            Room::new(room_capabilities(room), participants, None),
+            Room::new(room_capabilities(room), members, None, None),
         ),
     )
 }
@@ -681,10 +683,19 @@ impl Query for SteamMessenger {
             .into_iter()
             .map(|(id, name, avatar_hash)| async move {
                 let icon = match avatar_hash {
-                    Some(hash) => cache_avatar(id, &hash).await,
+                    Some(hash) => SteamImage::avatar(id, &hash).fetch().await.ok(),
                     None => None,
                 };
-                Identifier::new(id, User { name, icon })
+                Identifier::new(
+                    id,
+                    User {
+                        name,
+                        tag: None,
+                        icon,
+                        status: None,
+                        voice: None,
+                    },
+                )
             });
         let users = join_all(downloads).await;
         Ok(users)
@@ -712,11 +723,23 @@ impl Query for SteamMessenger {
             let last_message_at = last_messages.get(&id).copied().unwrap_or(0);
             async move {
                 let icon = match avatar_hash {
-                    Some(hash) => cache_avatar(id, &hash).await,
+                    Some(hash) => SteamImage::avatar(id, &hash).fetch().await.ok(),
                     None => None,
                 };
                 let sort_name = name.to_lowercase();
-                let room = Room::new(RoomCapabilities::Text, None, None);
+                // The friend is the conversation's sole member; the room and
+                // its member share the friend's SteamID and avatar.
+                let member = Identifier::new(
+                    id,
+                    User {
+                        name: name.clone(),
+                        tag: None,
+                        icon: icon.clone(),
+                        status: None,
+                        voice: None,
+                    },
+                );
+                let room = Room::new(RoomCapabilities::Text, Some(vec![member]), None, None);
                 (
                     last_message_at,
                     sort_name,
@@ -749,7 +772,7 @@ impl Query for SteamMessenger {
         let (group, member_ids) = self
             .load_chat_group_details(&connected, *house.id())
             .await?;
-        let participants = if member_ids.is_empty() {
+        let members = if member_ids.is_empty() {
             None
         } else {
             Some(
@@ -768,7 +791,7 @@ impl Query for SteamMessenger {
         let rooms = group
             .rooms
             .iter()
-            .map(|room| chat_room_identifier(room, participants.clone()))
+            .map(|room| chat_room_identifier(room, members.clone()))
             .collect();
         Ok(House::new(Some(rooms)))
     }
@@ -952,6 +975,39 @@ impl Text for SteamMessenger {
         Ok(messages)
     }
 
+    /// The account's owned emoticons, for the picker. Availability is
+    /// account-wide on Steam, so `location` is ignored.
+    async fn pickable_emojis(
+        &self,
+        _location: &Identifier<Place<Room>>,
+    ) -> Result<Vec<Emoji>, Box<dyn Error + Sync + Send>> {
+        let connected = self.connected().await?;
+        let conn = connected.conn.clone();
+        let response = self
+            .run(async move {
+                conn.service_method(CPlayer_GetEmoticonList_Request::default())
+                    .await
+            })
+            .await??;
+
+        // Emoticon names arrive colon-wrapped (`:steamhappy:`); the interface
+        // shortcode is the bare name.
+        let names = response.emoticons.into_iter().filter_map(|emoticon| {
+            let name = emoticon.name?;
+            let name = name.trim_matches(':');
+            (!name.is_empty()).then(|| name.to_owned())
+        });
+        Ok(join_all(names.map(|name| async move {
+            let image = SteamImage::emoticon(&name).fetch().await.ok();
+            Emoji {
+                shortcode: name,
+                image,
+                reference: None,
+            }
+        }))
+        .await)
+    }
+
     async fn send_message(
         &self,
         location: &Identifier<Place<Room>>,
@@ -959,8 +1015,9 @@ impl Text for SteamMessenger {
     ) -> Result<Identifier<Message>, Box<dyn Error + Sync + Send>> {
         let connected = self.connected().await?;
         let conn = connected.conn.clone();
-        // The user composes plain text; flatten to a string to send.
-        let outgoing = contents.content.text.to_plain();
+        // Flatten spans to Steam's wire form (emoji → `:name:`, which the
+        // server converts to `[emoticon]` BBCode for owned emoticons).
+        let outgoing = crate::rich::serialize_content(&contents.content.text);
         let room_location = connected
             .chat_room_locations
             .get(location.id())

@@ -59,9 +59,9 @@ use async_trait::async_trait;
 use futures::future::{Either, join_all, select};
 use futures_timer::Delay;
 use messenger_interface::{
-    interface::{Query, QueryEvent},
+    interface::{Query, QueryEvent, UserStatuses},
     stream::{ArcStream, WeakSocketStream},
-    types::{House, Identifier, Place, Room, RoomCapabilities, User},
+    types::{Details, House, ID, Identifier, Place, Room, RoomCapabilities, User, UserStatus},
 };
 use tracing::{error, warn};
 
@@ -69,6 +69,13 @@ use std::{error::Error, sync::Arc, time::Duration};
 
 const GATEWAY_CACHE_POLL_ATTEMPTS: usize = 8;
 const GATEWAY_CACHE_POLL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Creation time encoded in a snowflake: `id >> 22` is milliseconds since
+/// the Discord epoch (2015-01-01T00:00:00Z).
+fn snowflake_created(id: SNOWFLAKE) -> Option<chrono::DateTime<chrono::Utc>> {
+    const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+    chrono::DateTime::from_timestamp_millis(((id >> 22) + DISCORD_EPOCH_MS) as i64)
+}
 
 impl InnerDiscord<Owned> {
     // TODO: Depricate
@@ -110,7 +117,12 @@ impl InnerDiscord<Owned> {
         sorted.sort_by_key(|c| std::cmp::Reverse(c.last_message_id));
 
         let rooms_producer = sorted.iter().map(async move |channel| {
-            let place_room = channel.to_room_data().await;
+            let mut place_room = channel.to_room_data().await;
+            if let Some(members) = place_room.place_data.members.as_mut() {
+                for member in members {
+                    member.status = self.interface_user_status(*member.id());
+                }
+            }
             Discord::identifier_generator(channel.id, place_room)
         });
 
@@ -143,8 +155,15 @@ impl InnerDiscord<Owned> {
                 Discord::identifier_generator(
                     friend.id,
                     User {
-                        name: friend.user.username.clone(),
+                        name: friend
+                            .user
+                            .global_name
+                            .clone()
+                            .unwrap_or_else(|| friend.user.username.clone()),
+                        tag: Some(friend.user.username.clone()),
                         icon: hash,
+                        status: self.interface_user_status(friend.user.id),
+                        voice: None,
                     },
                 )
             })
@@ -255,7 +274,13 @@ impl InnerDiscord<Owned> {
                 let participants = self
                     .voice_participants
                     .get(&channel.id)
-                    .map(|entry| entry.clone())
+                    .map(|entry| {
+                        let mut participants = entry.clone();
+                        for participant in &mut participants {
+                            participant.status = self.interface_user_status(*participant.id());
+                        }
+                        participants
+                    })
                     .unwrap_or_default();
                 let identifier = Discord::identifier_generator(
                     channel.id,
@@ -264,6 +289,7 @@ impl InnerDiscord<Owned> {
                         None,
                         Room::new(
                             RoomCapabilities::from(channel.channel_type),
+                            None,
                             Some(participants),
                             None,
                         ),
@@ -288,10 +314,43 @@ impl InnerDiscord<Owned> {
         Discord::identifier_generator(
             profile.id,
             User {
-                name: profile.username.clone(),
+                name: profile
+                    .global_name
+                    .clone()
+                    .unwrap_or_else(|| profile.username.clone()),
+                tag: Some(profile.username.clone()),
                 icon,
+                status: self.interface_user_status(profile.id),
+                voice: None,
             },
         )
+    }
+}
+
+#[async_trait]
+impl UserStatuses for InnerDiscord<Owned> {
+    async fn user_statuses(
+        &self,
+        users: &[Identifier<User>],
+    ) -> Result<Vec<(ID, UserStatus)>, Box<dyn Error + Sync + Send>> {
+        let _ = self
+            .poll_gateway_until(|discord| {
+                discord.profile.load().is_some()
+                    || discord.relationships.load().is_some()
+                    || discord.guilds.load().is_some()
+            })
+            .await;
+
+        Ok(users
+            .iter()
+            .map(|user| {
+                (
+                    *user.id(),
+                    self.cached_user_status(*user.id())
+                        .unwrap_or(UserStatus::Offline),
+                )
+            })
+            .collect())
     }
 }
 
@@ -404,6 +463,99 @@ impl Query for InnerDiscord<Owned> {
 
         Ok(House::new(Some(rooms)))
     }
+
+    async fn inspect_user(
+        &self,
+        user: &Identifier<User>,
+    ) -> Result<Details, Box<dyn Error + Sync + Send>> {
+        // Interface user ids are the raw Discord snowflakes (see the contact
+        // and message-author construction paths), so no mapping table here.
+        let user_id = *user.id();
+        let mut details = Details::default();
+
+        // The rich profile endpoint needs a mutual friend/guild with the
+        // target; fall back to the public user object when it rejects us.
+        match self.rest_get_user_profile(user_id).await {
+            Ok(profile) => {
+                details.push("Username", profile.user.username);
+                details.push_opt("Display name", profile.user.global_name);
+                if profile.user.bot.unwrap_or(false) {
+                    details.push("Bot", "Yes");
+                }
+                if let Some(meta) = profile.user_profile {
+                    details.push_opt("Bio", meta.bio.filter(|bio| !bio.is_empty()));
+                    details.push_opt(
+                        "Pronouns",
+                        meta.pronouns.filter(|pronouns| !pronouns.is_empty()),
+                    );
+                }
+                details.push_opt("Premium since", profile.premium_since);
+                if let Some(mutual) = profile.mutual_guilds {
+                    details.push("Mutual servers", mutual.len().to_string());
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "Discord: profile endpoint failed for {user_id}, \
+                     falling back to the public user object: {err}"
+                );
+                let user = self.rest_get_user(user_id).await?;
+                details.push("Username", user.username);
+                details.push_opt("Display name", user.global_name);
+                if user.bot.unwrap_or(false) {
+                    details.push("Bot", "Yes");
+                }
+            }
+        }
+
+        details.push("User ID", user_id.to_string());
+        details.push_opt(
+            "Created",
+            snowflake_created(user_id).map(|at| at.format("%Y-%m-%d").to_string()),
+        );
+        Ok(details)
+    }
+
+    async fn inspect_house(
+        &self,
+        house: &Identifier<Place<House>>,
+    ) -> Result<Details, Box<dyn Error + Sync + Send>> {
+        let guild_id = *self
+            .guild_id_mappings
+            .get(house.id())
+            .ok_or("No discord guild id mapping for this house")?;
+
+        let guild = self.rest_get_guild(guild_id).await?;
+
+        let mut details = Details::default();
+        details.push("Name", guild.name);
+        details.push_opt(
+            "Description",
+            guild
+                .description
+                .filter(|description| !description.is_empty()),
+        );
+        details.push_opt(
+            "Members",
+            guild
+                .approximate_member_count
+                .map(|count| count.to_string()),
+        );
+        details.push_opt(
+            "Online",
+            guild
+                .approximate_presence_count
+                .map(|count| count.to_string()),
+        );
+        details.push_opt("Owner ID", guild.owner_id.map(|id| id.to_string()));
+        details.push("Server ID", guild_id.to_string());
+        details.push_opt(
+            "Created",
+            snowflake_created(guild_id).map(|at| at.format("%Y-%m-%d").to_string()),
+        );
+        Ok(details)
+    }
+
     async fn listen(
         self: Arc<Self>,
     ) -> Result<WeakSocketStream<QueryEvent>, Box<dyn Error + Sync + Send>> {

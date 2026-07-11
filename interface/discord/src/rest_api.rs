@@ -176,8 +176,10 @@ impl InnerDiscord<Owned> {
     pub(crate) async fn get_auth_header(
         &self,
     ) -> Result<Vec<(&'static str, String)>, Box<dyn Error + Sync + Send>> {
-        let token = self.ensure_token().await?;
-        Ok(vec![("Authorization", token.unsecure().trim().to_string())])
+        Ok(vec![(
+            "Authorization",
+            self.token.unsecure().trim().to_string(),
+        )])
     }
 
     pub(crate) async fn rest_get_profile(
@@ -257,6 +259,44 @@ impl InnerDiscord<Owned> {
             .await
     }
 
+    pub(crate) async fn rest_get_user(
+        &self,
+        user_id: SNOWFLAKE,
+    ) -> Result<api_types::UserDetails, Box<dyn Error + Sync + Send>> {
+        Fetch::<Fresh>::fetch(
+            || surf::get(format!("{DISCORD_API}/users/{user_id}")),
+            self.get_auth_header().await?,
+        )
+        .await?
+        .json::<api_types::UserDetails>()
+        .await
+    }
+
+    // User-token endpoint; requires a mutual friend/guild with the target.
+    // Docs: https://docs.discord.food/resources/user#get-user-profile
+    pub(crate) async fn rest_get_user_profile(
+        &self,
+        user_id: SNOWFLAKE,
+    ) -> Result<api_types::UserProfile, Box<dyn Error + Sync + Send>> {
+        let url = format!("{DISCORD_API}/users/{user_id}/profile?with_mutual_guilds=true");
+        Fetch::<Fresh>::fetch(|| surf::get(&url), self.get_auth_header().await?)
+            .await?
+            .json::<api_types::UserProfile>()
+            .await
+    }
+
+    // Docs: https://discord.com/developers/docs/resources/guild#get-guild
+    pub(crate) async fn rest_get_guild(
+        &self,
+        guild_id: SNOWFLAKE,
+    ) -> Result<api_types::GuildDetails, Box<dyn Error + Sync + Send>> {
+        let url = format!("{DISCORD_API}/guilds/{guild_id}?with_counts=true");
+        Fetch::<Fresh>::fetch(|| surf::get(&url), self.get_auth_header().await?)
+            .await?
+            .json::<api_types::GuildDetails>()
+            .await
+    }
+
     // Docs: https://discord.com/developers/docs/resources/message#create-reaction
     pub(crate) async fn rest_add_reaction(
         &self,
@@ -292,12 +332,14 @@ impl InnerDiscord<Owned> {
         &self,
         channel_id: SNOWFLAKE,
         content: String,
+        sticker_ids: Vec<SNOWFLAKE>,
     ) -> Result<api_types::Message, Box<dyn Error + Sync + Send>> {
         let message = api_types::CreateMessage {
             content: Some(content),
             nonce: None,
             enforce_nonce: None,
             tts: Some(false),
+            sticker_ids: (!sticker_ids.is_empty()).then_some(sticker_ids),
             flags: Some(0),
         };
         let msg_string = facet_json::to_vec(&message)?;
@@ -312,5 +354,39 @@ impl InnerDiscord<Owned> {
         .await?
         .json::<api_types::Message>()
         .await
+    }
+
+    // Docs: https://discord.com/developers/docs/resources/message#edit-message
+    pub(crate) async fn rest_edit_message(
+        &self,
+        channel_id: SNOWFLAKE,
+        message_id: SNOWFLAKE,
+        content: String,
+    ) -> Result<api_types::Message, Box<dyn Error + Sync + Send>> {
+        let body = facet_json::to_vec(&api_types::MessageEdit { content })?;
+        Fetch::<Fresh>::fetch(
+            || {
+                surf::patch(format!(
+                    "{DISCORD_API}/channels/{channel_id}/messages/{message_id}"
+                ))
+                .body(body.clone())
+                .content_type("application/json")
+            },
+            self.get_auth_header().await?,
+        )
+        .await?
+        .json::<api_types::Message>()
+        .await
+    }
+
+    // Docs: https://discord.com/developers/docs/resources/message#delete-message
+    pub(crate) async fn rest_delete_message(
+        &self,
+        channel_id: SNOWFLAKE,
+        message_id: SNOWFLAKE,
+    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+        let url = format!("{DISCORD_API}/channels/{channel_id}/messages/{message_id}");
+        Fetch::<Fresh>::fetch(|| surf::delete(&url), self.get_auth_header().await?).await?;
+        Ok(())
     }
 }

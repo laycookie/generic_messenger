@@ -6,10 +6,27 @@ use iced::{
     },
 };
 use iced_palace::widget::ellipsized_text;
-use messenger_interface::types::{ID, Identifier, Place, Room, RoomCapabilities};
+use messenger_interface::types::{House, ID, Identifier, Place, Room, RoomCapabilities, User};
+use messenger_unifier::{Call, MessengerId, MessengerRegistry};
 
 use super::PLACEHOLDER_PFP;
-use crate::state::{Call, MessengerId, MessengerRegistry};
+use crate::components::user_status::{known_user_status, one_to_one_room_status, status_indicator};
+
+/// "M"/"D" badges next to a muted/deafened voice participant.
+fn voice_state_badges<'a>(participant: &User) -> Vec<Element<'a, Action>> {
+    let Some(state) = participant.voice else {
+        return Vec::new();
+    };
+    [(state.muted, "M"), (state.deafened, "D")]
+        .into_iter()
+        .filter(|(active, _)| *active)
+        .map(|(_, label)| {
+            container(Text::new(label).size(10))
+                .padding(Padding::new(0.0).left(4.0))
+                .into()
+        })
+        .collect()
+}
 
 /// Green tint marking a voice channel/button as joinable.
 fn call_button_style(_theme: &iced::Theme, _status: button::Status) -> button::Style {
@@ -48,6 +65,11 @@ pub enum Action {
         id: MessengerId,
         conversation: Identifier<Place<Room>>,
     },
+    /// Open the inspect sheet for the selected server/guild.
+    InspectGuild {
+        id: MessengerId,
+        guild: Identifier<Place<House>>,
+    },
 }
 
 impl Sidebar {
@@ -62,15 +84,28 @@ impl Sidebar {
         server: Server,
         messengers: &'a MessengerRegistry,
     ) -> Column<'a, Action> {
-        let guild = messengers
-            .data(server.messenger_id)
-            .and_then(|d| d.guilds.iter().find(|g| *g.id() == server.guild_id));
+        let data = messengers.data(server.messenger_id);
+        let guild = data.and_then(|d| d.guilds.iter().find(|g| *g.id() == server.guild_id));
 
         let server_name = guild.map(|g| g.name.as_str()).unwrap_or("");
         let channels = guild.and_then(|g| g.rooms.as_deref()).unwrap_or(&[]);
 
         let header = container(Text::new(server_name).size(18))
             .padding(Padding::new(0.0).left(8.0).top(6.0).bottom(6.0));
+        let header = match guild {
+            Some(guild) => row![
+                header,
+                Button::new(Text::new("Info").size(12)).on_press(Action::InspectGuild {
+                    id: server.messenger_id,
+                    guild: guild.swap_data(Place::new(
+                        guild.name.clone(),
+                        guild.icon.clone(),
+                        House::new(None),
+                    )),
+                }),
+            ],
+            None => row![header],
+        };
 
         let rooms_list = Column::from_iter(channels.iter().map(move |chan| {
             let caps = chan.room_capabilities;
@@ -123,19 +158,28 @@ impl Sidebar {
                             None => image(PLACEHOLDER_PFP),
                         };
 
+                        let mut identity = row![
+                            container(
+                                avatar
+                                    .height(Length::Fixed(18.0))
+                                    .width(Length::Fixed(18.0))
+                                    .content_fit(ContentFit::Cover),
+                            )
+                            .padding(Padding::new(0.0).right(6.0).left(18.0)),
+                        ]
+                        .spacing(4.0)
+                        .width(Length::Fill);
+                        if let Some(status) = status_indicator(known_user_status(data, participant))
+                        {
+                            identity = identity.push(status);
+                        }
                         Element::from(
-                            row![
-                                container(
-                                    avatar
-                                        .height(Length::Fixed(18.0))
-                                        .width(Length::Fixed(18.0))
-                                        .content_fit(ContentFit::Cover),
+                            identity
+                                .push(
+                                    ellipsized_text(participant.name.as_str())
+                                        .wrapping(Wrapping::None),
                                 )
-                                .padding(Padding::new(0.0).right(6.0).left(18.0)),
-                                ellipsized_text(participant.name.as_str())
-                                    .wrapping(Wrapping::None),
-                            ]
-                            .width(Length::Fill),
+                                .extend(voice_state_badges(participant)),
                         )
                     },
                 ));
@@ -151,23 +195,31 @@ impl Sidebar {
             messengers.iter().flat_map(|(_, entry)| {
                 let id = entry.interface.id;
                 entry.data.conversations.iter().map(move |conversation| {
-                    Button::new({
-                        let image = match &conversation.icon {
-                            Some(icon) => image(icon),
-                            None => image(PLACEHOLDER_PFP),
-                        };
-                        row![
-                            container(image.height(Length::Fixed(28.0)))
-                                .padding(Padding::new(0.0).right(10.0)),
-                            ellipsized_text(conversation.name.as_str()).wrapping(Wrapping::None)
-                        ]
-                    })
-                    .width(Length::Fill)
-                    .on_press(Action::OpenChat {
-                        id,
-                        conversation: conversation.to_owned(),
-                    })
-                    .into()
+                    let image = match &conversation.icon {
+                        Some(icon) => image(icon),
+                        None => image(PLACEHOLDER_PFP),
+                    };
+                    let mut label = row![
+                        container(image.height(Length::Fixed(28.0)))
+                            .padding(Padding::new(0.0).right(10.0)),
+                    ]
+                    .spacing(4.0)
+                    .align_y(iced::Alignment::Center);
+                    if let Some(status) =
+                        status_indicator(one_to_one_room_status(&entry.data, conversation))
+                    {
+                        label = label.push(status);
+                    }
+                    label = label
+                        .push(ellipsized_text(conversation.name.as_str()).wrapping(Wrapping::None));
+
+                    Button::new(label)
+                        .width(Length::Fill)
+                        .on_press(Action::OpenChat {
+                            id,
+                            conversation: conversation.to_owned(),
+                        })
+                        .into()
                 })
             }),
         )
@@ -208,15 +260,21 @@ impl Sidebar {
                                 Some(icon) => image(icon),
                                 None => image(PLACEHOLDER_PFP),
                             };
-                            Element::from(
-                                container(
-                                    pfp_image
-                                        .height(Length::Fixed(24.0))
-                                        .width(Length::Fixed(24.0))
-                                        .content_fit(ContentFit::Cover),
-                                )
-                                .padding(Padding::new(0.0).right(4.0)),
-                            )
+                            let mut badge = row![container(
+                                pfp_image
+                                    .height(Length::Fixed(24.0))
+                                    .width(Length::Fixed(24.0))
+                                    .content_fit(ContentFit::Cover),
+                            )]
+                            .spacing(4.0)
+                            .align_y(iced::Alignment::Center);
+                            if let Some(status) = status_indicator(known_user_status(
+                                Some(&messenger.data),
+                                participant,
+                            )) {
+                                badge = badge.push(status);
+                            }
+                            Element::from(badge.padding(Padding::new(0.0).right(6.0)))
                         })));
 
                     Element::from(column![

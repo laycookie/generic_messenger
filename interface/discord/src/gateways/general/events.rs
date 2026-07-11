@@ -8,13 +8,16 @@ use facet_pretty::FacetPretty;
 use futures::future::join_all;
 use messenger_interface::{
     interface::{QueryEvent, TextEvent},
-    types::{Identifier, Message as GlobalMessage, User as GlobalUser},
+    types::{Identifier, Message as GlobalMessage, User as GlobalUser, UserStatus},
 };
 use tracing::{debug, error, trace, warn};
 
 use super::{
     GatewayEvent, Opcode,
-    payloads::{ReadyPayload, SessionObjectPayload, VoiceServerUpdatePayload, VoiceStatePayload},
+    payloads::{
+        PresencePayload, ReadyPayload, SessionObjectPayload, VoiceServerUpdatePayload,
+        VoiceStatePayload,
+    },
     recording::RecordedEvent,
 };
 use crate::{
@@ -23,6 +26,46 @@ use crate::{
     downloaders::CdnImage,
     gateways::{GatewayPayload, voice::Endpoint},
 };
+
+fn user_status_from_discord(status: &str) -> Option<UserStatus> {
+    match status {
+        "online" => Some(UserStatus::Online),
+        "idle" => Some(UserStatus::Idle),
+        "dnd" => Some(UserStatus::DoNotDisturb),
+        "offline" | "invisible" => Some(UserStatus::Offline),
+        other => {
+            warn!("Unknown Discord presence status: {other}");
+            None
+        }
+    }
+}
+
+fn cache_presence<T: UnitStruct>(discord: &InnerDiscord<T>, presence: PresencePayload, emit: bool) {
+    let user_id = presence.user.id;
+    let Some(status) = user_status_from_discord(&presence.status) else {
+        return;
+    };
+
+    discord.presences.insert(user_id, status);
+    if emit {
+        discord
+            .query_events
+            .force_push(QueryEvent::UserStatusChanged { user_id, status });
+    }
+}
+
+fn cache_presence_values<T: UnitStruct>(
+    discord: &InnerDiscord<T>,
+    presences: Vec<facet_value::Value>,
+    emit: bool,
+) {
+    for presence in presences {
+        match facet_value::from_value::<PresencePayload>(presence) {
+            Ok(presence) => cache_presence(discord, presence, emit),
+            Err(err) => warn!("Skipping unparseable presence: {err}"),
+        }
+    }
+}
 
 impl GatewayPayload<Opcode> {
     pub(in crate::gateways) async fn exec<T: UnitStruct>(
@@ -59,6 +102,7 @@ impl GatewayPayload<Opcode> {
                         // voice_states — otherwise stale entries linger.
                         discord.voice_states.clear();
                         discord.voice_participants.clear();
+                        discord.presences.clear();
 
                         let ready = facet_value::from_value::<ReadyPayload>(self.d)?;
 
@@ -66,6 +110,7 @@ impl GatewayPayload<Opcode> {
                             discord.profile.store(Some(Arc::new(api_types::Profile {
                                 id: user.id,
                                 username: user.username,
+                                global_name: user.global_name,
                                 avatar: user.avatar,
                             })));
                         }
@@ -85,6 +130,10 @@ impl GatewayPayload<Opcode> {
                             discord
                                 .relationships
                                 .store(Some(Arc::new(cached_relationships)));
+                        }
+
+                        if let Some(presences) = ready.presences {
+                            cache_presence_values(discord, presences, false);
                         }
 
                         let mut merged_members =
@@ -107,6 +156,44 @@ impl GatewayPayload<Opcode> {
                                 (guild_payload.id, guild_payload.channels)
                             {
                                 discord.guild_channels.insert(guild_id, channels);
+                            }
+
+                            // Custom emoji / stickers for the picker. Parsed
+                            // leniently per entry so one odd object doesn't
+                            // cost the whole guild its palette.
+                            if let Some(guild_id) = guild_payload.id {
+                                if let Some(emojis) = guild_payload.emojis {
+                                    let emojis = emojis
+                                        .into_iter()
+                                        .filter_map(|emoji| {
+                                            facet_value::from_value::<api_types::GuildEmoji>(emoji)
+                                                .inspect_err(|err| {
+                                                    warn!("Skipping unparseable guild emoji: {err}")
+                                                })
+                                                .ok()
+                                        })
+                                        .collect();
+                                    discord.guild_emojis.insert(guild_id, emojis);
+                                }
+                                if let Some(stickers) = guild_payload.stickers {
+                                    let stickers = stickers
+                                        .into_iter()
+                                        .filter_map(|sticker| {
+                                            facet_value::from_value::<api_types::GuildSticker>(
+                                                sticker,
+                                            )
+                                            .inspect_err(|err| {
+                                                warn!("Skipping unparseable guild sticker: {err}")
+                                            })
+                                            .ok()
+                                        })
+                                        .collect();
+                                    discord.guild_stickers.insert(guild_id, stickers);
+                                }
+                            }
+
+                            if let Some(presences) = guild_payload.presences {
+                                cache_presence_values(discord, presences, false);
                             }
 
                             if let Some(properties) = guild_payload.properties {
@@ -180,6 +267,10 @@ impl GatewayPayload<Opcode> {
                             trace!("VoiceStateUpdate: voice connect attempt finished");
                         }
                     }
+                    GatewayEvent::PresenceUpdate => {
+                        let presence = facet_value::from_value::<PresencePayload>(self.d)?;
+                        cache_presence(discord, presence, true);
+                    }
                     GatewayEvent::VoiceServerUpdate => {
                         let server_update =
                             facet_value::from_value::<VoiceServerUpdatePayload>(self.d)?;
@@ -237,8 +328,15 @@ impl GatewayPayload<Opcode> {
                         let author = Identifier::new(
                             message.author.id,
                             GlobalUser {
-                                name: message.author.username,
+                                name: message
+                                    .author
+                                    .global_name
+                                    .clone()
+                                    .unwrap_or_else(|| message.author.username.clone()),
+                                tag: Some(message.author.username),
                                 icon,
+                                status: discord.interface_user_status(message.author.id),
+                                voice: None,
                             },
                         );
                         let msg_identifier = Identifier::new(
@@ -300,8 +398,15 @@ impl GatewayPayload<Opcode> {
                         let author = Identifier::new(
                             message.author.id,
                             GlobalUser {
-                                name: message.author.username,
+                                name: message
+                                    .author
+                                    .global_name
+                                    .clone()
+                                    .unwrap_or_else(|| message.author.username.clone()),
+                                tag: Some(message.author.username),
                                 icon,
+                                status: discord.interface_user_status(message.author.id),
+                                voice: None,
                             },
                         );
                         let msg_identifier = Identifier::new(

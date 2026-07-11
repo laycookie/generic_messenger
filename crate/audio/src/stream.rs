@@ -43,13 +43,17 @@ impl<E> Master<E> {
 
     /// The close notification, if a stream is currently running.
     pub(crate) fn running_notify(&self) -> Option<Arc<Notify>> {
-        self.stream.as_ref().map(|stream| stream.close_notify.clone())
+        self.stream
+            .as_ref()
+            .map(|stream| stream.close_notify.clone())
     }
 
     /// The channel-event producer for the running stream, used to hand a
     /// late-created channel to the audio thread. `None` when not streaming.
     pub(crate) fn event_tx(&mut self) -> Option<&mut EventProd<E>> {
-        self.stream.as_mut().map(|stream| &mut stream.channel_event_tx)
+        self.stream
+            .as_mut()
+            .map(|stream| &mut stream.channel_event_tx)
     }
 
     /// Tear down the running stream. Channels survive; a later [`start`](Self::start)
@@ -82,7 +86,9 @@ impl<E> Master<E> {
         if device_channels == 0 || device_channels > MIX_SCRATCH_LEN {
             return Err(format!("unsupported {direction} channel count: {device_channels}").into());
         }
-        debug!("Starting {direction} stream with config {stream_config:?}, format {sample_format:?}");
+        debug!(
+            "Starting {direction} stream with config {stream_config:?}, format {sample_format:?}"
+        );
 
         let (event_prod, event_cons) = StaticRb::<E, 8>::default().split();
         let close_notify = Arc::new(Notify::new());

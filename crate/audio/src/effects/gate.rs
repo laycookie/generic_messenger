@@ -104,8 +104,7 @@ impl Gate {
     fn configure(&mut self, sample_rate: AudioSampleType, channels: usize) {
         self.channels = channels.max(1);
         self.open_thresh = db_to_linear(self.settings.threshold_db);
-        self.close_thresh =
-            db_to_linear(self.settings.threshold_db - self.settings.hysteresis_db);
+        self.close_thresh = db_to_linear(self.settings.threshold_db - self.settings.hysteresis_db);
         self.floor_gain = db_to_linear(self.settings.range_db).min(1.0);
         self.attack_coef = time_to_coef(self.settings.attack, sample_rate);
         self.release_coef = time_to_coef(self.settings.release, sample_rate);
@@ -118,7 +117,10 @@ impl Gate {
 
 impl Afx for Gate {
     fn prepare(&mut self, format: StreamFormat) {
-        self.configure(format.sample_rate as AudioSampleType, format.channels as usize);
+        self.configure(
+            format.sample_rate as AudioSampleType,
+            format.channels as usize,
+        );
     }
 
     fn apply_to(&mut self, audio: &mut [AudioSampleType]) -> bool {

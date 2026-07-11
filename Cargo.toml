@@ -5,19 +5,12 @@ members = [
 	"record_v2",
 	"crate/audio",
 	"crate/messenger_interface",
-	"crate/overwrite_ring",
-	"crate/steam_gns",
+	"crate/messenger_unifier",
+	"crate/messenger_downloader",
+	"crate/login_store",
 	"interface/discord",
 	"interface/steam"
 ]
-# Local fork of steam-vent (see [patch.crates-io] below); built as a patched
-# dependency, not a workspace member.
-exclude = ["crate/vendor/steam-vent"]
-
-# Fork steam-vent to dump unpublished service-method payloads (VoiceChatClient.*)
-# during voice-signaling capture. See interface/steam/VOICE_PROTOCOL.md.
-[patch.crates-io]
-steam-vent = { path = "crate/vendor/steam-vent" }
 
 [workspace.dependencies]
 # Logs
@@ -34,6 +27,8 @@ facet-json = "0.46.0"
 facet-pretty = "0.46.0"
 # facet-pretty = { git = "https://github.com/facet-rs/facet", branch = "main" }
 facet-error = "0.46.0"
+facet-reflect = "0.46.0"
+# facet-reflect = { git = "https://github.com/facet-rs/facet", branch = "main" }
 # Async
 asyncs-sync = "0.4.0"
 futures = "0.3.32"

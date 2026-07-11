@@ -9,9 +9,9 @@ use std::{error::Error, io, sync::Arc};
 
 use async_trait::async_trait;
 use messenger_interface::{
-    interface::{CallStatus, Voice as VoiceTrait, VoiceEvent},
+    interface::{CallStatus, SelfVoiceState, Voice as VoiceTrait, VoiceEvent},
     stream::{ArcStream, WeakSocketStream},
-    types::{Identifier, Place, Room},
+    types::{Identifier, Place, Room, VoiceState},
 };
 use surf::http::convert::json;
 use tracing::{debug, error, warn};
@@ -108,6 +108,60 @@ impl VoiceTrait for InnerDiscord<Owned> {
         self: Arc<Self>,
     ) -> Result<WeakSocketStream<VoiceEvent>, Box<dyn Error + Sync + Send>> {
         self.listen_as::<VoiceDiscord, _>().await
+    }
+}
+
+#[async_trait]
+impl SelfVoiceState for InnerDiscord<Owned> {
+    async fn set_self_voice_state(
+        &self,
+        _location: &Identifier<Place<Room>>,
+        state: VoiceState,
+    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+        let load_gateway = self.gateway.load();
+        let Some(gateway) = load_gateway.as_ref() else {
+            return Err(
+                io::Error::new(io::ErrorKind::NotConnected, "gateway not connected").into(),
+            );
+        };
+
+        // Target the channel Discord already has us in (our own live voice
+        // state), not `_location`'s mapping: an opcode-4 naming any *other*
+        // channel is a move request, and a failed move disconnects the call.
+        // Discord only allows one voice session per account anyway, so the
+        // live state is the only call the flags could apply to.
+        let Some(profile_id) = self.profile.load().as_ref().map(|profile| profile.id) else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "own profile not loaded").into());
+        };
+        let (guild_id, channel_id) = match self.voice_states.get(&profile_id) {
+            Some(voice_state) if voice_state.channel_id.is_some() => {
+                (voice_state.guild_id, voice_state.channel_id)
+            }
+            _ => {
+                return Err(
+                    io::Error::new(io::ErrorKind::NotConnected, "not in a voice call").into(),
+                );
+            }
+        };
+
+        // Same opcode as joining: an opcode-4 for the channel we are already
+        // in only updates the flags — Discord does not restart the media
+        // handshake unless the channel changes. The confirmed state comes
+        // back as our own VOICE_STATE_UPDATE and flows to the app through
+        // the usual roster path.
+        let payload = json!({
+            "op": Opcode::VoiceStateUpdate as u8,
+            "d": {
+                "guild_id": guild_id,
+                "channel_id": channel_id,
+                "self_mute": state.muted,
+                "self_deaf": state.deafened,
+              }
+        });
+        debug!("Sending opcode 4 (self voice state): {}", payload);
+
+        gateway.send(payload.to_string().into()).await?;
+        Ok(())
     }
 }
 

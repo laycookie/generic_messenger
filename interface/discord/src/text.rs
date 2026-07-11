@@ -10,9 +10,9 @@ use std::{error::Error, sync::Arc};
 use async_trait::async_trait;
 use futures::future::join_all;
 use messenger_interface::{
-    interface::{Ordering, Text, TextEvent},
+    interface::{DeleteMessage, EditMessage, Ordering, Reactions, Text, TextEvent},
     stream::{ArcStream, WeakSocketStream},
-    types::{Identifier, Message, Place, Room, User},
+    types::{Emoji, Identifier, Message, Place, Room, Sticker, User},
 };
 
 use crate::{
@@ -86,8 +86,15 @@ impl Text for InnerDiscord<Owned> {
             let author = messenger_interface::types::Identifier::new(
                 message.author.id,
                 messenger_interface::types::User {
-                    name: message.author.username,
+                    name: message
+                        .author
+                        .global_name
+                        .clone()
+                        .unwrap_or_else(|| message.author.username.clone()),
+                    tag: Some(message.author.username),
                     icon,
+                    status: self.interface_user_status(message.author.id),
+                    voice: None,
                 },
             );
             let identifier = Discord::identifier_generator(
@@ -114,40 +121,75 @@ impl Text for InnerDiscord<Owned> {
             .collect())
     }
 
-    async fn add_reaction(
+    /// The current guild's custom emoji (from the `Ready` snapshot). A DM has
+    /// none — Unicode emoji, which the UI supplies itself, are all there is.
+    async fn pickable_emojis(
         &self,
         location: &Identifier<Place<Room>>,
-        message: &Identifier<Message>,
-        emoji: &str,
-    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+    ) -> Result<Vec<Emoji>, Box<dyn Error + Sync + Send>> {
         let channel_location = *self
             .channel_id_mappings
             .get(location.id())
             .ok_or("No discord channel id mapping for this room")?;
-        let msg_id = *self
-            .message_id_mappings
-            .get(message.id())
-            .ok_or("No discord message id mapping")?;
-        self.rest_add_reaction(channel_location.channel_id(), msg_id, emoji)
-            .await
+        let Some(guild_id) = channel_location.guild_id() else {
+            return Ok(Vec::new());
+        };
+        let emojis = self
+            .guild_emojis
+            .get(&guild_id)
+            .map(|entry| entry.clone())
+            .unwrap_or_default();
+
+        Ok(join_all(emojis.into_iter().filter_map(|emoji| {
+            if !emoji.available.unwrap_or(true) {
+                return None;
+            }
+            let name = emoji.name?;
+            let animated = emoji.animated.unwrap_or(false);
+            Some(async move {
+                Emoji {
+                    reference: Some(crate::rich::emoji_wire_tag(&name, emoji.id, animated)),
+                    image: crate::rich::resolve_emoji(emoji.id, animated).await,
+                    shortcode: name,
+                }
+            })
+        }))
+        .await)
     }
 
-    async fn remove_reaction(
+    /// The current guild's stickers (from the `Ready` snapshot). Lottie
+    /// stickers are omitted — there is no static image to show or render.
+    async fn pickable_stickers(
         &self,
         location: &Identifier<Place<Room>>,
-        message: &Identifier<Message>,
-        emoji: &str,
-    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+    ) -> Result<Vec<Sticker>, Box<dyn Error + Sync + Send>> {
         let channel_location = *self
             .channel_id_mappings
             .get(location.id())
             .ok_or("No discord channel id mapping for this room")?;
-        let msg_id = *self
-            .message_id_mappings
-            .get(message.id())
-            .ok_or("No discord message id mapping")?;
-        self.rest_remove_reaction(channel_location.channel_id(), msg_id, emoji)
-            .await
+        let Some(guild_id) = channel_location.guild_id() else {
+            return Ok(Vec::new());
+        };
+        let stickers = self
+            .guild_stickers
+            .get(&guild_id)
+            .map(|entry| entry.clone())
+            .unwrap_or_default();
+
+        Ok(join_all(stickers.into_iter().filter_map(|sticker| {
+            if !sticker.available.unwrap_or(true) {
+                return None;
+            }
+            let image = CdnImage::sticker(sticker.id, sticker.format_type)?;
+            Some(async move {
+                Sticker {
+                    alt: sticker.name,
+                    image: image.fetch().await.ok(),
+                    reference: sticker.id.to_string(),
+                }
+            })
+        }))
+        .await)
     }
 
     async fn send_message(
@@ -160,11 +202,9 @@ impl Text for InnerDiscord<Owned> {
             .get(location.id())
             .ok_or("No discord channel id mapping for this room")?;
 
+        let (content, sticker_ids) = crate::rich::serialize_content(&contents.content.text);
         let msg = self
-            .rest_send_message(
-                channel_location.channel_id(),
-                contents.content.text.to_plain(),
-            )
+            .rest_send_message(channel_location.channel_id(), content, sticker_ids)
             .await?;
 
         // Register the mapping immediately: reacting to (or paginating
@@ -180,8 +220,15 @@ impl Text for InnerDiscord<Owned> {
         let author = Identifier::new(
             msg.author.id,
             User {
-                name: msg.author.username,
+                name: msg
+                    .author
+                    .global_name
+                    .clone()
+                    .unwrap_or_else(|| msg.author.username.clone()),
+                tag: Some(msg.author.username),
                 icon,
+                status: self.interface_user_status(msg.author.id),
+                voice: None,
             },
         );
 
@@ -199,6 +246,142 @@ impl Text for InnerDiscord<Owned> {
         self: Arc<Self>,
     ) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
         self.listen_as::<TextDiscord, _>().await
+    }
+}
+
+#[async_trait]
+impl EditMessage for InnerDiscord<Owned> {
+    async fn edit_message(
+        &self,
+        location: &Identifier<Place<Room>>,
+        message: &Identifier<Message>,
+        contents: Message,
+    ) -> Result<Identifier<Message>, Box<dyn Error + Sync + Send>> {
+        let channel_location = *self
+            .channel_id_mappings
+            .get(location.id())
+            .ok_or("No discord channel id mapping for this room")?;
+        let msg_id = *self
+            .message_id_mappings
+            .get(message.id())
+            .ok_or("No discord message id mapping")?;
+
+        // Stickers can't be edited into a message; only the content updates.
+        let (content, _sticker_ids) = crate::rich::serialize_content(&contents.content.text);
+        let msg = self
+            .rest_edit_message(channel_location.channel_id(), msg_id, content)
+            .await?;
+
+        let (content, history) = msg.revisions().await;
+        let reactions = msg.interface_reactions().await;
+        let icon = match &msg.author.avatar {
+            Some(hash) => CdnImage::avatar(msg.author.id, hash).fetch().await.ok(),
+            None => None,
+        };
+        let author = Identifier::new(
+            msg.author.id,
+            User {
+                name: msg
+                    .author
+                    .global_name
+                    .clone()
+                    .unwrap_or_else(|| msg.author.username.clone()),
+                tag: Some(msg.author.username),
+                icon,
+                status: self.interface_user_status(msg.author.id),
+                voice: None,
+            },
+        );
+
+        Ok(Identifier::new(
+            msg.id,
+            Message {
+                content,
+                history,
+                reactions,
+                author: Some(author),
+            },
+        ))
+    }
+}
+
+#[async_trait]
+impl DeleteMessage for InnerDiscord<Owned> {
+    async fn delete_message(
+        &self,
+        location: &Identifier<Place<Room>>,
+        message: &Identifier<Message>,
+    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+        let channel_location = *self
+            .channel_id_mappings
+            .get(location.id())
+            .ok_or("No discord channel id mapping for this room")?;
+        let msg_id = *self
+            .message_id_mappings
+            .get(message.id())
+            .ok_or("No discord message id mapping")?;
+        self.rest_delete_message(channel_location.channel_id(), msg_id)
+            .await
+    }
+}
+
+impl InnerDiscord<Owned> {
+    /// Resolve a unified reaction identity into the form the reactions REST
+    /// endpoint expects: a Unicode emoji passes through, a custom emoji's
+    /// shortcode becomes `name:id` when the channel's guild has it. An
+    /// unresolvable shortcode (external emoji, DM) passes through and lets
+    /// the server reject it.
+    fn reaction_api_emoji(&self, guild_id: Option<api_types::SNOWFLAKE>, emoji: &str) -> String {
+        guild_id
+            .and_then(|guild_id| {
+                let guild_emojis = self.guild_emojis.get(&guild_id)?;
+                let custom = guild_emojis
+                    .iter()
+                    .find(|guild_emoji| guild_emoji.name.as_deref() == Some(emoji))?;
+                Some(format!("{emoji}:{}", custom.id))
+            })
+            .unwrap_or_else(|| emoji.to_owned())
+    }
+}
+
+#[async_trait]
+impl Reactions for InnerDiscord<Owned> {
+    async fn add_reaction(
+        &self,
+        location: &Identifier<Place<Room>>,
+        message: &Identifier<Message>,
+        emoji: &str,
+    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+        let channel_location = *self
+            .channel_id_mappings
+            .get(location.id())
+            .ok_or("No discord channel id mapping for this room")?;
+        let msg_id = *self
+            .message_id_mappings
+            .get(message.id())
+            .ok_or("No discord message id mapping")?;
+        let emoji = self.reaction_api_emoji(channel_location.guild_id(), emoji);
+        self.rest_add_reaction(channel_location.channel_id(), msg_id, &emoji)
+            .await
+    }
+
+    async fn remove_reaction(
+        &self,
+        location: &Identifier<Place<Room>>,
+        message: &Identifier<Message>,
+        emoji: &str,
+    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+        let channel_location = *self
+            .channel_id_mappings
+            .get(location.id())
+            .ok_or("No discord channel id mapping for this room")?;
+        let msg_id = *self
+            .message_id_mappings
+            .get(message.id())
+            .ok_or("No discord message id mapping")?;
+        let emoji = self.reaction_api_emoji(channel_location.guild_id(), emoji);
+        self.rest_remove_reaction(channel_location.channel_id(), msg_id, &emoji)
+            .await
     }
 }
 

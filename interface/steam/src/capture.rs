@@ -50,6 +50,7 @@ use steam_vent_proto::steammessages_chat_steamclient::CChatRoom_JoinVoiceChat_Re
 use tracing::{error, info, warn};
 
 use crate::SteamMessenger;
+use crate::gns;
 
 /// How long to sit in the call draining messages while B connects.
 const CAPTURE_WINDOW: Duration = Duration::from_secs(120);
@@ -88,9 +89,15 @@ async fn capture_voice_signaling() {
     // List voice-capable rooms so the operator can pick a target to join.
     match messenger.load_chat_groups(&connected).await {
         Ok(groups) => {
-            info!("capture: scanning {} chat group(s) for voice rooms", groups.len());
+            info!(
+                "capture: scanning {} chat group(s) for voice rooms",
+                groups.len()
+            );
             for group in &groups {
-                match messenger.load_chat_group_details(&connected, group.id).await {
+                match messenger
+                    .load_chat_group_details(&connected, group.id)
+                    .await
+                {
                     Ok((detail, _members)) => {
                         for room in detail.rooms.iter().filter(|room| room.voice_allowed) {
                             info!(
@@ -137,9 +144,24 @@ async fn capture_voice_signaling() {
         }
     }
 
+    // Become **media-active**: request the networking cert, exactly as the retail
+    // client does after joining. Without this we're not a reachable media
+    // participant and the peer may never send a rendezvous. (The app's join flow
+    // does this automatically via `establish_voice_media`.)
+    match gns::cert::request_networking_cert(&conn).await {
+        Ok(identity) => info!(
+            cert_len = identity.cert.len(),
+            "capture: obtained networking cert — now MEDIA-ACTIVE",
+        ),
+        Err(err) => warn!(
+            "capture: networking cert failed ({err}) — NOT media-active; a rendezvous may not fire",
+        ),
+    }
+
     info!(
-        "capture: now have account B join this voice channel and talk. \
-         Watching for {}s — looking for the rendezvous carrier...",
+        "capture: now have account B join this voice channel and TALK. Watching {}s. \
+         Any P2P rendezvous is auto-classified ICE-vs-SDR below; also watch \
+         `steam_vent=debug` for VoiceChatClient.*/networking notification bodies.",
         CAPTURE_WINDOW.as_secs()
     );
 
@@ -148,6 +170,11 @@ async fn capture_voice_signaling() {
     while Instant::now() < deadline {
         for raw in conn.take_unprocessed() {
             seen += 1;
+            // The decisive line: if this is a media rendezvous, is it ICE
+            // (reachable) or SDR (closed relay)?
+            if let Some(classification) = gns::signaling::classify_rendezvous(&raw.data) {
+                warn!(emsg = raw.kind.value(), "capture: >>> {classification} <<<");
+            }
             info!(
                 emsg = raw.kind.value(),
                 proto = raw.is_protobuf,

@@ -265,6 +265,15 @@ impl VoiceGateway {
 }
 
 pub enum AudioChannel {
+    /// Voice frames arrived before the Speaking event that names this SSRC's
+    /// user (UDP vs websocket — no ordering guarantee). Holds the number of
+    /// frames dropped while waiting, so the wait can be bounded; the channel
+    /// is only requested once the user is known (or the wait gives up), so
+    /// per-user audio controls can bind to it.
+    AwaitingIdentity(u8),
     Initializing(oneshot::Receiver<SampleProducer>),
-    Connected(SampleProducer),
+    Connected {
+        producer: SampleProducer,
+        overflow_frames: u32,
+    },
 }

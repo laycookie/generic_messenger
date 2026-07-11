@@ -93,6 +93,7 @@ pub enum GatewayEvent {
     GuildIntegrationsUpdate,
     GuildMemberAdd,
     GuildMemberRemove,
+    PresenceUpdate,
     VoiceStateUpdate,
     VoiceServerUpdate,
     MessageCreate,
@@ -150,10 +151,7 @@ impl Gateway<General> {
         // TODO: People are dumb (me included) so later maybe check the token for trailing spaces
         // the REST_API already filters for them on Discords end anyways (presumably or at least
         // the ones trailing at the end)
-        // Resolves a username/password login into a token on first use; a token
-        // login returns the cached token immediately.
-        let token = discord.ensure_token().await?;
-        let token = token.unsecure().trim();
+        let token = discord.token.unsecure().trim();
         websocket
             .send(WebsocketMessage::Text(
                 json!({

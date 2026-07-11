@@ -112,10 +112,11 @@ typically sub-second. Anything Discord deleted longer ago than that would
 also be reflected in Discord's HTTP view, so the tombstone is no longer
 load-bearing.
 
-Implementation: a lock-free atomic ring with overwrite-on-push, provided
-by the workspace's `overwrite-ring` crate (`crate/overwrite_ring`). For
-messages, the ring lives on `gateways::general::General` so its lifetime
-matches the gateway connection's:
+Implementation: use a small lock-free atomic ring with overwrite-on-push. The
+old workspace helper crate for this was removed while tombstone rings are not
+wired into the app, so reintroduce this as a local helper only when the cache
+policy actually needs it. For messages, the ring should live on
+`gateways::general::General` so its lifetime matches the gateway connection's:
 
 ```rust
 pub struct General {
@@ -147,9 +148,8 @@ scanned doesn't matter. Slot value `T::default()` (here `0u64`) is the
 never-written sentinel; real Discord snowflakes are non-zero, so this
 can't collide with a live ID.
 
-The same `Ring<T, CAP>` type will be reused for the future per-entity
-tombstone rings (channels, guilds, relationships) — see "open issues"
-below.
+The same ring shape can be reused for future per-entity tombstone rings
+(channels, guilds, relationships) — see "open issues" below.
 
 **Ordering invariant in the event handler:** push to the tombstone ring
 **before** pushing the corresponding `TextEvent::MessageDeleted` to the

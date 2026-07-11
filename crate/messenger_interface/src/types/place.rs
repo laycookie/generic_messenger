@@ -32,25 +32,33 @@ type Fetched<T> = Option<T>;
 /// Represents a room/channel in the messenger system.
 ///
 /// Rooms contain capabilities (text/voice) and optionally loaded data
-/// about participants and messages.
+/// about members, voice participants, and messages.
 #[derive(Debug, Clone)]
 pub struct Room {
     /// Capabilities supported by this room (text, voice, etc.).
     pub room_capabilities: RoomCapabilities,
     /// List of messages, if fetched.
     pub messages: Fetched<Vec<Identifier<Message>>>,
-    /// List of participants, if fetched.
+    /// Who belongs to the room (DM recipients, group members), if fetched.
+    /// Membership is stable: it does not change when someone joins or
+    /// leaves the room's voice call.
+    pub members: Fetched<Vec<Identifier<User>>>,
+    /// Who is currently connected to the room's voice call, if fetched.
+    /// Maintained live by `VoiceEvent`s; a member of the room is not
+    /// necessarily a participant, and vice versa.
     pub participants: Fetched<Vec<Identifier<User>>>,
 }
 impl Room {
     /// Create a new Room with the given capabilities and optional data.
     pub fn new(
         room_capabilities: RoomCapabilities,
+        members: Fetched<Vec<Identifier<User>>>,
         participants: Fetched<Vec<Identifier<User>>>,
         messages: Fetched<Vec<Identifier<Message>>>,
     ) -> Self {
         Self {
             room_capabilities,
+            members,
             participants,
             messages,
         }

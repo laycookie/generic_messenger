@@ -13,11 +13,8 @@ async-trait = { workspace = true }
 async-compat = "0.2.5"
 futures = { workspace = true }
 futures-timer = "3.0.3"
-# Files/networking for adapter-local cache work, matching the Discord interface stack.
-async-fs = "2.2.0"
+# Request builders for the shared downloader cache path.
 surf = "2.3.2"
-# Collision-proof temp files for atomic download-then-rename caching.
-tempfile = "3"
 # Data structs
 dashmap = "6.1.0"
 # Bitflags
@@ -30,6 +27,10 @@ secure-string = "0.3.0"
 ed25519-dalek = "2"
 # Random seed for the identity key.
 getrandom = "0.2"
+# Voice media: Opus codec (48 kHz stereo, matches the audio graph and Discord)
+# and the messenger-agnostic audio graph the bridge encodes from / decodes into.
+opus = "0.3.1"
+simple-audio-channels = { path = "../../crate/audio", version = "0.0.1" }
 # Steam network protocol (reverse-engineered Steam client protocol, SteamKit-style)
 steam-vent = "0.5.0"
 # Protobuf message types (CFriendMessages_*, CMsgClient*); not re-exported by
@@ -37,6 +38,7 @@ steam-vent = "0.5.0"
 steam-vent-proto = "0.5.2"
 # Interface
 messenger_interface = { path = "../../crate/messenger_interface" }
+messenger_downloader = { path = "../../crate/messenger_downloader" }
 
 [dev-dependencies]
 # Native tokio runtime for the manual voice-signaling capture test. steam-vent is

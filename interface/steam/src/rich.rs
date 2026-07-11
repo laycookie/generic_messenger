@@ -14,17 +14,10 @@
 
 use std::path::PathBuf;
 
-use messenger_interface::types::{CacheCategory, Emoji, RichText, Span, TextStyle, cache_img_dir};
+use messenger_interface::types::{Emoji, RichText, Span, Sticker, TextStyle};
 use tracing::debug;
 
-use crate::downloaders::cache_remote_image;
-
-/// Steam emoticon image CDN; the path segment is the bare emoticon name.
-const EMOTICON_CDN: &str = "https://community.steamstatic.com/economy/emoticon";
-
-/// Steam sticker image CDN. Stickers are economy items served alongside
-/// emoticons; the path segment is the sticker's name/path (see [`resolve_sticker`]).
-const STICKER_CDN: &str = "https://community.steamstatic.com/economy/sticker";
+use crate::downloaders::SteamImage;
 
 #[derive(Debug, PartialEq)]
 enum Piece {
@@ -174,9 +167,7 @@ fn tokenize(content: &str) -> Vec<Piece> {
 
 /// Download+cache a Steam emoticon image, returning the local path.
 async fn resolve_emoticon(name: &str) -> Option<PathBuf> {
-    let url = format!("{EMOTICON_CDN}/{name}");
-    let dir = cache_img_dir(CacheCategory::Emoji, "steam", name);
-    cache_remote_image(&url, dir, &format!("{name}.png")).await
+    SteamImage::emoticon(name).fetch().await.ok()
 }
 
 /// Parse the inside of a `[sticker …]` tag into its `key=value` attributes.
@@ -227,42 +218,32 @@ fn sticker_image_ref(attrs: &[(String, String)]) -> Option<&str> {
     })
 }
 
-/// Reduce a sticker reference (a name, path, or URL) to a safe single-segment
-/// cache key for the directory and filename.
-fn sticker_cache_key(reference: &str) -> String {
-    reference
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
-
 /// Sticker resolution. Reads the sticker name from the tag's attributes
-/// ([`sticker_image_ref`]) and downloads it from the economy sticker CDN. On any
-/// failure (`cache_remote_image` returns `None`) we fall back to a `[sticker]`
-/// placeholder with no image, which still keeps sticker-only messages from
-/// vanishing entirely. A download warning echoes the attempted URL, so a 404
-/// reveals if the CDN path shape needs adjusting for a given sticker.
-async fn resolve_sticker(raw: &str) -> (String, Option<PathBuf>) {
+/// ([`sticker_image_ref`]) and downloads it from the economy sticker CDN
+/// (URL/path construction lives in [`SteamImage`]). On any failure we fall back
+/// to a `[sticker]` placeholder with no image, which still keeps sticker-only
+/// messages from vanishing entirely. A download warning echoes the attempted
+/// URL, so a 404 reveals if the CDN path shape needs adjusting for a given
+/// sticker.
+async fn resolve_sticker(raw: &str) -> Sticker {
     let attrs = parse_sticker_attrs(raw);
     debug!("Steam: sticker tag attrs={attrs:?} raw=[sticker {raw}]");
 
-    let image = match sticker_image_ref(&attrs) {
-        Some(reference) => {
-            let url = if reference.starts_with("http") {
-                reference.to_owned()
-            } else {
-                format!("{STICKER_CDN}/{reference}")
-            };
-            let key = sticker_cache_key(reference);
-            let dir = cache_img_dir(CacheCategory::Stickers, "steam", &key);
-            cache_remote_image(&url, dir, &format!("{key}.png")).await
-        }
+    let (image, reference) = match sticker_image_ref(&attrs) {
+        Some(reference) => (
+            SteamImage::sticker(reference).fetch().await.ok(),
+            reference.to_owned(),
+        ),
         None => {
             debug!("Steam: sticker tag had no recognizable image attribute (confirm format)");
-            None
+            (None, String::new())
         }
     };
-    ("[sticker]".to_owned(), image)
+    Sticker {
+        alt: "[sticker]".to_owned(),
+        image,
+        reference,
+    }
 }
 
 /// Build [`RichText`] from a raw Steam chat string (BBCode form), resolving
@@ -278,15 +259,38 @@ pub async fn build_content(raw: &str) -> RichText {
                 spans.push(Span::Emoji(Emoji {
                     shortcode: name,
                     image,
+                    // The bare name is all Steam needs to send an emoticon.
+                    reference: None,
                 }));
             }
             Piece::Sticker { raw } => {
-                let (alt, image) = resolve_sticker(&raw).await;
-                spans.push(Span::Sticker { alt, image });
+                spans.push(Span::Sticker(resolve_sticker(&raw).await));
             }
         }
     }
     RichText { spans }
+}
+
+/// Serialize outgoing [`RichText`] into a Steam chat string. Emoji become
+/// `:name:` — the server converts owned emoticons into `[emoticon]` BBCode
+/// itself (see the `modified_message` echo handling in `query.rs`). Links use
+/// their target so the URL stays functional. Sticker spans are skipped: the
+/// outgoing sticker wire format is unconfirmed (needs a capture session).
+pub(crate) fn serialize_content(text: &RichText) -> String {
+    let mut out = String::new();
+    for span in &text.spans {
+        match span {
+            Span::Text { text, .. } => out.push_str(text),
+            Span::Link { href, .. } => out.push_str(href),
+            Span::Emoji(emoji) => {
+                out.push(':');
+                out.push_str(&emoji.shortcode);
+                out.push(':');
+            }
+            Span::Sticker(_) => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -394,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn sticker_image_ref_priority_and_cache_key() {
+    fn sticker_image_ref_priority() {
         // `type` (the confirmed sticker-name key) wins over other candidates.
         let attrs = parse_sticker_attrs(r#"type=aliya_anoxic url=http://x/y.png"#);
         assert_eq!(sticker_image_ref(&attrs), Some("aliya_anoxic"));
@@ -403,8 +407,6 @@ mod tests {
         assert_eq!(sticker_image_ref(&attrs), Some("42"));
         // Nothing usable -> placeholder path.
         assert_eq!(sticker_image_ref(&parse_sticker_attrs("limit=0")), None);
-        // Cache key is a safe single segment.
-        assert_eq!(sticker_cache_key("a/b c.png"), "a_b_c_png");
     }
 
     #[test]
@@ -428,5 +430,25 @@ mod tests {
                 name: "cleanhourglass".to_owned()
             }]
         );
+    }
+
+    #[test]
+    fn serialize_emoji_as_colon_form_and_skips_stickers() {
+        let rich = RichText {
+            spans: vec![
+                Span::Text {
+                    text: "hi ".to_owned(),
+                    style: TextStyle::default(),
+                },
+                Span::Emoji(Emoji::shortcode("steamhappy")),
+                // No confirmed outgoing wire format: must not leak into text.
+                Span::Sticker(Sticker {
+                    alt: "[sticker]".to_owned(),
+                    image: None,
+                    reference: "aliya_anoxic".to_owned(),
+                }),
+            ],
+        };
+        assert_eq!(serialize_content(&rich), "hi :steamhappy:");
     }
 }

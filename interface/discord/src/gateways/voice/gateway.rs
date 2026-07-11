@@ -29,6 +29,11 @@ use super::{
 use crate::gateways::{Gateway, HeartBeatingData, Websocket};
 use crate::{api_types::SNOWFLAKE, gateways::GatewayStreamReciver as _};
 
+/// Frames to drop while waiting for the Speaking event that names an SSRC's
+/// user before attaching the channel unbound (no per-user volume/afx). At one
+/// Opus frame per 20ms this waits about a second.
+const MAX_IDENTITY_WAIT_FRAMES: u8 = 50;
+
 pub struct Voice {
     heartbeat_version: u8,
     pub channel_id: SNOWFLAKE,
@@ -83,9 +88,20 @@ impl Voice {
         let mut channel_entry = match self.ssrc_to_audio_channel.entry(ssrc) {
             dashmap::Entry::Occupied(channel) => channel,
             dashmap::Entry::Vacant(vacant_entry) => {
+                // The user mapping comes from Speaking events (and DAVE decrypt
+                // requires it, so a DAVE call always has it here). On a non-DAVE
+                // call the first frames can beat Speaking; wait before creating
+                // the channel so it can be bound to its user.
+                let Some(user) = self.ssrc_to_user_id.get(&ssrc).map(|entry| *entry) else {
+                    vacant_entry.insert(AudioChannel::AwaitingIdentity(1).into());
+                    return true;
+                };
                 let (sender, receiver) = oneshot::channel();
                 vacant_entry.insert(AudioChannel::Initializing(receiver).into());
-                let _ = audio_events.force_push(AudioEvent::AddAudioSource(sender));
+                let _ = audio_events.force_push(AudioEvent::AddAudioSource {
+                    user: Some(user),
+                    channel: sender,
+                });
                 // TODO: Save samples for when channel is ready
                 return false;
             }
@@ -93,10 +109,39 @@ impl Voice {
         loop {
             let mut channel = channel_entry.get().lock().unwrap();
             match &mut *channel {
+                AudioChannel::AwaitingIdentity(frames_waited) => {
+                    let user = self.ssrc_to_user_id.get(&ssrc).map(|entry| *entry);
+                    if user.is_none() && *frames_waited < MAX_IDENTITY_WAIT_FRAMES {
+                        // Still nameless: drop this frame too and keep waiting.
+                        *frames_waited += 1;
+                        break;
+                    }
+                    if user.is_none() {
+                        warn!(
+                            "No Speaking event named SSRC {ssrc} within \
+                             {MAX_IDENTITY_WAIT_FRAMES} frames; \
+                             attaching its audio without per-user controls"
+                        );
+                    }
+                    let (sender, receiver) = oneshot::channel();
+                    *channel = AudioChannel::Initializing(receiver);
+                    drop(channel);
+                    let _ = audio_events.force_push(AudioEvent::AddAudioSource {
+                        user,
+                        channel: sender,
+                    });
+                    return false;
+                }
                 AudioChannel::Initializing(receiver) => match receiver.try_recv() {
                     Ok(Some(producer)) => {
                         drop(channel);
-                        channel_entry.insert(AudioChannel::Connected(producer).into());
+                        channel_entry.insert(
+                            AudioChannel::Connected {
+                                producer,
+                                overflow_frames: 0,
+                            }
+                            .into(),
+                        );
                         // Re-enter the loop so this frame is delivered to
                         // the freshly connected channel.
                         continue;
@@ -113,16 +158,25 @@ impl Voice {
                         break;
                     }
                 },
-                AudioChannel::Connected(producer) => {
+                AudioChannel::Connected {
+                    producer,
+                    overflow_frames,
+                } => {
                     // The channel is declared as i16; the mixer converts to
                     // the device format itself.
                     let samples_pushed = producer.push_iter(samples);
                     if samples.len() != samples_pushed {
-                        error!(
-                            "Audio buffer overflow. Pushed: {}, Succeeded: {}",
-                            samples.len(),
-                            samples_pushed
-                        );
+                        *overflow_frames = overflow_frames.saturating_add(1);
+                        if *overflow_frames == 1 || *overflow_frames % 50 == 0 {
+                            error!(
+                                "Audio buffer overflow. Pushed: {}, Succeeded: {}, repeated: {}",
+                                samples.len(),
+                                samples_pushed,
+                                overflow_frames
+                            );
+                        }
+                    } else {
+                        *overflow_frames = 0;
                     }
                     break;
                 }
