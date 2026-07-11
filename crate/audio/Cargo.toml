@@ -9,6 +9,8 @@ repository = "https://github.com/laycookie/generic_messenger"
 [dependencies]
 tracing = { workspace = true }
 asyncs-sync = { workspace = true }
+credential_macro = { path = "../../macro" }
 ringbuf = "0.4.8"
 # async-broadcast = "0.7.2"
 cpal = "0.17.3"
+fundsp = { version = "0.23.0", default-features = false, features = ["std"] }

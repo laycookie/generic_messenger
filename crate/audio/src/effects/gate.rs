@@ -1,75 +1,72 @@
-use std::time::Duration;
+use fundsp::prelude::{AFollow, An, afollow, db_amp};
 
 use crate::{AudioSampleType, StreamFormat};
 
-use super::Afx;
-
-/// Tunable parameters for a [`Gate`]. Levels are dBFS; the envelope stages are
-/// wall-clock durations, resolved into sample counts once the gate is
-/// [`prepare`](Afx::prepare)d with a concrete format.
-#[derive(Clone, Copy, Debug)]
-pub struct GateSettings {
-    /// Level the signal must rise above for the gate to open.
-    pub threshold_db: AudioSampleType,
-    /// How far below `threshold_db` the signal must fall for an open gate to
-    /// re-close (hysteresis). Keeps the gate from chattering on a signal that
-    /// hovers right at the threshold.
-    pub hysteresis_db: AudioSampleType,
-    /// Time to ramp from the closed floor up to fully open once triggered.
-    pub attack: Duration,
-    /// Time the gate is held open after the signal last exceeded the
-    /// threshold. Bridges short dips — the gaps between words — so speech is
-    /// not chopped and a consumer does not park mid-utterance.
-    pub hold: Duration,
-    /// Time to ramp from open back down to the floor after `hold` elapses.
-    pub release: Duration,
-    /// Attenuation applied while closed, in dB below unity. [`f32::NEG_INFINITY`]
-    /// closes fully (true silence); a finite value (e.g. `-40.0`) merely ducks.
-    /// Note that park-on-silence — dropping the buffer so a consumer's `pop`
-    /// blocks — only happens when the gate closes fully.
-    pub range_db: AudioSampleType,
-}
-
-impl Default for GateSettings {
-    fn default() -> Self {
-        // Voice-tuned: open near a typical mic noise floor, hold across the
-        // gaps between words, fade out, then close fully so sustained silence
-        // parks the consumer.
-        GateSettings {
-            threshold_db: -50.0,
-            hysteresis_db: 6.0,
-            attack: Duration::from_millis(5),
-            hold: Duration::from_millis(200),
-            release: Duration::from_millis(150),
-            range_db: AudioSampleType::NEG_INFINITY,
-        }
-    }
-}
+use super::{Afx, ParamUnit};
 
 /// A noise gate with attack / hold / release envelope shaping.
 ///
-/// While the signal sits above [`GateSettings::threshold_db`] the gate opens to
-/// unity gain; when it falls away the gate holds, then releases down to the
-/// [`range`](GateSettings::range_db) floor. The detector is the per-frame peak
+/// While the signal sits above [`threshold_db`](Gate::threshold_db) the gate
+/// opens to unity gain; when it falls away the gate holds, then releases down
+/// to the [`floor`](Gate::floor_db). The detector is the per-frame peak
 /// across channels, so the envelope tracks the loudest channel.
 ///
-/// When the floor is full silence (`range_db` = -∞) and an entire buffer lands
-/// on it, `apply_to` *drops* the buffer rather than forwarding silence — so a
-/// gated input channel falls quiet and its consumer's `pop` parks until real
-/// audio returns, which the voice-activity logic relies on. With a finite floor
-/// the gate only ducks, never silences, so every buffer is kept.
+/// When the floor is full silence (`floor_db` at [`Gate::FLOOR_OFF`]) and an
+/// entire buffer lands on it, `apply_to` *drops* the buffer rather than
+/// forwarding silence — so a gated input channel falls quiet and its
+/// consumer's `pop` parks until real audio returns, which the voice-activity
+/// logic relies on. With a higher floor the gate only ducks, never silences,
+/// so every buffer is kept.
+///
+/// The parameters are fields on the gate itself, stored in the units the UI
+/// shows: levels in dBFS, envelope stages in milliseconds. They are resolved
+/// into linear gains and sample counts when the gate is prepared with a
+/// concrete format, and again after every parameter edit. Code-level tweaks go
+/// through [`Gate::tuned`] so the resolved values follow. Field defaults live
+/// next to the fields as consts, so [`Gate::new`] can't drift from what the UI
+/// shows.
+#[derive(credential_macro::AfxParams)]
+#[afx(after_set = recompute)]
 pub struct Gate {
-    settings: GateSettings,
-    // Resolved against the stream format in `configure` (seeded in `new`).
-    channels: usize,
+    /// Level the signal must rise above for the gate to open.
+    #[afx(param(name = "Threshold", unit = ParamUnit::Decibels, min = -90.0, max = 0.0, default = Gate::DEFAULT_THRESHOLD, min_is_off = false))]
+    pub threshold_db: f32,
+    /// How far below `threshold_db` the signal must fall for an open gate to
+    /// re-close (hysteresis). Keeps the gate from chattering on a signal that
+    /// hovers right at the threshold.
+    #[afx(param(name = "Hysteresis", unit = ParamUnit::Decibels, min = 0.0, max = 24.0, default = Gate::DEFAULT_HYSTERESIS, min_is_off = false))]
+    pub hysteresis_db: f32,
+    /// Time to ramp from the closed floor up to fully open once triggered.
+    #[afx(param(name = "Attack", unit = ParamUnit::Milliseconds, min = 0.0, max = 100.0, default = Gate::DEFAULT_ATTACK_MS, min_is_off = false))]
+    pub attack_ms: f32,
+    /// Time the gate is held open after the signal last exceeded the
+    /// threshold. Bridges short dips — the gaps between words — so speech is
+    /// not chopped and a consumer does not park mid-utterance.
+    #[afx(param(name = "Hold", unit = ParamUnit::Milliseconds, min = 0.0, max = 1000.0, default = Gate::DEFAULT_HOLD_MS, min_is_off = false))]
+    pub hold_ms: f32,
+    /// Time to ramp from open back down to the floor after `hold` elapses.
+    #[afx(param(name = "Release", unit = ParamUnit::Milliseconds, min = 0.0, max = 1000.0, default = Gate::DEFAULT_RELEASE_MS, min_is_off = false))]
+    pub release_ms: f32,
+    /// Attenuation applied while closed, in dB below unity. At
+    /// [`Gate::FLOOR_OFF`] (the range minimum, rendered "off") the gate
+    /// closes fully — true silence; above it, it merely ducks. Note that
+    /// park-on-silence — dropping the buffer so a consumer's `pop` blocks —
+    /// only happens when the gate closes fully.
+    #[afx(param(name = "Floor", unit = ParamUnit::Decibels, min = Gate::FLOOR_OFF, max = 0.0, default = Gate::FLOOR_OFF, min_is_off = true))]
+    pub floor_db: f32,
+
+    // The fields below are runtime state, not parameters: un-annotated, so
+    // reflection skips them and the UI never sees or writes them.
+    //
+    // Resolved from parameters. Stream-format data is passed through
+    // `apply_to`, so it is not stored here.
     open_thresh: AudioSampleType,
     close_thresh: AudioSampleType,
     floor_gain: AudioSampleType,
-    attack_coef: AudioSampleType,
-    release_coef: AudioSampleType,
-    hold_frames: u32,
-    // Envelope state, carried across buffers for a continuous stream.
-    gain: AudioSampleType,
+    // Envelope state, carried across buffers for a continuous stream. The
+    // attack/release glide is a fundsp smoother (its state survives live
+    // `set_time` retunes); the open/hold decision is the gate's own.
+    glide: An<AFollow<f32>>,
     open: bool,
     hold_counter: u32,
 }
@@ -79,65 +76,114 @@ pub struct Gate {
 const SILENCE_EPS: AudioSampleType = 1e-6;
 
 impl Gate {
-    pub fn new(settings: GateSettings) -> Self {
+    pub const NAME: &str = "Gate";
+    // Voice-tuned defaults: open near a typical mic noise floor, hold across
+    // the gaps between words, fade out, then close fully so sustained
+    // silence parks the consumer.
+    pub const DEFAULT_THRESHOLD: f32 = -50.0;
+    pub const DEFAULT_HYSTERESIS: f32 = 6.0;
+    pub const DEFAULT_ATTACK_MS: f32 = 5.0;
+    // Hold + release is how long transmission continues after speech stops
+    // (the gate only parks the consumer once fully closed). Keep the sum
+    // short, while still bridging ordinary inter-word gaps.
+    pub const DEFAULT_HOLD_MS: f32 = 150.0;
+    pub const DEFAULT_RELEASE_MS: f32 = 100.0;
+    /// Floor value that stands for −∞: at (or below) it the gate closes
+    /// fully, which is what enables the park-on-silence buffer drop.
+    pub const FLOOR_OFF: f32 = -80.0;
+
+    /// A gate on the voice-tuned defaults.
+    pub fn new() -> Self {
         let mut gate = Gate {
-            settings,
-            channels: 1,
+            threshold_db: Self::DEFAULT_THRESHOLD,
+            hysteresis_db: Self::DEFAULT_HYSTERESIS,
+            attack_ms: Self::DEFAULT_ATTACK_MS,
+            hold_ms: Self::DEFAULT_HOLD_MS,
+            release_ms: Self::DEFAULT_RELEASE_MS,
+            floor_db: Self::FLOOR_OFF,
             open_thresh: 0.0,
             close_thresh: 0.0,
             floor_gain: 0.0,
-            attack_coef: 1.0,
-            release_coef: 1.0,
-            hold_frames: 0,
-            gain: 0.0,
+            glide: afollow(
+                Self::DEFAULT_ATTACK_MS / 1000.0,
+                Self::DEFAULT_RELEASE_MS / 1000.0,
+            ),
             open: false,
             hold_counter: 0,
         };
-        // Seed against a default format so the gate is usable even if it is
-        // never `prepare`d; the real format overwrites this.
-        gate.configure(48_000.0, 2);
+        gate.recompute();
+        gate.glide.filter_mono(gate.floor_gain);
         gate
     }
 
-    /// Resolve the dB/duration settings into the linear gains, smoothing
-    /// coefficients and frame counts used per sample, then reset to closed.
-    fn configure(&mut self, sample_rate: AudioSampleType, channels: usize) {
-        self.channels = channels.max(1);
-        self.open_thresh = db_to_linear(self.settings.threshold_db);
-        self.close_thresh = db_to_linear(self.settings.threshold_db - self.settings.hysteresis_db);
-        self.floor_gain = db_to_linear(self.settings.range_db).min(1.0);
-        self.attack_coef = time_to_coef(self.settings.attack, sample_rate);
-        self.release_coef = time_to_coef(self.settings.release, sample_rate);
-        self.hold_frames = (self.settings.hold.as_secs_f32() * sample_rate) as u32;
-        self.gain = self.floor_gain;
-        self.open = false;
-        self.hold_counter = 0;
+    /// Apply code-level parameter tweaks and re-resolve the derived state,
+    /// e.g. `Gate::new().tuned(|gate| gate.threshold_db = -54.0)`. UI writes
+    /// go through the generated parameter setter, which re-resolves on its own.
+    pub fn tuned(mut self, tweak: impl FnOnce(&mut Self)) -> Self {
+        tweak(&mut self);
+        self.recompute();
+        self
+    }
+
+    /// Resolve parameters into runtime values that do not depend on the
+    /// stream format.
+    fn recompute(&mut self) {
+        self.open_thresh = db_amp(self.threshold_db);
+        self.close_thresh = db_amp(self.threshold_db - self.hysteresis_db);
+        // The slider floor stands for −∞: a full close (and its
+        // park-on-silence buffer drop) rather than an −80dB duck.
+        self.floor_gain = if self.floor_db <= Self::FLOOR_OFF {
+            0.0
+        } else {
+            db_amp(self.floor_db).min(1.0)
+        };
+        self.glide
+            .set_time(self.attack_ms / 1000.0, self.release_ms / 1000.0);
+    }
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl Afx for Gate {
-    fn prepare(&mut self, format: StreamFormat) {
-        self.configure(
-            format.sample_rate as AudioSampleType,
-            format.channels as usize,
-        );
+    fn name(&self) -> &'static str {
+        Gate::NAME
     }
 
-    fn apply_to(&mut self, audio: &mut [AudioSampleType]) -> bool {
+    /// Adopt a stream format: re-derive the per-sample values and reset the
+    /// envelope to closed (a new stream starts from silence).
+    fn prepare(&mut self, format: StreamFormat) {
+        self.glide.reset();
+        self.glide.set_sample_rate(format.sample_rate as f64);
+        self.recompute();
+        // A freshly reset smoother jumps straight to its first input; feed it
+        // the closed floor so the stream starts silent with smoothing armed.
+        self.glide.filter_mono(self.floor_gain);
+        self.open = false;
+        self.hold_counter = 0;
+    }
+
+    fn apply_to(&mut self, format: StreamFormat, audio: &mut [AudioSampleType]) -> bool {
         if audio.is_empty() {
             return true;
         }
+        let channels = (format.channels as usize).max(1);
+        let hold_frames = (self.hold_ms / 1000.0 * format.sample_rate as AudioSampleType) as u32;
+        self.glide.set_sample_rate(format.sample_rate as f64);
         let floor = self.floor_gain;
         let mut produced_signal = false;
 
-        for frame in audio.chunks_mut(self.channels) {
+        for frame in audio.chunks_mut(channels) {
             // Detector: peak magnitude across the frame's channels.
             let level: AudioSampleType = frame.iter().fold(0.0, |peak, &s| peak.max(s.abs()));
 
             // Open/close decision with hold and hysteresis.
             if level > self.open_thresh {
                 self.open = true;
-                self.hold_counter = self.hold_frames;
+                self.hold_counter = hold_frames;
             } else if self.open {
                 if self.hold_counter > 0 {
                     self.hold_counter -= 1;
@@ -146,122 +192,36 @@ impl Afx for Gate {
                 }
             }
 
-            // Glide the gain toward the target; attack rising, release falling.
+            // Glide the gain toward the target; the smoother applies its
+            // attack time rising and its release time falling. A zero-length
+            // stage jumps instead: the smoother's fastest step is one sample
+            // per pole, which would leave a tail where none was asked for.
             let target = if self.open { 1.0 } else { floor };
-            let coef = if target > self.gain {
-                self.attack_coef
+            let instant = if target > self.glide.value() {
+                self.attack_ms <= 0.0
             } else {
-                self.release_coef
+                self.release_ms <= 0.0
             };
-            self.gain += (target - self.gain) * coef;
+            if instant {
+                self.glide.set_value(target);
+            }
+            let gain = self.glide.filter_mono(target);
 
-            if self.gain > floor + SILENCE_EPS {
+            if gain > floor + SILENCE_EPS {
                 produced_signal = true;
             }
             for sample in frame.iter_mut() {
-                *sample *= self.gain;
+                *sample *= gain;
             }
         }
 
-        // A finite floor always emits (it ducks, never silences). A full-close
+        // A raised floor always emits (it ducks, never silences). A full-close
         // floor drops only once the whole buffer has settled to silence, so the
         // release tail is preserved and sustained silence parks the consumer.
         produced_signal || floor > SILENCE_EPS
     }
 }
 
-fn db_to_linear(db: AudioSampleType) -> AudioSampleType {
-    if db == AudioSampleType::NEG_INFINITY {
-        0.0
-    } else {
-        10.0_f32.powf(db / 20.0)
-    }
-}
-
-/// One-pole smoothing coefficient that reaches ~63% of a step over `time`.
-/// A stage of one frame or less is treated as instantaneous.
-fn time_to_coef(time: Duration, sample_rate: AudioSampleType) -> AudioSampleType {
-    let frames = time.as_secs_f32() * sample_rate;
-    if frames <= 1.0 {
-        1.0
-    } else {
-        1.0 - (-1.0 / frames).exp()
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn gate(overrides: GateSettings) -> Gate {
-        let mut gate = Gate::new(overrides);
-        gate.configure(48_000.0, 1);
-        gate
-    }
-
-    fn voice() -> GateSettings {
-        GateSettings {
-            threshold_db: -40.0,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn opens_and_ramps_up_over_attack() {
-        let mut gate = gate(GateSettings {
-            attack: Duration::from_millis(5),
-            ..voice()
-        });
-        let mut buf = [0.5; 480];
-        assert!(gate.apply_to(&mut buf));
-        // Attack glides the gain up across the buffer rather than snapping.
-        assert!(buf[0].abs() < buf[479].abs());
-        assert!(buf[479].abs() > 0.0);
-    }
-
-    #[test]
-    fn holds_through_a_short_gap() {
-        let mut gate = gate(GateSettings {
-            attack: Duration::ZERO,
-            hold: Duration::from_millis(100),
-            ..voice()
-        });
-        let mut loud = [0.5; 8];
-        assert!(gate.apply_to(&mut loud));
-        // A 10ms gap sits well inside the 100ms hold: kept, not dropped.
-        let mut gap = [0.0; 480];
-        assert!(gate.apply_to(&mut gap));
-    }
-
-    #[test]
-    fn drops_buffer_once_fully_closed() {
-        let mut gate = gate(GateSettings {
-            attack: Duration::ZERO,
-            hold: Duration::ZERO,
-            release: Duration::ZERO,
-            ..voice()
-        });
-        let mut loud = [0.5; 8];
-        assert!(gate.apply_to(&mut loud));
-        // No hold or release, full-close floor: the next silent buffer is
-        // dropped so the consumer parks.
-        let mut quiet = [0.0; 8];
-        assert!(!gate.apply_to(&mut quiet));
-    }
-
-    #[test]
-    fn finite_range_ducks_and_never_drops() {
-        let mut gate = gate(GateSettings {
-            range_db: -20.0,
-            ..voice()
-        });
-        // -20dB floor: silence is attenuated but still emitted, so it is kept.
-        let mut quiet = [0.0; 8];
-        assert!(gate.apply_to(&mut quiet));
-    }
-
-    #[test]
-    fn keeps_empty_buffer() {
-        assert!(gate(voice()).apply_to(&mut []));
-    }
-}
+#[path = "../../tests/unit/effects/gate.rs"]
+mod tests;

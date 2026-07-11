@@ -5,10 +5,11 @@ use messenger_interface::types::{Emoji, ID, Identifier, Place, Room, User, UserS
 use messenger_unifier::{MessengerData, MessengerId, MessengerRegistry};
 use simple_audio_channels::{
     AudioMixer, SampleFormat, StreamFormat,
-    effects::{Gate, GateSettings},
+    effects::{EffectsRack, Gain, Gate, Mute},
 };
 use tracing::{debug, trace, warn};
 
+use crate::audio_controls::AudioControls;
 use crate::pages::{AppMessage, StreamDirection};
 
 fn apply_user_status_to_user(user: &mut Identifier<User>, user_id: ID, status: UserStatus) {
@@ -265,6 +266,7 @@ pub fn process_voice_event(
     id: MessengerId,
     event: VoiceEvent,
     messengers: &mut MessengerRegistry,
+    controls: &mut AudioControls,
 ) -> Task<AppMessage> {
     match event {
         VoiceEvent::CallStatusUpdate(status) => {
@@ -307,10 +309,30 @@ pub fn process_voice_event(
                         add(&mut call.source_mut().participants);
                     }
                 }
+
+                // Reconcile our own echo into the (optimistically set) local
+                // state: normally a confirmation of the last press, but this
+                // is also how an admin's server-mute silences the mic, and how
+                // a rejoin re-applies whatever the server reports.
+                if data
+                    .profile
+                    .as_ref()
+                    .is_some_and(|profile| profile.id() == user.id())
+                {
+                    let state = user.voice.unwrap_or_default();
+                    debug!(
+                        "Applying own voice state: muted={} deafened={}",
+                        state.muted, state.deafened
+                    );
+                    controls.set_mic_muted(state.muted);
+                    controls.set_deafened(state.deafened);
+                }
             }
         }
         VoiceEvent::ParticipantLeft { user_id } => {
             trace!("{user_id:?} left vc");
+            // Their playback channel dies with them; keep only the stored volume.
+            controls.detach_user(id, user_id);
             if let Some(data) = messengers.data_mut(id) {
                 let left_rooms = remove_voice_participant(data, user_id);
 
@@ -319,6 +341,9 @@ pub fn process_voice_event(
                     .as_ref()
                     .is_some_and(|profile| *profile.id() == user_id)
                 {
+                    // Out of the call: audible and un-muted for the next one.
+                    controls.set_mic_muted(false);
+                    controls.set_deafened(false);
                     if left_rooms.is_empty() && data.calls.len() == 1 {
                         data.calls.clear();
                     } else {
@@ -333,13 +358,22 @@ pub fn process_voice_event(
 }
 
 pub fn process_audio_event(
-    _id: MessengerId,
+    id: MessengerId,
     event: AudioEvent,
     audio: &mut AudioMixer,
+    controls: &mut AudioControls,
 ) -> Task<AppMessage> {
     match event {
-        AudioEvent::AddAudioSource { channel, .. } => {
-            // Discord voice pushes opus-decoded i16 stereo at 48kHz.
+        AudioEvent::AddAudioSource { user, channel } => {
+            // Voice backends push opus-decoded i16 stereo at 48kHz.
+            let (mut rack, backend) = EffectsRack::new();
+            let deafen_mute = Mute::new();
+            let deafen_switch = deafen_mute.switch();
+            let deafen_id = rack.insert(Box::new(deafen_mute));
+            let volume = user
+                .map(|user| controls.user_volume(id, user))
+                .unwrap_or(1.0);
+            let gain = rack.insert(Box::new(Gain::with_multiplier(volume)));
             let producer = audio
                 .create_output_channel(
                     StreamFormat {
@@ -347,9 +381,17 @@ pub fn process_audio_event(
                         sample_format: SampleFormat::I16,
                         sample_rate: 48_000,
                     },
-                    Vec::new(),
+                    backend,
                 )
                 .unwrap();
+            controls.attach_output_mute(deafen_switch);
+
+            // Known speaker: keep the rack frontend in their controls, so the
+            // participant volume slider / "+ afx" sheet reach the backend. The
+            // Gain is seeded with any volume set before (or between) channels.
+            if let Some(user) = user {
+                controls.attach_user(id, user, rack, gain, vec![deafen_id]);
+            }
 
             if channel.send(producer).is_err() {
                 warn!("Couldn't send audio channel to the adapter");
@@ -360,7 +402,18 @@ pub fn process_audio_event(
             }
         }
         AudioEvent::AddAudioInput(sender) => {
-            // Discord voice encodes f32 stereo frames at 48kHz.
+            // Noise-gate the microphone near the device noise floor, holding
+            // across the gaps between words so transmission is not chopped,
+            // then closing fully so silence parks.
+            let (mut rack, backend) = EffectsRack::new();
+            let mic_mute = Mute::new();
+            let mic_mute_switch = mic_mute.switch();
+            let mic_mute_id = rack.insert(Box::new(mic_mute));
+            rack.insert(Box::new(
+                Gate::new().tuned(|gate| gate.threshold_db = -54.0),
+            ));
+
+            // Voice backends encode f32 stereo frames at 48kHz.
             let input = audio
                 .create_input_channel(
                     StreamFormat {
@@ -368,15 +421,11 @@ pub fn process_audio_event(
                         sample_format: SampleFormat::F32,
                         sample_rate: 48_000,
                     },
-                    // Noise-gate the microphone near the device noise floor,
-                    // holding across the gaps between words so transmission is
-                    // not chopped, then closing fully so silence parks.
-                    vec![Box::new(Gate::new(GateSettings {
-                        threshold_db: -54.0,
-                        ..Default::default()
-                    }))],
+                    backend,
                 )
                 .unwrap();
+
+            controls.attach_mic(rack, mic_mute_switch, vec![mic_mute_id]);
 
             if sender.send(input).is_err() {
                 warn!("Couldn't send audio input channel to the adapter");

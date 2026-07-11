@@ -10,7 +10,7 @@ use tracing::error;
 use crate::{
     AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, CHANNEL_HEADROOM, CONVERT_SCRATCH_LEN,
     MIX_SCRATCH_LEN, Notify, SampleConsum, SampleProd, SampleRb, StreamFormat,
-    effects::EffectChain,
+    effects::RackBackend,
     resample::Resampler,
     stream::{for_each_sample_format, update_presence},
 };
@@ -24,7 +24,7 @@ use crate::{
 pub struct SampleProducer {
     producer: SampleProd<CHANNEL_BUFFER_SIZE>,
     resampler: Resampler,
-    effects: EffectChain,
+    effects: RackBackend,
     /// Device-format staging between conversion/effects and the ring.
     scratch: Box<[AudioSampleType]>,
     format: StreamFormat,
@@ -73,11 +73,7 @@ impl SampleProducer {
             );
             // A dropped buffer (a gate on silence) is consumed from the source
             // but never queued for playback.
-            let keep = self
-                .effects
-                .iter_mut()
-                .all(|effect| effect.apply_to(&mut self.scratch[..written]));
-            if keep {
+            if self.effects.apply(&mut self.scratch[..written]) {
                 let pushed = self.producer.push_slice(&self.scratch[..written]);
                 debug_assert_eq!(pushed, written);
             }
@@ -104,11 +100,12 @@ impl Debug for OutputRxEvent {
 impl AudioMixer {
     /// Create an output (playback) channel. `format` declares what the
     /// application will push; audio is converted to the device's preferred
-    /// format, with `effects` applied (in device format) at push time.
+    /// format, with `effects` applied (in device format) at push time. Keep
+    /// the rack's frontend to edit the chain while the channel is live.
     pub fn create_output_channel(
         &mut self,
         format: StreamFormat,
-        mut effects: EffectChain,
+        mut effects: RackBackend,
     ) -> Result<SampleProducer, Box<dyn Error>> {
         if format.channels == 0 || format.sample_rate == 0 {
             return Err("invalid stream format: zero channels or sample rate".into());
@@ -127,9 +124,7 @@ impl AudioMixer {
         }
 
         // Output effects run in the device format (post-conversion).
-        for effect in effects.iter_mut() {
-            effect.prepare(device_format);
-        }
+        effects.prepare(device_format);
 
         let rb = SampleRb::<CHANNEL_BUFFER_SIZE>::default();
         let producer = SampleProducer {
@@ -204,6 +199,10 @@ impl AudioMixer {
         self.prune_output_channels();
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/output.rs"]
+mod tests;
 
 /// Build the real-time playback callback. It must stay free of locks,
 /// allocation and blocking: it drains the channel-event ring, mixes channel

@@ -16,6 +16,7 @@ use crate::{
 };
 
 pub mod effects;
+mod graph;
 pub mod input;
 pub mod output;
 mod resample;
@@ -27,8 +28,8 @@ pub(crate) type SampleRb<const N: usize> = Arc<StaticRb<AudioSampleType, N>>;
 pub(crate) type SampleProd<const N: usize> = Caching<SampleRb<N>, true, false>;
 pub(crate) type SampleConsum<const N: usize> = Caching<SampleRb<N>, false, true>;
 
-/// Number of samples in audio channel ring buffers (~129ms at 48kHz stereo).
-pub const CHANNEL_BUFFER_SIZE: usize = 12400;
+/// Number of samples in audio channel ring buffers (~50ms at 48kHz stereo).
+pub const CHANNEL_BUFFER_SIZE: usize = 4800;
 
 /// Samples per fixed scratch buffer used inside the real-time audio callbacks.
 pub(crate) const MIX_SCRATCH_LEN: usize = 1024;

@@ -1,9 +1,11 @@
 use std::{error::Error, path::PathBuf};
 
+use crate::audio_controls::{AfxKind, AfxTarget, AudioControls, AudioOp};
 use crate::components::divider::Divider;
 use messenger_unifier::{
     Call, MessengerData, MessengerId, MessengerInterface, MessengerRegistry, PendingSend,
 };
+use simple_audio_channels::effects::{ParamKey, ParamSpec, ParamUnit, SlotKey};
 
 use self::{
     chat::{Action as ChatAction, Chat, UpdateResult as ChatUpdateResult},
@@ -13,14 +15,15 @@ use self::{
 };
 
 use iced::{
-    Alignment, Color, ContentFit, Element, Length, Task,
+    Alignment, Color, ContentFit, Element, Length, Padding, Task,
     widget::{
         Button, Column, Responsive, Row, Text, center, column, container, image, mouse_area,
-        opaque, row, stack,
+        opaque, row, slider, stack,
     },
 };
 use messenger_interface::types::{
     Details, House, ID, Identifier, Message as InterfaceMessage, Place, Revision, Room, User,
+    VoiceState,
 };
 use tracing::{error, warn};
 
@@ -43,6 +46,8 @@ pub struct Messenger {
     pending_counter: ID,
     /// Inspect sheet shown as a modal over the page, if any.
     inspect: Option<Inspect>,
+    /// Afx sheet (a live channel's effect chain) shown as a modal, if any.
+    afx: Option<AfxSheet>,
 }
 
 impl Messenger {
@@ -52,6 +57,7 @@ impl Messenger {
             main: Main::Contacts(Contacts::default()),
             pending_counter: ID::MAX,
             inspect: None,
+            afx: None,
         }
     }
 
@@ -129,6 +135,107 @@ impl Inspect {
     }
 }
 
+/// The afx modal: a live channel's effect chain — listed with per-effect
+/// remove and one generic control per parameter the effect declares
+/// (rendered from its [`ParamSpec`] table), plus the effects that can be added.
+struct AfxSheet {
+    target: AfxTarget,
+    /// Whose channel this is, for the header (a participant's name, or "Microphone").
+    title: String,
+}
+
+/// Display a parameter value the way its spec says it should be read.
+fn format_param(spec: &ParamSpec, value: f32) -> String {
+    if spec.min_is_off && value <= spec.min {
+        return "off".to_owned();
+    }
+    match spec.unit {
+        ParamUnit::Amplitude => format!("{:.0}%", value * 100.0),
+        ParamUnit::Decibels => format!("{value:.1} dB"),
+        ParamUnit::Milliseconds => format!("{value:.0} ms"),
+        ParamUnit::Hertz => format!("{value:.0} Hz"),
+    }
+}
+
+impl AfxSheet {
+    fn view(&self, audio: &AudioControls) -> Element<'_, Message> {
+        let header = Text::new(format!("Audio effects — {}", self.title)).size(20);
+
+        let body: Element<'_, Message> = match audio.effects(self.target) {
+            // Racks only exist while their channel does (during a call).
+            None => Text::new("No live audio channel to edit.").into(),
+            Some(effects) => {
+                let listing: Element<'_, Message> = if effects.is_empty() {
+                    Text::new("No effects").size(13).into()
+                } else {
+                    Column::from_iter(effects.iter().map(|afx| {
+                        let effect = afx.id;
+                        let title = row![
+                            Text::new(afx.name).width(Length::Fill),
+                            Button::new(Text::new("x").size(11))
+                                .on_press(Message::AfxRemove(effect)),
+                        ]
+                        .align_y(Alignment::Center);
+
+                        let knobs = Column::from_iter(afx.params().map(|state| {
+                            let (spec, param) = (state.spec, state.spec.key);
+                            row![
+                                Text::new(spec.name).size(11).width(Length::Fixed(72.0)),
+                                slider(spec.min..=spec.max, state.value, move |value| {
+                                    Message::AfxSetParam {
+                                        effect,
+                                        param,
+                                        value,
+                                    }
+                                })
+                                .step((spec.max - spec.min) / 200.0)
+                                .width(Length::Fill),
+                                container(Text::new(format_param(spec, state.value)).size(11))
+                                    .width(Length::Fixed(56.0))
+                                    .padding(Padding::new(0.0).left(6.0)),
+                            ]
+                            .align_y(Alignment::Center)
+                            .into()
+                        }))
+                        .spacing(2.0);
+
+                        column![title, knobs].spacing(2.0).into()
+                    }))
+                    .spacing(10.0)
+                    .into()
+                };
+
+                let add_row = Row::from_iter(
+                    std::iter::once(Element::from(Text::new("Add:").size(13))).chain(
+                        AfxKind::ALL.iter().map(|kind| {
+                            Button::new(Text::new(format!("+ {}", kind.name())).size(13))
+                                .on_press(Message::AfxAdd(*kind))
+                                .into()
+                        }),
+                    ),
+                )
+                .spacing(8.0)
+                .align_y(Alignment::Center);
+
+                column![listing, add_row].spacing(12.0).into()
+            }
+        };
+
+        container(
+            column![
+                header,
+                body,
+                Button::new("Close").on_press(Message::CloseAfx)
+            ]
+            .spacing(14.0),
+        )
+        .padding(18.0)
+        .width(Length::Fixed(400.0))
+        .style(container::rounded_box)
+        .into()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum Message {
     Chat(ChatAction),
@@ -171,6 +278,17 @@ pub(crate) enum Message {
     /// The inspect sheet fetch resolved.
     InspectLoaded(Result<Details, String>),
     CloseInspect,
+    /// Add the picked effect to the open afx sheet's channel.
+    AfxAdd(AfxKind),
+    /// Remove an effect from the open afx sheet's channel.
+    AfxRemove(SlotKey),
+    /// A parameter slider in the afx sheet moved.
+    AfxSetParam {
+        effect: SlotKey,
+        param: ParamKey,
+        value: f32,
+    },
+    CloseAfx,
     /// An edit was confirmed by the server; replace the stored message.
     ConfirmEdit {
         id: MessengerId,
@@ -197,6 +315,13 @@ pub enum Action {
         channel: Identifier<Place<Room>>,
     },
     DisconnectFromCall(Call),
+    /// Broadcast the client's own mute/deafen flags for an active call.
+    SetCallState {
+        call: Call,
+        state: VoiceState,
+    },
+    /// An audio edit for the app-owned `AudioControls` (volume, afx chain).
+    Audio(AudioOp),
 }
 
 impl Messenger {
@@ -350,6 +475,37 @@ impl Messenger {
             }
             Message::CloseInspect => {
                 self.inspect = None;
+                Action::None
+            }
+            Message::AfxAdd(kind) => match &self.afx {
+                Some(sheet) => Action::Audio(AudioOp::AddEffect {
+                    target: sheet.target,
+                    kind,
+                }),
+                None => Action::None,
+            },
+            Message::AfxRemove(id) => match &self.afx {
+                Some(sheet) => Action::Audio(AudioOp::RemoveEffect {
+                    target: sheet.target,
+                    id,
+                }),
+                None => Action::None,
+            },
+            Message::AfxSetParam {
+                effect,
+                param,
+                value,
+            } => match &self.afx {
+                Some(sheet) => Action::Audio(AudioOp::SetEffectParam {
+                    target: sheet.target,
+                    effect,
+                    param,
+                    value,
+                }),
+                None => Action::None,
+            },
+            Message::CloseAfx => {
+                self.afx = None;
                 Action::None
             }
             Message::ConfirmEdit {
@@ -685,6 +841,20 @@ impl Messenger {
             },
             Message::Sidebar(action) => match action {
                 SidebarAction::Disconnect(call) => Action::DisconnectFromCall(call),
+                SidebarAction::SetCallState(call, state) => Action::SetCallState { call, state },
+                SidebarAction::SetUserVolume {
+                    messenger,
+                    user,
+                    volume,
+                } => Action::Audio(AudioOp::SetUserVolume {
+                    messenger,
+                    user,
+                    volume,
+                }),
+                SidebarAction::OpenAfx { target, title } => {
+                    self.afx = Some(AfxSheet { target, title });
+                    Action::None
+                }
                 SidebarAction::Call(channel) => {
                     let server = self.sidebar.server_selected.as_ref().unwrap();
                     let Some(interface) = messengers.interface(server.messenger_id) else {
@@ -768,6 +938,7 @@ impl Messenger {
     pub(crate) fn view<'a>(
         &'a self,
         messengers: &'a MessengerRegistry,
+        audio: &'a AudioControls,
     ) -> iced::Element<'a, Message> {
         let profiles = row![Text::from(
             messengers
@@ -787,7 +958,7 @@ impl Messenger {
         let navbar = Navbar::get_element(messengers).map(Message::Navbar);
 
         let window = Responsive::new(move |size| {
-            let sidebar = self.sidebar.view(messengers).map(Message::Sidebar);
+            let sidebar = self.sidebar.view(messengers, audio).map(Message::Sidebar);
 
             let main = match &self.main {
                 Main::Contacts(contacts) => contacts.get_element(messengers).map(Message::Contacts),
@@ -803,14 +974,19 @@ impl Messenger {
 
         let base = Element::from(column![profiles, row![navbar, window]]);
 
-        let Some(inspect) = &self.inspect else {
+        // Modals: dimmed backdrop closes on click, the card itself swallows
+        // clicks. Inspect wins if both are somehow open.
+        let (card, close): (Element<'a, Message>, Message) = if let Some(inspect) = &self.inspect {
+            (inspect.view(), Message::CloseInspect)
+        } else if let Some(afx) = &self.afx {
+            (afx.view(audio), Message::CloseAfx)
+        } else {
             return base;
         };
-
         stack![
             base,
             opaque(
-                mouse_area(center(opaque(inspect.view())).style(|_theme| {
+                mouse_area(center(opaque(card)).style(|_theme| {
                     container::Style {
                         background: Some(iced::Background::Color(Color {
                             a: 0.6,
@@ -819,7 +995,7 @@ impl Messenger {
                         ..Default::default()
                     }
                 }))
-                .on_press(Message::CloseInspect)
+                .on_press(close)
             )
         ]
         .into()

@@ -1,15 +1,18 @@
 use iced::{
     Color, ContentFit, Element, Length, Padding,
     widget::{
-        Button, Column, Row, Scrollable, Text, button, column, container, image, row,
+        Button, Column, Scrollable, Text, button, column, container, image, row, slider,
         text::Wrapping,
     },
 };
 use iced_palace::widget::ellipsized_text;
-use messenger_interface::types::{House, ID, Identifier, Place, Room, RoomCapabilities, User};
-use messenger_unifier::{Call, MessengerId, MessengerRegistry};
+use messenger_interface::types::{
+    House, ID, Identifier, Place, Room, RoomCapabilities, User, VoiceState,
+};
+use messenger_unifier::{Call, MessengerData, MessengerId, MessengerRegistry};
 
 use super::PLACEHOLDER_PFP;
+use crate::audio_controls::{AfxTarget, AudioControls};
 use crate::components::user_status::{known_user_status, one_to_one_room_status, status_indicator};
 
 /// "M"/"D" badges next to a muted/deafened voice participant.
@@ -32,6 +35,14 @@ fn voice_state_badges<'a>(participant: &User) -> Vec<Element<'a, Action>> {
 fn call_button_style(_theme: &iced::Theme, _status: button::Status) -> button::Style {
     button::Style {
         background: Some(iced::Background::Color(Color::from_rgb(0.0, 1.0, 0.2))),
+        ..Default::default()
+    }
+}
+
+/// Red tint marking an own-state toggle (mute/deafen) as engaged.
+fn engaged_toggle_style(_theme: &iced::Theme, _status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(0.9, 0.2, 0.2))),
         ..Default::default()
     }
 }
@@ -60,6 +71,8 @@ pub struct Sidebar {
 pub enum Action {
     Call(Identifier<Place<Room>>),
     Disconnect(Call),
+    /// Broadcast the client's own mute/deafen flags for an active call.
+    SetCallState(Call, VoiceState),
     OpenContacts,
     OpenChat {
         id: MessengerId,
@@ -69,6 +82,17 @@ pub enum Action {
     InspectGuild {
         id: MessengerId,
         guild: Identifier<Place<House>>,
+    },
+    /// A participant volume slider moved.
+    SetUserVolume {
+        messenger: MessengerId,
+        user: ID,
+        volume: f32,
+    },
+    /// Open the afx sheet for a live audio channel.
+    OpenAfx {
+        target: AfxTarget,
+        title: String,
     },
 }
 
@@ -225,7 +249,71 @@ impl Sidebar {
         )
     }
 
-    pub fn view<'a>(&'a self, messengers: &'a MessengerRegistry) -> Element<'a, Action> {
+    /// One row of the active-call roster: avatar + name + "+afx", with the
+    /// participant's volume slider underneath.
+    fn view_call_participant<'a>(
+        messenger_id: MessengerId,
+        data: &'a MessengerData,
+        participant: &'a Identifier<User>,
+        audio: &AudioControls,
+    ) -> Element<'a, Action> {
+        let user_id = *participant.id();
+        let avatar = match participant.icon.as_ref() {
+            Some(icon) => image(icon),
+            None => image(PLACEHOLDER_PFP),
+        };
+        let volume = audio.user_volume(messenger_id, user_id);
+
+        let identity = row![
+            container(
+                avatar
+                    .height(Length::Fixed(24.0))
+                    .width(Length::Fixed(24.0))
+                    .content_fit(ContentFit::Cover),
+            )
+            .padding(Padding::new(0.0).right(4.0)),
+        ]
+        .extend(status_indicator(known_user_status(Some(data), participant)))
+        .push(
+            ellipsized_text(participant.name.as_str())
+                .wrapping(Wrapping::None)
+                .width(Length::Fill),
+        )
+        .extend(voice_state_badges(participant))
+        .push(
+            Button::new(Text::new("+afx").size(10)).on_press(Action::OpenAfx {
+                target: AfxTarget::User {
+                    messenger: messenger_id,
+                    user: user_id,
+                },
+                title: participant.name.clone(),
+            }),
+        )
+        .align_y(iced::Alignment::Center);
+
+        let volume_row = row![
+            slider(0.0..=2.0, volume, move |volume| Action::SetUserVolume {
+                messenger: messenger_id,
+                user: user_id,
+                volume,
+            })
+            .step(0.01_f32)
+            .width(Length::Fill),
+            container(Text::new(format!("{:.0}%", volume * 100.0)).size(11))
+                .padding(Padding::new(0.0).left(4.0)),
+        ]
+        .align_y(iced::Alignment::Center);
+
+        column![identity, volume_row]
+            .padding(Padding::new(0.0).bottom(6.0))
+            .into()
+    }
+
+    pub fn view<'a>(
+        &'a self,
+        messengers: &'a MessengerRegistry,
+        audio: &'a AudioControls,
+    ) -> Element<'a, Action> {
         let room_list = match &self.server_selected {
             Some(server) => Self::view_server_panel(*server, messengers),
             None => Self::view_dm_panel(messengers),
@@ -233,8 +321,8 @@ impl Sidebar {
 
         // === New ===
         let active_calls_panel = Element::from(Column::from_iter(messengers.iter().map(
-            |(_, messenger)| {
-                let active_call_panel = messenger.data.calls.iter().map(|call| {
+            |(messenger_id, messenger)| {
+                let active_call_panel = messenger.data.calls.iter().map(move |call| {
                     let client_user_id =
                         messenger.data.profile.as_ref().map(|profile| profile.id());
 
@@ -252,35 +340,80 @@ impl Sidebar {
 
                     let call_status =
                         Element::from(Text::from(call.state_str()).width(Length::Fill));
+                    let mic_afx_button = Element::from(
+                        Button::new(Text::new("+afx").size(10)).on_press(Action::OpenAfx {
+                            target: AfxTarget::Mic,
+                            title: "Microphone".to_owned(),
+                        }),
+                    );
                     let disconnect_button =
-                        Element::from(Button::new("D").on_press(Action::Disconnect(call.clone())));
-                    let call_participents_icons =
-                        Element::from(Row::from_iter(call_participents.map(|participant| {
-                            let pfp_image = match participant.icon.as_ref() {
-                                Some(icon) => image(icon),
-                                None => image(PLACEHOLDER_PFP),
-                            };
-                            let mut badge = row![container(
-                                pfp_image
-                                    .height(Length::Fixed(24.0))
-                                    .width(Length::Fixed(24.0))
-                                    .content_fit(ContentFit::Cover),
-                            )]
-                            .spacing(4.0)
-                            .align_y(iced::Alignment::Center);
-                            if let Some(status) = status_indicator(known_user_status(
-                                Some(&messenger.data),
+                        Element::from(Button::new("X").on_press(Action::Disconnect(call.clone())));
+                    let call_participants =
+                        Element::from(Column::from_iter(call_participents.map(|participant| {
+                            Self::view_call_participant(
+                                messenger_id,
+                                &messenger.data,
                                 participant,
-                            )) {
-                                badge = badge.push(status);
-                            }
-                            Element::from(badge.padding(Padding::new(0.0).right(6.0)))
+                                audio,
+                            )
                         })));
 
-                    Element::from(column![
-                        row![call_status, disconnect_button],
-                        call_participents_icons,
-                    ])
+                    // Own mute/deafen toggles, only for backends that can
+                    // broadcast them. The shown state is the app's desired
+                    // state (set optimistically on press, reconciled by the
+                    // backend's echo) — deriving it from the roster instead
+                    // would lag a round-trip, so a quick second press would
+                    // compute its toggle from stale flags.
+                    let can_set_state = messenger
+                        .interface
+                        .api
+                        .voice()
+                        .is_ok_and(|voice| voice.self_state().is_ok());
+                    let self_state = VoiceState {
+                        muted: audio.mic_muted(),
+                        deafened: audio.deafened(),
+                    };
+                    let toggle = |label, engaged: bool, target: VoiceState| {
+                        let button = Button::new(Text::new(label).size(10))
+                            .on_press(Action::SetCallState(call.clone(), target));
+                        if engaged {
+                            button.style(engaged_toggle_style)
+                        } else {
+                            button
+                        }
+                    };
+
+                    let header = row![call_status]
+                        .extend(
+                            can_set_state
+                                .then(|| {
+                                    [
+                                        toggle(
+                                            "M",
+                                            self_state.muted,
+                                            VoiceState {
+                                                muted: !self_state.muted,
+                                                ..self_state
+                                            },
+                                        ),
+                                        toggle(
+                                            "D",
+                                            self_state.deafened,
+                                            VoiceState {
+                                                deafened: !self_state.deafened,
+                                                ..self_state
+                                            },
+                                        ),
+                                    ]
+                                    .map(Element::from)
+                                })
+                                .into_iter()
+                                .flatten(),
+                        )
+                        .push(mic_afx_button)
+                        .push(disconnect_button);
+
+                    Element::from(column![header, call_participants])
                 });
 
                 Element::from(Column::from_iter(active_call_panel))

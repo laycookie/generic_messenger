@@ -1,4 +1,4 @@
-use std::{error::Error, fmt::Debug, io, sync::Arc};
+use std::{error::Error, fmt::Debug, future, io, sync::Arc, task::Poll};
 
 use cpal::{FromSample, Sample, SizedSample, traits::DeviceTrait as _};
 use ringbuf::{
@@ -10,7 +10,7 @@ use tracing::error;
 use crate::{
     AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, CHANNEL_HEADROOM, CONVERT_SCRATCH_LEN,
     MIX_SCRATCH_LEN, Notify, SampleConsum, SampleProd, SampleRb, StreamFormat,
-    effects::EffectChain,
+    effects::RackBackend,
     resample::Resampler,
     stream::{for_each_sample_format, update_presence},
 };
@@ -35,7 +35,7 @@ pub struct SampleConsumer {
     cons: SampleConsum<CHANNEL_BUFFER_SIZE>,
     notify: Arc<Notify>,
     resampler: Resampler,
-    effects: EffectChain,
+    effects: RackBackend,
     /// Declared-format staging between conversion/effects and the caller.
     scratch: Box<[AudioSampleType]>,
     format: StreamFormat,
@@ -75,14 +75,10 @@ impl SampleConsumer {
                 break;
             }
             // A dropped buffer (a gate on silence) is consumed from the ring
-            // but never handed back: skip it and keep pulling, so a silent
-            // channel returns nothing and the caller's `pop` parks.
-            let keep = self
-                .effects
-                .iter_mut()
-                .all(|effect| effect.apply_to(&mut self.scratch[..converted]));
-            if !keep {
-                continue;
+            // but never handed back. Stop after one discarded chunk so a
+            // silent hot input cannot drain the whole ring in one poll.
+            if !self.effects.apply(&mut self.scratch[..converted]) {
+                break;
             }
             for (slot, sample) in out[written..written + converted]
                 .iter_mut()
@@ -109,20 +105,39 @@ impl SampleConsumer {
             if written > 0 {
                 return written;
             }
+            yield_to_executor().await;
+            if self.cons.occupied_len() >= self.format.channels as usize {
+                continue;
+            }
             self.notify.notified().await;
         }
     }
+}
+
+async fn yield_to_executor() {
+    let mut yielded = false;
+    future::poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 impl AudioMixer {
     /// Create an input (capture) channel. `format` declares what the
     /// application wants to receive; captured audio is converted from the
     /// device's preferred format, with `effects` applied (in the declared
-    /// format) at pop time.
+    /// format) at pop time. Keep the rack's frontend to edit the chain while
+    /// the channel is live.
     pub fn create_input_channel(
         &mut self,
         format: StreamFormat,
-        mut effects: EffectChain,
+        mut effects: RackBackend,
     ) -> Result<SampleConsumer, Box<dyn Error>> {
         if format.channels == 0 || format.sample_rate == 0 {
             return Err("invalid stream format: zero channels or sample rate".into());
@@ -137,10 +152,8 @@ impl AudioMixer {
         let device_format = StreamFormat::of_device(&master.config);
 
         // Input effects run in the channel's declared format (post-conversion);
-        // give each the format it will see before any audio flows.
-        for effect in effects.iter_mut() {
-            effect.prepare(format);
-        }
+        // give the rack the format it will see before any audio flows.
+        effects.prepare(format);
 
         let rb = SampleRb::<CHANNEL_BUFFER_SIZE>::default();
         let notify = Arc::new(Notify::new());
@@ -220,6 +233,10 @@ impl AudioMixer {
         self.prune_input_channels();
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/input.rs"]
+mod tests;
 
 /// Build the real-time capture callback. It must stay free of locks,
 /// allocation and blocking: it drains the channel-event ring and copies

@@ -72,7 +72,7 @@ impl Resampler {
                     if !next(&mut self.a) {
                         break;
                     }
-                    map_frame(&self.a, &mut dst[written..written + dst_ch]);
+                    Self::map_frame(&self.a, &mut dst[written..written + dst_ch]);
                 }
                 written += dst_ch;
             }
@@ -106,137 +106,36 @@ impl Resampler {
             for ((sample, a), b) in self.interp.iter_mut().zip(&self.a).zip(&self.b) {
                 *sample = a + (b - a) * t;
             }
-            map_frame(&self.interp, &mut dst[written..written + dst_ch]);
+            Self::map_frame(&self.interp, &mut dst[written..written + dst_ch]);
             written += dst_ch;
             self.phase += self.step;
         }
         written
     }
-}
 
-/// Remap one frame between channel layouts: identity when equal, mono is
-/// duplicated to the front pair, stereo averages down to mono; otherwise
-/// channels map positionally with extras dropped or zero-filled.
-fn map_frame(src: &[AudioSampleType], dst: &mut [AudioSampleType]) {
-    match (src.len(), dst.len()) {
-        (s, d) if s == d => dst.copy_from_slice(src),
-        (1, _) => {
-            dst.fill(0.0);
-            dst[0] = src[0];
-            if dst.len() >= 2 {
-                dst[1] = src[0];
+    /// Remap one frame between channel layouts: identity when equal, mono is
+    /// duplicated to the front pair, stereo averages down to mono; otherwise
+    /// channels map positionally with extras dropped or zero-filled.
+    fn map_frame(src: &[AudioSampleType], dst: &mut [AudioSampleType]) {
+        match (src.len(), dst.len()) {
+            (s, d) if s == d => dst.copy_from_slice(src),
+            (1, _) => {
+                dst.fill(0.0);
+                dst[0] = src[0];
+                if dst.len() >= 2 {
+                    dst[1] = src[0];
+                }
             }
-        }
-        (2, 1) => dst[0] = 0.5 * (src[0] + src[1]),
-        (s, d) => {
-            let shared = s.min(d);
-            dst[..shared].copy_from_slice(&src[..shared]);
-            dst[shared..].fill(0.0);
+            (2, 1) => dst[0] = 0.5 * (src[0] + src[1]),
+            (s, d) => {
+                let shared = s.min(d);
+                dst[..shared].copy_from_slice(&src[..shared]);
+                dst[shared..].fill(0.0);
+            }
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn slice_source(
-        data: &[AudioSampleType],
-        ch: usize,
-    ) -> impl FnMut(&mut [AudioSampleType]) -> bool + '_ {
-        let mut pos = 0;
-        move |frame: &mut [AudioSampleType]| {
-            if pos + ch > data.len() {
-                return false;
-            }
-            frame.copy_from_slice(&data[pos..pos + ch]);
-            pos += ch;
-            true
-        }
-    }
-
-    #[test]
-    fn identity_passthrough() {
-        let mut conv = Resampler::new(2, 48_000, 2, 48_000);
-        let src = [0.1, 0.2, 0.3, 0.4];
-        let mut dst = [0.0; 8];
-        let n = conv.pull(slice_source(&src, 2), &mut dst);
-        assert_eq!(n, 4);
-        assert_eq!(&dst[..4], &src);
-    }
-
-    #[test]
-    fn mono_to_stereo_duplicates() {
-        let mut conv = Resampler::new(1, 48_000, 2, 48_000);
-        let src = [0.5, -0.5];
-        let mut dst = [0.0; 4];
-        let n = conv.pull(slice_source(&src, 1), &mut dst);
-        assert_eq!(n, 4);
-        assert_eq!(dst, [0.5, 0.5, -0.5, -0.5]);
-    }
-
-    #[test]
-    fn stereo_to_mono_averages() {
-        let mut conv = Resampler::new(2, 48_000, 1, 48_000);
-        let src = [0.2, 0.4, -1.0, 1.0];
-        let mut dst = [0.0; 2];
-        let n = conv.pull(slice_source(&src, 2), &mut dst);
-        assert_eq!(n, 2);
-        assert!((dst[0] - 0.3).abs() < 1e-6);
-        assert!(dst[1].abs() < 1e-6);
-    }
-
-    #[test]
-    fn upsample_interpolates_midpoints() {
-        let mut conv = Resampler::new(1, 24_000, 1, 48_000);
-        let src = [0.0, 1.0, 2.0, 3.0];
-        let mut dst = [0.0; 16];
-        let n = conv.pull(slice_source(&src, 1), &mut dst);
-        // Output stops once the lookahead frame can no longer be refilled.
-        assert_eq!(&dst[..n], &[0.0, 0.5, 1.0, 1.5, 2.0, 2.5]);
-    }
-
-    #[test]
-    fn downsample_skips_frames() {
-        let mut conv = Resampler::new(1, 48_000, 1, 24_000);
-        let src = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
-        let mut dst = [0.0; 8];
-        let n = conv.pull(slice_source(&src, 1), &mut dst);
-        assert_eq!(&dst[..n], &[0.0, 2.0, 4.0]);
-    }
-
-    #[test]
-    fn state_persists_across_pulls() {
-        let mut conv = Resampler::new(1, 24_000, 1, 48_000);
-        let src = [0.0, 1.0, 2.0, 3.0];
-        let mut source = slice_source(&src, 1);
-        let mut dst = [0.0; 3];
-        let n = conv.pull(&mut source, &mut dst);
-        assert_eq!(n, 3);
-        assert_eq!(dst, [0.0, 0.5, 1.0]);
-        let mut dst2 = [0.0; 8];
-        let n2 = conv.pull(&mut source, &mut dst2);
-        assert_eq!(&dst2[..n2], &[1.5, 2.0, 2.5]);
-    }
-
-    #[test]
-    fn rate_44100_to_48000_keeps_duration() {
-        let mut conv = Resampler::new(1, 44_100, 1, 48_000);
-        let src = vec![0.25 as AudioSampleType; 44_100];
-        let mut dst = vec![0.0 as AudioSampleType; 50_000];
-        let n = conv.pull(slice_source(&src, 1), &mut dst);
-        // One second in ≈ one second out (minus the lookahead frame).
-        assert!((n as i64 - 48_000).unsigned_abs() < 4, "{n}");
-        assert!(dst[..n].iter().all(|s| (s - 0.25).abs() < 1e-6));
-    }
-
-    #[test]
-    fn partial_dst_returns_whole_frames_only() {
-        let mut conv = Resampler::new(2, 48_000, 2, 48_000);
-        let src = [0.1, 0.2, 0.3, 0.4];
-        let mut dst = [0.0; 3];
-        let n = conv.pull(slice_source(&src, 2), &mut dst);
-        assert_eq!(n, 2);
-        assert_eq!(&dst[..2], &[0.1, 0.2]);
-    }
-}
+#[path = "../tests/unit/resample.rs"]
+mod tests;

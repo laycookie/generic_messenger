@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use audio_controls::AudioControls;
 use font_kit::{family_name::FamilyName, source::SystemSource};
 use futures::{StreamExt, future::join_all, join};
 use iced::{Element, Subscription, Task, window};
@@ -9,6 +10,7 @@ use messenger_unifier::MessengerRegistry;
 use pages::{AppMessage, StreamDirection, login, messenger};
 use simple_audio_channels::AudioMixer;
 
+mod audio_controls;
 mod components;
 mod events;
 mod pages;
@@ -68,6 +70,8 @@ struct App {
     messenger: messenger::Messenger,
     // Subsystems
     audio: AudioMixer,
+    /// Live voice-channel handles (per-user volume gains, effect racks).
+    audio_controls: AudioControls,
     messengers: MessengerRegistry,
 }
 
@@ -109,6 +113,7 @@ impl App {
             login: login::Login::default(),
             messenger: messenger::Messenger::new(),
             audio: AudioMixer::default(),
+            audio_controls: AudioControls::default(),
             messengers: MessengerRegistry::default(),
         };
 
@@ -289,11 +294,14 @@ impl App {
             AppMessage::TextEvent((id, event)) => {
                 events::process_text_event(id, event, &mut self.messengers)
             }
-            AppMessage::VoiceEvent((id, event)) => {
-                events::process_voice_event(id, event, &mut self.messengers)
-            }
+            AppMessage::VoiceEvent((id, event)) => events::process_voice_event(
+                id,
+                event,
+                &mut self.messengers,
+                &mut self.audio_controls,
+            ),
             AppMessage::AudioEvent((id, event)) => {
-                events::process_audio_event(id, event, &mut self.audio)
+                events::process_audio_event(id, event, &mut self.audio, &mut self.audio_controls)
             }
             // === Audio ===
             AppMessage::StartStream(dir) => {
@@ -315,9 +323,17 @@ impl App {
                 }
             }
             AppMessage::StopStream(dir) => {
+                // The stream's channels are gone with it — drop the control
+                // handles that pointed into them (stored volumes survive).
                 match dir {
-                    StreamDirection::Input => self.audio.stop_stream_input(),
-                    StreamDirection::Output => self.audio.stop_stream_output(),
+                    StreamDirection::Input => {
+                        self.audio.stop_stream_input();
+                        self.audio_controls.detach_mic();
+                    }
+                    StreamDirection::Output => {
+                        self.audio.stop_stream_output();
+                        self.audio_controls.detach_all_users();
+                    }
                 };
                 Task::none()
             }
@@ -395,6 +411,42 @@ impl App {
                     })
                     .then(|task| task)
                 }
+                messenger::Action::Audio(op) => {
+                    self.audio_controls.apply(op);
+                    Task::none()
+                }
+                messenger::Action::SetCallState { call, state } => {
+                    debug!(
+                        "Requesting call state: muted={} deafened={}",
+                        state.muted, state.deafened
+                    );
+                    let Some(entry) = self.messengers.get(call.messenger_id()) else {
+                        return Task::none();
+                    };
+                    let api = entry.interface.api.clone();
+
+                    // Apply optimistically so the toggle takes effect (and the
+                    // buttons repaint) immediately — otherwise a press landing
+                    // before the previous echo would compute from stale state
+                    // (a double-click could never toggle off). The echo then
+                    // confirms, or corrects if the server disagrees.
+                    self.audio_controls.set_mic_muted(state.muted);
+                    self.audio_controls.set_deafened(state.deafened);
+
+                    Task::future(async move {
+                        match api.voice().and_then(|voice| voice.self_state()) {
+                            Ok(voice) => {
+                                let room_id = call.source().swap_data((**call.source()).clone());
+                                if let Err(err) = voice.set_self_voice_state(&room_id, state).await
+                                {
+                                    error!("Failed to set voice state: {err}");
+                                }
+                            }
+                            Err(err) => warn!("Setting call state not supported: {err:#?}"),
+                        }
+                    })
+                    .discard()
+                }
                 messenger::Action::DisconnectFromCall(call) => {
                     let Some(entry) = self.messengers.get(call.messenger_id()) else {
                         return Task::none();
@@ -426,7 +478,10 @@ impl App {
         match self.screen {
             Screen::Loading => iced::widget::text("Loading").into(),
             Screen::Login => self.login.view().map(AppMessage::Login),
-            Screen::Messenger => self.messenger.view(&self.messengers).map(AppMessage::Chat),
+            Screen::Messenger => self
+                .messenger
+                .view(&self.messengers, &self.audio_controls)
+                .map(AppMessage::Chat),
         }
     }
 
