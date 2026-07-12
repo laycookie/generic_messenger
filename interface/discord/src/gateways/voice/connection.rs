@@ -252,24 +252,34 @@ impl RecvTransport<'_> {
         } else {
             voice_data
         };
-        // Decrypt Dave
+        // Decrypt Dave. The guard's scope is just the decrypt — holding it
+        // through the Opus decode below would block send_frame and the DAVE
+        // event handlers for nothing. Uncontended acquisition is silent; the
+        // trace fires only when someone else actually holds the lock.
         let decrypted;
-        trace!("recv: waiting for dave_session lock");
-        let mut dave_session = self.dave_session.lock().await;
-        let voice_data = if let Some(dave_session) = dave_session.as_mut() {
-            decrypted = dave_session.decrypt(
-                *self
-                    .ssrc_to_user_id
-                    .get(&rtp_packet.get_ssrc())
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "no SSRC to user mapping")
-                    })?,
-                MediaType::AUDIO,
-                voice_data,
-            )?;
-            decrypted.as_slice()
-        } else {
-            voice_data
+        let voice_data = {
+            let mut dave_session = match self.dave_session.try_lock() {
+                Some(guard) => guard,
+                None => {
+                    trace!("recv: waiting for dave_session lock");
+                    self.dave_session.lock().await
+                }
+            };
+            if let Some(dave_session) = dave_session.as_mut() {
+                decrypted = dave_session.decrypt(
+                    *self
+                        .ssrc_to_user_id
+                        .get(&rtp_packet.get_ssrc())
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "no SSRC to user mapping")
+                        })?,
+                    MediaType::AUDIO,
+                    voice_data,
+                )?;
+                decrypted.as_slice()
+            } else {
+                voice_data
+            }
         };
 
         // Decode opus with a per-SSRC decoder: Opus carries inter-frame state,
@@ -428,6 +438,30 @@ impl SendTransport<'_> {
             })?;
         let opus_payload = &codec.encoded_audio_buf[..encoded_len];
 
+        // Dave (E2E) encrypt, scoped so the guard is dropped before the
+        // transport encrypt + UDP send — a wedged send must not keep the
+        // other dave_session users (event handlers, recv) blocked.
+        // Uncontended acquisition is silent; the trace fires only when
+        // someone else actually holds the lock.
+        let dave_encrypted;
+        let audio_payload = {
+            let mut dave_session = match self.dave_session.try_lock() {
+                Some(guard) => guard,
+                None => {
+                    trace!("send_frame: waiting for dave_session lock");
+                    self.dave_session.lock().await
+                }
+            };
+            match dave_session.as_mut() {
+                Some(dave_session) => {
+                    dave_encrypted =
+                        dave_session.encrypt(MediaType::AUDIO, Codec::OPUS, opus_payload)?;
+                    &*dave_encrypted
+                }
+                None => opus_payload,
+            }
+        };
+
         let samples_per_channel = (samples.len() / VOICE_CHANNELS) as u32;
         let now = Instant::now();
 
@@ -480,19 +514,6 @@ impl SendTransport<'_> {
                 let nonce = crypto_aead::xchacha20poly1305::Nonce::from_bytes(nonce);
                 let key = crypto_aead::xchacha20poly1305::Key::from_bytes(&secret_key[..])
                     .expect("Invalid key length");
-
-                // Held across the udp.send below — a wedged send keeps every
-                // other dave_session waiter (event handlers, recv) blocked.
-                trace!("send_frame: waiting for dave_session lock");
-                let mut dave_session = self.dave_session.lock().await;
-                let dave_encrypted;
-                let audio_payload = if let Some(dave_session) = dave_session.as_mut() {
-                    dave_encrypted =
-                        dave_session.encrypt(MediaType::AUDIO, Codec::OPUS, opus_payload)?;
-                    dave_encrypted.iter().as_slice()
-                } else {
-                    opus_payload
-                };
 
                 let encrypted = crypto_aead::xchacha20poly1305::encrypt(
                     audio_payload,

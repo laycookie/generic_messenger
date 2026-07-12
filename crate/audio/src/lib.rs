@@ -29,7 +29,7 @@ pub(crate) type SampleProd<const N: usize> = Caching<SampleRb<N>, true, false>;
 pub(crate) type SampleConsum<const N: usize> = Caching<SampleRb<N>, false, true>;
 
 /// Number of samples in audio channel ring buffers (~50ms at 48kHz stereo).
-pub const CHANNEL_BUFFER_SIZE: usize = 4800;
+pub const CHANNEL_BUFFER_SIZE: usize = 9600;
 
 /// Samples per fixed scratch buffer used inside the real-time audio callbacks.
 pub(crate) const MIX_SCRATCH_LEN: usize = 1024;

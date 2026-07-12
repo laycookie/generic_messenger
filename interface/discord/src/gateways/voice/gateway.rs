@@ -38,6 +38,10 @@ pub struct Voice {
     heartbeat_version: u8,
     pub channel_id: SNOWFLAKE,
     pub dave_pending_transitions: DashMap<u16, NonZeroU16>, // transition_id, dave_protocol_version
+    /// Serialized by necessity: every useful [`DaveSession`] method takes
+    /// `&mut self` (the MLS ratchet and nonce state advance on each call), so
+    /// this can't be ArcSwap'd or copied — duplicated ratchet state would
+    /// reuse AEAD nonces. Keep guard scopes free of I/O awaits instead.
     pub dave_session: AsyncMutex<Option<DaveSession>>,
     pub connection: ArcSwapOption<Connection>,
     pub ssrc_to_audio_channel: DashMap<Ssrc, std::sync::Mutex<super::AudioChannel>>,
@@ -62,11 +66,18 @@ impl std::ops::DerefMut for DaveSessionGuard<'_> {
 
 impl Voice {
     pub(crate) async fn require_dave_session(&self) -> Result<DaveSessionGuard<'_>, io::Error> {
-        // Freeze suspect: the audio loop holds this lock across its UDP
-        // send, and the SessionDescription handler across DAVE reinit.
-        trace!("require_dave_session: waiting for dave_session lock");
-        let guard = self.dave_session.lock().await;
-        trace!("require_dave_session: dave_session lock acquired");
+        // Uncontended acquisition is silent; the traces fire only when the
+        // lock is actually held elsewhere (audio loop mid-encrypt/decrypt,
+        // or another DAVE event handler).
+        let guard = match self.dave_session.try_lock() {
+            Some(guard) => guard,
+            None => {
+                trace!("require_dave_session: waiting for dave_session lock");
+                let guard = self.dave_session.lock().await;
+                trace!("require_dave_session: dave_session lock acquired");
+                guard
+            }
+        };
         if guard.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

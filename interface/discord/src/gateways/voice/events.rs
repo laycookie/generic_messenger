@@ -97,22 +97,29 @@ impl GatewayPayload<VoiceOpcode> {
             VoiceOpcode::SessionDescription => {
                 let session_description = facet_value::from_value::<SessionDescription>(self.d)?;
 
-                // Init DAVE
-                trace!("SessionDescription: waiting for dave_session lock");
-                let mut dave_session = voice_gateway.dave_session.lock().await;
-                trace!("SessionDescription: dave_session lock acquired");
+                // Init DAVE. The lock scope is just the reinit — the key
+                // package send and everything below (websocket I/O,
+                // listen_as) must not hold the guard, or a stalled send
+                // wedges the audio loop and every DAVE event handler.
                 let profile = discord.profile.load();
                 let profile = profile.as_ref().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "user profile not loaded")
                 })?;
-                reinit_dave_session(
-                    &voice_gateway.websocket,
-                    &mut dave_session,
-                    session_description.dave_protocol_version(),
-                    voice_gateway.channel_id,
-                    profile.id,
-                )
-                .await?;
+                trace!("SessionDescription: waiting for dave_session lock");
+                let key_package = {
+                    let mut dave_session = voice_gateway.dave_session.lock().await;
+                    trace!("SessionDescription: dave_session lock acquired");
+                    reinit_dave_session(
+                        &mut dave_session,
+                        session_description.dave_protocol_version(),
+                        voice_gateway.channel_id,
+                        profile.id,
+                    )?
+                };
+                voice_gateway
+                    .websocket
+                    .send_binary(VoiceOpcode::MLSKeyPackage as u8, key_package.into_iter())
+                    .await?;
                 trace!("SessionDescription: DAVE session initialized, key package sent");
 
                 // Commit description to connection. A repeated session
@@ -128,7 +135,7 @@ impl GatewayPayload<VoiceOpcode> {
                 };
 
                 if first_description {
-                    // Runs while holding dave_session + both receiver locks.
+                    // Runs while holding both receiver locks.
                     trace!("SessionDescription: creating audio stream (listen_as)");
                     let stream = discord
                         .clone()
@@ -282,21 +289,25 @@ impl GatewayPayload<VoiceOpcode> {
                 let packet = facet_value::from_value::<DAVEPrepareEpoch>(self.d)?;
 
                 if packet.epoch == 1 {
-                    let mut dave_session = voice_gateway.dave_session.lock().await;
                     // TODO: Investigate if this should be properly added
                     // this.daveProtocolVersion = packet.protocol_version;
                     let profile = discord.profile.load();
                     let profile = profile.as_ref().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::NotFound, "user profile not loaded")
                     })?;
-                    reinit_dave_session(
-                        &voice_gateway.websocket,
-                        &mut dave_session,
-                        packet.protocol_version,
-                        voice_gateway.channel_id,
-                        profile.id,
-                    )
-                    .await?;
+                    let key_package = {
+                        let mut dave_session = voice_gateway.dave_session.lock().await;
+                        reinit_dave_session(
+                            &mut dave_session,
+                            packet.protocol_version,
+                            voice_gateway.channel_id,
+                            profile.id,
+                        )?
+                    };
+                    voice_gateway
+                        .websocket
+                        .send_binary(VoiceOpcode::MLSKeyPackage as u8, key_package.into_iter())
+                        .await?;
                 }
             }
             VoiceOpcode::MLSExternalSenderPackage => {
@@ -455,13 +466,15 @@ async fn respond_to_mls_transition<E: std::fmt::Debug>(
     Ok(())
 }
 
-async fn reinit_dave_session(
-    voice_websocket: &Websocket,
+/// (Re)initialize the DAVE session and return the MLS key package to announce.
+/// Sync on purpose: callers run this under the dave_session lock, and the
+/// websocket send of the returned package belongs after that guard is dropped.
+fn reinit_dave_session(
     dave_session: &mut Option<DaveSession>,
     dave_protocol_version: u16,
     channel_id: SNOWFLAKE,
     user_id: SNOWFLAKE,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let dave_ver = NonZeroU16::new(dave_protocol_version).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidData, "DAVE protocol version is zero")
     })?;
@@ -476,9 +489,5 @@ async fn reinit_dave_session(
         key_package
     };
 
-    voice_websocket
-        .send_binary(VoiceOpcode::MLSKeyPackage as u8, key_package?.into_iter())
-        .await?;
-
-    Ok(())
+    Ok(key_package?)
 }
