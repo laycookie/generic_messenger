@@ -16,9 +16,11 @@ use crate::{
 };
 
 pub mod effects;
+pub mod effects_rack;
 mod graph;
 pub mod input;
 pub mod output;
+pub mod params;
 mod resample;
 mod stream;
 

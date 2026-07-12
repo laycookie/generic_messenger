@@ -5,7 +5,10 @@ use crate::components::divider::Divider;
 use messenger_unifier::{
     Call, MessengerData, MessengerId, MessengerInterface, MessengerRegistry, PendingSend,
 };
-use simple_audio_channels::effects::{ParamKey, ParamSpec, ParamUnit, SlotKey};
+use simple_audio_channels::{
+    effects_rack::SlotKey,
+    params::{ParamKey, ParamSpec, ParamUnit},
+};
 
 use self::{
     chat::{Action as ChatAction, Chat, UpdateResult as ChatUpdateResult},

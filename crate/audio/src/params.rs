@@ -1,3 +1,7 @@
+/// The derive that generates [`AfxParams`] impls, re-exported so the trait
+/// and its derive share one import path.
+pub use simple_audio_channels_macro::AfxParams;
+
 /// How a parameter's value should be displayed by a UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]

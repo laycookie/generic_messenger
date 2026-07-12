@@ -1,8 +1,11 @@
 use fundsp::prelude::{AFollow, An, afollow, db_amp};
 
-use crate::{AudioSampleType, StreamFormat};
+use crate::{
+    AudioSampleType, StreamFormat,
+    params::{AfxParams, ParamUnit},
+};
 
-use super::{Afx, ParamUnit};
+use super::Afx;
 
 /// A noise gate with attack / hold / release envelope shaping.
 ///
@@ -25,7 +28,7 @@ use super::{Afx, ParamUnit};
 /// through [`Gate::tuned`] so the resolved values follow. Field defaults live
 /// next to the fields as consts, so [`Gate::new`] can't drift from what the UI
 /// shows.
-#[derive(credential_macro::AfxParams)]
+#[derive(AfxParams)]
 #[afx(after_set = recompute)]
 pub struct Gate {
     /// Level the signal must rise above for the gate to open.

@@ -1,6 +1,5 @@
 use super::*;
 use crate::SampleFormat;
-use crate::effects::AfxParams as _;
 
 fn mono_48k() -> StreamFormat {
     StreamFormat {

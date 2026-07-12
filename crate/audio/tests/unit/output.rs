@@ -1,10 +1,7 @@
 use ringbuf::traits::Consumer as _;
 
 use super::*;
-use crate::{
-    SampleFormat,
-    effects::{EffectsRack, Gain},
-};
+use crate::{SampleFormat, effects::Gain, effects_rack::EffectsRack};
 
 /// A `SampleProducer` wired to a bare ring instead of a device, so the
 /// full push path (convert -> effects -> ring) is testable. The rack

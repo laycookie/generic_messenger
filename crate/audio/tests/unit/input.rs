@@ -4,11 +4,10 @@ use ringbuf::traits::{Observer as _, Producer as _};
 
 use super::*;
 use crate::{
-    SampleFormat,
-    effects::{Afx, EffectsRack},
+    SampleFormat, effects::Afx, effects_rack::EffectsRack, params::AfxParams,
 };
 
-#[derive(credential_macro::AfxParams)]
+#[derive(AfxParams)]
 struct DropAll {
     _private: (),
 }

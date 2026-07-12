@@ -1,6 +1,5 @@
 use super::*;
 use crate::SampleFormat;
-use crate::effects::AfxParams;
 
 /// A gate prepared for mono processing at a -40dB voice threshold,
 /// with `tweak` applied on top.

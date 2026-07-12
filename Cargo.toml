@@ -4,6 +4,7 @@ members = [
 	"macro",
 	"record_v2",
 	"crate/audio",
+	"crate/audio/macro",
 	"crate/messenger_interface",
 	"crate/messenger_unifier",
 	"crate/messenger_downloader",

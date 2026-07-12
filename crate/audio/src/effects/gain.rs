@@ -1,12 +1,15 @@
-use crate::{AudioSampleType, StreamFormat};
+use crate::{
+    AudioSampleType, StreamFormat,
+    params::{AfxParams, ParamUnit},
+};
 
-use super::{Afx, ParamUnit};
+use super::Afx;
 
 /// Multiplies every sample by a linear gain.
 ///
 /// Parameter edits glide over a short window, avoiding zipper noise while
 /// keeping the gain a normal rack effect.
-#[derive(credential_macro::AfxParams, Clone, Copy, Debug)]
+#[derive(AfxParams, Clone, Copy, Debug)]
 pub struct Gain {
     /// Target linear amplitude multiplier set by UI/automation.
     ///

@@ -1,0 +1,15 @@
+[package]
+name = "simple-audio-channels-macro"
+version = "0.0.1"
+edition = "2021"
+description = "AfxParams derive for simple-audio-channels"
+license = "GPL-2.0-only"
+repository = "https://github.com/laycookie/generic_messenger"
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+[lib]
+proc-macro = true

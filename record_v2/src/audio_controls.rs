@@ -8,8 +8,10 @@ use std::collections::HashMap;
 
 use messenger_interface::types::ID;
 use messenger_unifier::MessengerId;
-use simple_audio_channels::effects::{
-    Afx, EffectsRack, Gain, Gate, LowCut, MuteSwitch, ParamKey, Slot, SlotKey,
+use simple_audio_channels::{
+    effects::{Afx, Gain, Gate, LowCut, MuteSwitch},
+    effects_rack::{EffectsRack, Slot, SlotKey},
+    params::ParamKey,
 };
 
 /// Which live channel an afx edit is aimed at.

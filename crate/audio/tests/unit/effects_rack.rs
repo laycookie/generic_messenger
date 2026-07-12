@@ -1,11 +1,13 @@
 use super::*;
+use crate::effects::{Gain, Gate};
+use crate::params::AfxParams;
 use crate::{SampleFormat, SampleRate};
 use std::sync::{Arc, Mutex};
 
 /// Adds a constant, records `prepare` calls, optionally discards.
 /// Opaque: its fields are not reflectable, so it has no parameters -
 /// the legitimate shape for an effect with nothing to tune.
-#[derive(credential_macro::AfxParams)]
+#[derive(AfxParams)]
 struct Probe {
     offset: AudioSampleType,
     keep: bool,

@@ -5,7 +5,8 @@ use messenger_interface::types::{Emoji, ID, Identifier, Place, Room, User, UserS
 use messenger_unifier::{MessengerData, MessengerId, MessengerRegistry};
 use simple_audio_channels::{
     AudioMixer, SampleFormat, StreamFormat,
-    effects::{EffectsRack, Gain, Gate, Mute},
+    effects::{Gain, Gate, Mute},
+    effects_rack::EffectsRack,
 };
 use tracing::{debug, trace, warn};
 

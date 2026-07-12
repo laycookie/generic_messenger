@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use crate::{AudioSampleType, StreamFormat};
+use crate::{AudioSampleType, StreamFormat, params::AfxParams};
 
 use super::Afx;
 
@@ -26,7 +26,7 @@ impl MuteSwitch {
 }
 
 /// Paramless rack effect controlled by a [`MuteSwitch`].
-#[derive(credential_macro::AfxParams, Clone, Default)]
+#[derive(AfxParams, Clone, Default)]
 pub struct Mute {
     switch: MuteSwitch,
 }

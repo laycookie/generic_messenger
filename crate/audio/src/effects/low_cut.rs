@@ -3,14 +3,18 @@ use fundsp::{
     prelude::{Shared, highpass_q, pass, shared, var},
 };
 
-use crate::{AudioSampleType, StreamFormat, graph::GraphHost};
+use crate::{
+    AudioSampleType, StreamFormat,
+    graph::GraphHost,
+    params::{AfxParams, ParamUnit},
+};
 
-use super::{Afx, ParamUnit};
+use super::Afx;
 
 /// Removes rumble below the cutoff: a 2nd-order Butterworth high-pass,
 /// typically parked just under the voice band to cut desk thumps, plosive
 /// pops and traffic without touching speech.
-#[derive(credential_macro::AfxParams)]
+#[derive(AfxParams)]
 #[afx(after_set = retune)]
 pub struct LowCut {
     /// Frequency below which the signal is rolled off.
