@@ -5,12 +5,17 @@ members = [
 	"record_v2",
 	"crate/audio",
 	"crate/audio/macro",
+	"crate/video",
+	"crate/video_capture",
 	"crate/messenger_interface",
+	"crate/unitstruct",
 	"crate/messenger_unifier",
 	"crate/messenger_downloader",
 	"crate/login_store",
 	"interface/discord",
-	"interface/steam"
+	"interface/slack",
+	"interface/steam",
+	"interface/telegram"
 ]
 
 [workspace.dependencies]
@@ -36,3 +41,34 @@ futures = "0.3.32"
 async-trait = "0.1.89"
 # Time
 chrono = "0.4"
+
+# Video capture and RGB↔YUV conversion are hot loops even during application
+# development. Keep those crates optimized so `cargo run` does not make debug
+# arithmetic consume a full CPU core.
+[profile.dev.package.simple-video]
+opt-level = 3
+
+[profile.dev.package.simple-video-capture]
+opt-level = 3
+
+[profile.dev.package.nokhwa-core]
+opt-level = 3
+
+[profile.dev.package.openh264]
+opt-level = 3
+
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+
+[profile.dev.package.rav1e]
+opt-level = 3
+
+# Audio conversion, mixing, and DSP are hot loops during development too.
+[profile.dev.package.simple-audio-channels]
+opt-level = 3
+
+[profile.dev.package.fundsp]
+opt-level = 3
+
+[profile.dev.package.ringbuf]
+opt-level = 3

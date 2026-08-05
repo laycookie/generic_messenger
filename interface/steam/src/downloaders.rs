@@ -9,10 +9,11 @@
 //! SteamID into the `Identifier<User>` the UI renders. Mirrors the Discord
 //! interface's typed `CdnImage` caching.
 
-use std::path::PathBuf;
+use std::{io, path::PathBuf};
 
 use dashmap::DashMap;
-use messenger_downloader::{Cached, DownloadResult, Fetch};
+use messenger_downloader::{Cached, DownloadError, DownloadResult, Fetch};
+use sha2::{Digest as _, Sha256};
 
 use messenger_interface::types::{CacheCategory, ID, Identifier, User};
 
@@ -28,6 +29,7 @@ const EMOTICON_CDN: &str = "https://community.steamstatic.com/economy/emoticon";
 /// Steam sticker image CDN. Stickers are economy items served alongside
 /// emoticons; the path segment is the sticker's name/path.
 const STICKER_CDN: &str = "https://community.steamstatic.com/economy/sticker";
+const MAX_ITEM_REFERENCE_LEN: usize = 512;
 
 /// A Steam CDN image, identified typesafely instead of by a stringly URL/path.
 /// Each variant owns enough to derive its CDN URL, cache filename, and
@@ -64,15 +66,19 @@ impl SteamImage {
         }
     }
 
-    fn url(&self) -> String {
+    fn url(&self) -> DownloadResult<String> {
         match self {
-            Self::Avatar { hash, .. } => format!("{AVATAR_CDN}/{hash}_full.jpg"),
-            Self::Emoticon { name } => format!("{EMOTICON_CDN}/{name}"),
+            Self::Avatar { hash, .. } => {
+                validate_avatar_hash(hash)?;
+                cdn_item_url(AVATAR_CDN, &format!("{hash}_full.jpg"))
+            }
+            Self::Emoticon { name } => cdn_item_url(EMOTICON_CDN, name),
             Self::Sticker { reference } => {
-                if reference.starts_with("http") {
-                    reference.clone()
+                if let Ok(url) = surf::Url::parse(reference) {
+                    validate_sticker_url(&url)?;
+                    Ok(url.into())
                 } else {
-                    format!("{STICKER_CDN}/{reference}")
+                    cdn_item_url(STICKER_CDN, reference)
                 }
             }
         }
@@ -83,11 +89,20 @@ impl SteamImage {
     /// — so a single owner's images share a directory and distinct owners never
     /// collide on a shared hash. Emoticons and stickers are globally identified
     /// by their own name, so they sit directly under the category.
-    fn file_name(&self) -> String {
+    fn file_name(&self) -> DownloadResult<String> {
         match self {
-            Self::Avatar { steamid, hash } => format!("{steamid}/{hash}.jpg"),
-            Self::Emoticon { name } => format!("{name}.png"),
-            Self::Sticker { reference } => format!("{}.png", sticker_cache_key(reference)),
+            Self::Avatar { steamid, hash } => {
+                validate_avatar_hash(hash)?;
+                Ok(format!("{steamid}/{hash}.jpg"))
+            }
+            Self::Emoticon { name } => {
+                validate_item_reference(name)?;
+                Ok(format!("{}.png", reference_cache_key("emoticon", name)))
+            }
+            Self::Sticker { reference } => {
+                validate_item_reference(reference)?;
+                Ok(format!("{}.png", reference_cache_key("sticker", reference)))
+            }
         }
     }
 
@@ -103,12 +118,12 @@ impl SteamImage {
     /// path. A cache hit skips the network; the shared downloader handles the
     /// existence check and atomic write.
     pub(crate) async fn fetch(self) -> DownloadResult<PathBuf> {
-        let url = self.url();
-        let file_name = self.file_name();
+        let url = self.url()?;
+        let file_name = self.file_name()?;
         Fetch::<Cached>::cached_fetch(
             INTERFACE_NAME,
             || surf::get(&url),
-            Vec::new(),
+            [] as [(&str, &str); 0],
             self.category(),
             &file_name,
         )
@@ -117,13 +132,73 @@ impl SteamImage {
     }
 }
 
-/// Reduce a sticker reference (a name, path, or URL) to a safe single-segment
-/// cache key for the filename.
-fn sticker_cache_key(reference: &str) -> String {
-    reference
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
+fn validate_item_reference(reference: &str) -> DownloadResult<()> {
+    if reference.is_empty()
+        || reference.len() > MAX_ITEM_REFERENCE_LEN
+        || reference.chars().any(char::is_control)
+        || matches!(reference, "." | "..")
+    {
+        return Err(invalid_reference("invalid Steam image reference"));
+    }
+    Ok(())
+}
+
+fn validate_avatar_hash(hash: &str) -> DownloadResult<()> {
+    if hash.len() != 40 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid_reference("invalid Steam avatar SHA-1 hash"));
+    }
+    Ok(())
+}
+
+fn cdn_item_url(base: &str, item: &str) -> DownloadResult<String> {
+    validate_item_reference(item)?;
+    let mut url = surf::Url::parse(base)?;
+    url.path_segments_mut()
+        .map_err(|_| invalid_reference("Steam CDN URL cannot contain path segments"))?
+        .push(item);
+    Ok(url.into())
+}
+
+fn validate_sticker_url(url: &surf::Url) -> DownloadResult<()> {
+    const ALLOWED_HOSTS: [&str; 2] = [
+        "community.steamstatic.com",
+        "community.akamai.steamstatic.com",
+    ];
+
+    validate_item_reference(url.as_str())?;
+    let trusted = url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| ALLOWED_HOSTS.contains(&host))
+        && url.path().starts_with("/economy/sticker/");
+    if !trusted {
+        return Err(invalid_reference(
+            "Steam sticker URL must use approved HTTPS Steam CDN endpoint",
+        ));
+    }
+    Ok(())
+}
+
+fn reference_cache_key(kind: &str, reference: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(reference.as_bytes());
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        output.push(HEX[usize::from(byte >> 4)] as char);
+        output.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    output
+}
+
+fn invalid_reference(message: &'static str) -> DownloadError {
+    io::Error::new(io::ErrorKind::InvalidInput, message).into()
 }
 
 pub(crate) async fn steam_user_identifier(
@@ -164,7 +239,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sticker_cache_key_sanitizes_to_one_segment() {
-        assert_eq!(sticker_cache_key("a/b c.png"), "a_b_c_png");
+    fn remote_references_become_digest_cache_keys() {
+        let key = SteamImage::emoticon("../../outside").file_name().unwrap();
+        assert_eq!(key.len(), 64 + ".png".len());
+        assert!(!key.contains(['/', '\\']));
+    }
+
+    #[test]
+    fn item_names_are_encoded_as_single_url_segments() {
+        let url = SteamImage::emoticon("face/../../private").url().unwrap();
+        assert!(url.starts_with(EMOTICON_CDN));
+        assert!(url.contains("face%2F..%2F..%2Fprivate"));
+    }
+
+    #[test]
+    fn sticker_urls_reject_ssrf_targets() {
+        for target in [
+            "http://community.steamstatic.com/economy/sticker/wave",
+            "https://127.0.0.1/economy/sticker/wave",
+            "https://community.steamstatic.com.evil.test/economy/sticker/wave",
+            "https://community.steamstatic.com:444/economy/sticker/wave",
+            "https://community.steamstatic.com/not-stickers/wave",
+        ] {
+            assert!(SteamImage::sticker(target).url().is_err(), "{target}");
+        }
+    }
+
+    #[test]
+    fn sticker_urls_accept_expected_cdn() {
+        let target = "https://community.steamstatic.com/economy/sticker/wave.png";
+        assert_eq!(SteamImage::sticker(target).url().unwrap(), target);
+    }
+
+    #[test]
+    fn avatar_hash_requires_sha1_shape() {
+        assert!(SteamImage::avatar(1, "../../secret").url().is_err());
+        assert!(
+            SteamImage::avatar(1, "0123456789abcdef0123456789abcdef01234567")
+                .url()
+                .is_ok()
+        );
     }
 }

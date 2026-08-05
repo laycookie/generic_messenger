@@ -47,6 +47,17 @@ impl Resampler {
         self.dst_channels
     }
 
+    pub(crate) fn src_channels(&self) -> usize {
+        self.src_channels
+    }
+
+    /// Forget interpolation history after upstream samples were deliberately
+    /// skipped to recover realtime latency.
+    pub(crate) fn reset(&mut self) {
+        self.phase = 0.0;
+        self.loaded = 0;
+    }
+
     /// Fill `dst` with converted frames, pulling source frames through `next`.
     ///
     /// `next` writes one source frame (`src_channels` samples) into its
@@ -103,10 +114,17 @@ impl Resampler {
             }
 
             let t = self.phase as AudioSampleType;
-            for ((sample, a), b) in self.interp.iter_mut().zip(&self.a).zip(&self.b) {
-                *sample = a + (b - a) * t;
+            let dst_frame = &mut dst[written..written + dst_ch];
+            if self.src_channels == dst_ch {
+                for ((sample, a), b) in dst_frame.iter_mut().zip(&self.a).zip(&self.b) {
+                    *sample = a + (b - a) * t;
+                }
+            } else {
+                for ((sample, a), b) in self.interp.iter_mut().zip(&self.a).zip(&self.b) {
+                    *sample = a + (b - a) * t;
+                }
+                Self::map_frame(&self.interp, dst_frame);
             }
-            Self::map_frame(&self.interp, &mut dst[written..written + dst_ch]);
             written += dst_ch;
             self.phase += self.step;
         }

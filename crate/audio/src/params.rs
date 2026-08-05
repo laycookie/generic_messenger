@@ -8,6 +8,8 @@ pub use simple_audio_channels_macro::AfxParams;
 pub enum ParamUnit {
     /// A linear amplitude multiplier; typically shown as a percentage.
     Amplitude,
+    /// A dynamics ratio, displayed as input change to output change (e.g. 4:1).
+    Ratio,
     /// Decibels.
     Decibels,
     /// A duration in milliseconds.

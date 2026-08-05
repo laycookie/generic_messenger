@@ -3,7 +3,7 @@
 This document captures the race conditions that arise when a backend exposes
 *both* a stateful query API (REST) and a delta-driven event stream (gateway /
 websocket). Discord is the concrete case worked through here, but the patterns
-apply to any hybrid backend implemented behind the `Query` / `Text` / `Voice`
+apply to any hybrid backend implemented behind the `Query` / `Text` / `Audio`
 traits in `messenger_interface`.
 
 For a wider discussion of backend communication shapes (socket-only,
@@ -184,18 +184,14 @@ async fn houses(&self) -> Result<Vec<...>, ...> {
 
 Two properties matter here, and they hold by inspection:
 
-1. **The gateway's `Ready` handler is the sole writer of the cache.**
-   `discord.guilds`, `discord.dm_channels`, and `discord.guild_channels` are
-   only `store`d from the `Ready` branch of the dispatch handler in
-   `interface/discord/src/gateways/general/events.rs`. The REST fallback path
-   returns the fetched data directly to the caller and does **not** write it
-   back to the cache.
-2. **The cache, once populated, is never invalidated except by gateway
-   disconnect.** `Ready` arrives once per connection; subsequent gateway events
-   (`GUILD_UPDATE`, `CHANNEL_CREATE`, ...) mutate the cache in place. When the
-   gateway connection drops, the entire `Gateway<General>` is dropped, but the
-   `InnerDiscord` caches it populated outlive it — they remain readable. A
-   reconnect will overwrite them with a fresh `Ready` snapshot.
+1. **Gateway dispatch is the sole cache writer.** `Ready` publishes the initial
+   snapshot; guild/channel/relationship/expression create, update, and delete
+   reducers keep it current. REST fallback returns data directly and never
+   writes it into these caches.
+2. **A fresh `Ready` invalidates the previous session first.** Reconnect clears
+   every session-scoped slice and index, then publishes the new snapshot.
+   Empty collections are published explicitly, so entities deleted while the
+   connection was down cannot survive reconnect.
 
 Together these mean that for cache-backed queries:
 
@@ -229,40 +225,24 @@ cold-start.
 | Fetch | Cache-backed? | Matching delete event | Status today | Latent risk |
 |---|---|---|---|---|
 | `rest_get_profile` | yes | (no DELETE for self) | safe | n/a |
-| `rest_get_contacts` | **no, every call HTTP** | `RELATIONSHIP_REMOVE` | not handled yet | vulnerable on every call once handler is added |
-| `rest_get_dms` | yes (cold-start only) | `CHANNEL_DELETE` (DM) | not handled yet | cold-start window only |
-| `rest_get_guilds` | yes (cold-start only) | `GUILD_DELETE` | not handled yet | cold-start window only |
-| `rest_get_guild_channels` | yes (cold-start only) | `CHANNEL_DELETE` (guild) | not handled yet | cold-start window only |
-| `rest_get_messages` | **no, every call HTTP** | `MessageDelete` (handled), `MessageDeleteBulk` (not) | **actively vulnerable** | being addressed |
+| `rest_get_contacts` | yes (cold-start only) | `RELATIONSHIP_REMOVE` | cache reducer handled | cold-start UI window only |
+| `rest_get_dms` | yes (cold-start only) | `CHANNEL_DELETE` (DM) | cache reducer handled | cold-start UI window only |
+| `rest_get_guilds` | yes (cold-start only) | `GUILD_DELETE` | cache reducer handled | cold-start UI window only |
+| `rest_get_guild_channels` | yes (cold-start only) | `CHANNEL_DELETE` (guild) | cache reducer handled | cold-start UI window only |
+| `rest_get_messages` | **no, every call HTTP** | `MessageDelete`, `MessageDeleteBulk` | recorded and merged | creation/update/delete/reactions reconciled |
 
 Cache-first fetches are only at risk during the gateway-connect-to-Ready
 window (typically 1–3 seconds), and only once the corresponding `*_DELETE`
 handlers are added. Defensible to defer tombstone rings for those entity
 types until those handlers are wired up.
 
-`rest_get_contacts` is the next-most-exposed fetch: no cache, so a race
-opens on every call. When `RELATIONSHIP_REMOVE` handling is added, a
-separate tombstone ring will be needed.
-
 ## Open issues for later
 
-1. **Update races (phantom updates).** `MessageUpdate` arriving during
-   `rest_get_messages` is not yet addressed. The current policy handles
-   deletion but not partial updates. Plan: extend the local cache to store
-   full message state per channel, so gateway updates and HTTP fetches can
-   merge per-field rather than just per-presence.
-2. **Reaction races inside fetched messages.** A `MessageReactionRemove`
-   event landing during `rest_get_messages` can resurrect a reaction
-   *inside* a non-resurrected message. Same root cause as #1; resolved by
-   the same per-channel message cache.
-3. **`MessageDeleteBulk` handling.** Currently not matched in the gateway
-   event handler. Plan: handle it in the same change as the unified
-   `TextEvent::MessageDeleted` work — when that variant is extended to
-   optionally carry multiple IDs, the gateway handler will populate the
-   tombstone ring with all of them and fan out to the unified event.
-   Singular deletes become "bulk of one."
-4. **Tombstone rings for non-message entities.** When `CHANNEL_DELETE`,
-   `GUILD_DELETE`, `RELATIONSHIP_REMOVE` get wired up, each will need its
-   own tombstone ring (or a generic-over-ID one). Per-entity ring size can
-   be tuned to the realistic burst size of that entity type — guild deletes
-   are far rarer than message deletes, for example.
+1. **Cold-start UI replacement.** Cache-backed queries can still have an
+   already-consumed realtime event visually overwritten by the one REST
+   fallback started before `Ready`. Fix belongs in the UI reducer: merge
+   entities by ID instead of replacing whole lists.
+2. **Partial message updates.** Discord can send embed-only partial
+   `MESSAGE_UPDATE` payloads that omit author/content/timestamp. Current adapter
+   intentionally skips fields it cannot represent. Extend wire model only when
+   interface exposes those fields.

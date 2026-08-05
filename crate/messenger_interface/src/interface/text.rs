@@ -1,6 +1,6 @@
 //! Text chat: the guaranteed core ([`Text`]) plus the optional per-operation
-//! capabilities ([`EditMessage`], [`DeleteMessage`], [`CancelSend`],
-//! [`Reactions`]), their casters, and the realtime [`TextEvent`]s.
+//! capabilities ([`TextEdit`], [`TextDelete`], [`TextCancelSend`],
+//! [`TextReactions`]), their casters, and the realtime [`TextEvent`]s.
 
 use std::time::Duration;
 use std::{error::Error, sync::Arc};
@@ -14,14 +14,14 @@ use crate::types::{Emoji, ID, Identifier, Message, Place, Room, Sticker};
 
 capability_caster!(
     /// Capability: editing previously sent messages.
-    TextCasterEdit: Text => EditMessage { edit, arc_edit }
+    TextCasterEdit: Text => TextEdit { edit, arc_edit }
     /// Capability: deleting sent messages.
-    TextCasterDelete: Text => DeleteMessage { delete, arc_delete }
+    TextCasterDelete: Text => TextDelete { delete, arc_delete }
     /// Capability: retracting a message while it is still within its
     /// send window (e.g. email "undo send").
-    TextCasterCancel: Text => CancelSend { cancel, arc_cancel }
+    TextCasterCancel: Text => TextCancelSend { cancel, arc_cancel }
     /// Capability: reacting to messages with emoji.
-    TextCasterReactions: Text => Reactions { reactions, arc_reactions }
+    TextCasterReactions: Text => TextReactions { reactions, arc_reactions }
 );
 
 /// Ordering requested by a caller of [`Text::get_messages`].
@@ -45,11 +45,11 @@ pub enum Ordering {
 ///
 /// This is the guaranteed core every text-capable backend provides. Optional
 /// mutations (editing, deleting, cancelling a send) live in their own
-/// capability traits ([`EditMessage`], [`DeleteMessage`], [`CancelSend`]);
+/// capability traits ([`TextEdit`], [`TextDelete`], [`TextCancelSend`]);
 /// whether a backend supports them is a property of its *type*, surfaced to
 /// the UI through the `TextCaster*` supertraits the same way
-/// [`Voice`](super::Voice) support is surfaced through
-/// [`MessengerCasterVoice`](super::MessengerCasterVoice).
+/// [`Audio`](super::Audio) support is surfaced through
+/// [`MessengerCasterAudio`](super::MessengerCasterAudio).
 #[async_trait]
 pub trait Text:
     Send + Sync + TextCasterEdit + TextCasterDelete + TextCasterCancel + TextCasterReactions
@@ -93,6 +93,12 @@ pub trait Text:
         contents: Message,
     ) -> Result<Identifier<Message>, Box<dyn Error + Sync + Send>>;
 
+    /// Subscribe to realtime message and reaction changes.
+    ///
+    /// Intended for one long-lived consumer per backend. The returned weak
+    /// stream does not keep the backend alive. Events are deltas; callers still
+    /// use [`Self::get_messages`] for initial state and history. The default
+    /// reports [`MessengerError::NotImplemented`].
     async fn listen(
         self: Arc<Self>,
     ) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
@@ -108,7 +114,7 @@ pub trait Text:
 /// and failing. Receiving *others'* edits is unrelated — that stays on
 /// [`Text::listen`] as [`TextEvent::MessageUpdated`].
 #[async_trait]
-pub trait EditMessage: Text {
+pub trait TextEdit: Text {
     /// Edit a previously sent message, replacing its content.
     ///
     /// Returns the updated message as confirmed by the server.
@@ -122,9 +128,9 @@ pub trait EditMessage: Text {
 
 /// Capability: delete sent messages, with no time limit beyond the
 /// platform's own permissions. A retract-within-a-window platform (email
-/// "undo send") is *not* this — that is [`CancelSend`].
+/// "undo send") is *not* this — that is [`TextCancelSend`].
 #[async_trait]
-pub trait DeleteMessage: Text {
+pub trait TextDelete: Text {
     /// Delete a message.
     async fn delete_message(
         &self,
@@ -142,7 +148,7 @@ pub trait DeleteMessage: Text {
 /// emoji to build `name:id`). Receiving *others'* reactions is unrelated —
 /// that stays on [`Text::listen`] as [`TextEvent::ReactionAdded`].
 #[async_trait]
-pub trait Reactions: Text {
+pub trait TextReactions: Text {
     /// Add the client's reaction to a message.
     async fn add_reaction(
         &self,
@@ -162,16 +168,16 @@ pub trait Reactions: Text {
 
 /// Capability: retract a message while it is still within its send window.
 ///
-/// Distinct from [`DeleteMessage`]: the affordance ("Cancel send", shown only
+/// Distinct from [`TextDelete`]: the affordance ("Cancel send", shown only
 /// briefly) and the semantics (the message may never have left the server)
 /// differ, which is exactly what makes support decidable per backend type.
 #[async_trait]
-pub trait CancelSend: Text {
+pub trait TextCancelSend: Text {
     /// How long after sending a message stays cancellable. Static per
     /// backend; per-message eligibility is `now - sent_at < cancel_window()`,
     /// computed client-side from timestamps the UI already has.
     fn cancel_window(&self) -> Duration;
-    /// Retract a message still inside [`cancel_window`](CancelSend::cancel_window).
+    /// Retract a message still inside [`cancel_window`](TextCancelSend::cancel_window).
     async fn cancel_send(
         &self,
         location: &Identifier<Place<Room>>,
@@ -246,7 +252,7 @@ mod tests {
     impl_text_core!(MutableText);
 
     #[async_trait]
-    impl EditMessage for MutableText {
+    impl TextEdit for MutableText {
         async fn edit_message(
             &self,
             _: &Identifier<Place<Room>>,
@@ -257,7 +263,7 @@ mod tests {
         }
     }
     #[async_trait]
-    impl DeleteMessage for MutableText {
+    impl TextDelete for MutableText {
         async fn delete_message(
             &self,
             _: &Identifier<Place<Room>>,
@@ -267,7 +273,7 @@ mod tests {
         }
     }
     #[async_trait]
-    impl Reactions for MutableText {
+    impl TextReactions for MutableText {
         async fn add_reaction(
             &self,
             _: &Identifier<Place<Room>>,

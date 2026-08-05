@@ -23,6 +23,7 @@ bitflags = { workspace = true }
 chrono = { workspace = true }
 # Security
 secure-string = "0.3.0"
+sha2 = "0.10.9"
 # Ed25519 identity keypair for the GNS networking cert (key_data) + handshake.
 ed25519-dalek = "2"
 # Random seed for the identity key.

@@ -1,0 +1,17 @@
+[package]
+name = "telegram"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+futures-timer = "3.0.3"
+grammers-client = { version = "0.10.0", default-features = false }
+grammers-session = { version = "0.10.0", default-features = false, features = ["sqlite-storage"] }
+messenger_interface = { path = "../../crate/messenger_interface" }
+secure-string = "0.3.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "sync", "time"] }
+tracing = { workspace = true }

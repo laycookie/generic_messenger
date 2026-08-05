@@ -17,13 +17,22 @@
 //! exhaustive value rather than a loose list). The persisted subset is returned
 //! from [`Messenger::auth`](crate::interface::Messenger::auth) as a
 //! [`Credential`].
+//!
+//! Backends may also expose [`InteractiveAuthMethod`]s. Starting one returns an
+//! [`InteractiveAuthSession`] containing a UI prompt and a future that resolves
+//! to the same backend-neutral [`Credential`] type.
 
-use std::error::Error;
-use std::fmt;
+use std::{error::Error, fmt, future::Future, pin::Pin};
 
 use secure_string::SecureString;
 
 pub use credential_macro::CredentialSchema;
+
+/// Error returned while starting or completing interactive authentication.
+pub type AuthError = Box<dyn Error + Send + Sync>;
+
+/// Owned, sendable authentication future stored behind method descriptors.
+pub type AuthFuture<T> = Pin<Box<dyn Future<Output = Result<T, AuthError>> + Send>>;
 
 /// One collected credential field: a schema-declared `key` (one of the backend's
 /// compile-time field keys) and the value the user supplied. The value is always
@@ -76,6 +85,51 @@ pub struct AuthMethod {
     pub fields: &'static [CredentialFieldSpec],
 }
 
+/// Runtime-generated text encoded into a QR code.
+///
+/// Payload remains opaque to the UI and deliberately omits `Display`; QR login
+/// URLs can authorize a session and must not be written to logs accidentally.
+#[derive(Clone, Eq, PartialEq)]
+pub struct QrPayload(Box<str>);
+
+impl QrPayload {
+    #[must_use]
+    pub fn new(payload: impl Into<Box<str>>) -> Self {
+        Self(payload.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for QrPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("QrPayload([redacted])")
+    }
+}
+
+/// UI presentation produced after an interactive authentication method starts.
+#[derive(Debug)]
+pub enum InteractiveAuthPrompt {
+    QrCode { payload: QrPayload },
+}
+
+/// Live interactive authentication session. Dropping `finish` cancels backend
+/// work owned by its future.
+pub struct InteractiveAuthSession {
+    pub prompt: InteractiveAuthPrompt,
+    pub finish: AuthFuture<Credential>,
+}
+
+/// Backend-provided interactive authentication method.
+#[derive(Clone, Copy)]
+pub struct InteractiveAuthMethod {
+    pub label: &'static str,
+    pub start: fn() -> AuthFuture<InteractiveAuthSession>,
+}
+
 /// Error from parsing a [`Credential`] into a backend's typed schema.
 #[derive(Debug)]
 pub enum CredentialError {
@@ -94,3 +148,16 @@ impl fmt::Display for CredentialError {
 }
 
 impl Error for CredentialError {}
+
+#[cfg(test)]
+mod tests {
+    use super::QrPayload;
+
+    #[test]
+    fn qr_payload_debug_is_redacted() {
+        let debug = format!("{:?}", QrPayload::new("sensitive-payload"));
+
+        assert_eq!(debug, "QrPayload([redacted])");
+        assert!(!debug.contains("sensitive-payload"));
+    }
+}

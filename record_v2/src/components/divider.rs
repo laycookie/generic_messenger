@@ -34,7 +34,7 @@ where
     }
 }
 
-impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer> for Divider<'_, Message>
+impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for Divider<'_, Message>
 where
     Message: Clone,
     Renderer: renderer::Renderer,
@@ -89,37 +89,37 @@ where
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
-        let foo = tree.state.downcast_mut::<State>();
+        let state = tree.state.downcast_mut::<State>();
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerPressed { .. }) => {
                 if let Some(cursor_position) = cursor.position_over(layout.bounds()) {
-                    foo.is_dragging = true;
-                    foo.prev = cursor_position;
+                    state.is_dragging = true;
+                    state.prev = cursor_position;
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-            | Event::Touch(touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. }) => {
-                if foo.is_dragging {
-                    if let Some(on_release) = self.on_release.clone() {
-                        shell.publish(on_release);
-                    }
-                    foo.is_dragging = false;
+            | Event::Touch(touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. })
+                if state.is_dragging =>
+            {
+                if let Some(on_release) = self.on_release.clone() {
+                    shell.publish(on_release);
                 }
+                state.is_dragging = false;
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                if foo.is_dragging {
-                    let delta = position.x - foo.prev.x;
+                if state.is_dragging {
+                    let delta = position.x - state.prev.x;
                     let divider_bound = layout.bounds().x;
                     if (delta < 0.0 && position.x > divider_bound)
                         || (delta > 0.0 && position.x < divider_bound)
                     {
-                        foo.prev = *position;
+                        state.prev = *position;
                         return;
                     }
                     shell.publish((self.on_change)(delta));
                 }
-                foo.prev = *position;
+                state.prev = *position;
             }
             _ => (),
         }

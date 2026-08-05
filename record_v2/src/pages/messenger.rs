@@ -1,13 +1,19 @@
 use std::{error::Error, path::PathBuf};
 
-use crate::audio_controls::{AfxKind, AfxTarget, AudioControls, AudioOp};
+use crate::audio_controls::{AfxTarget, AudioControls, AudioOp};
 use crate::components::divider::Divider;
+use crate::pages::{RemoteVideo, SelectedVideoInput};
 use messenger_unifier::{
     Call, MessengerData, MessengerId, MessengerInterface, MessengerRegistry, PendingSend,
 };
 use simple_audio_channels::{
-    effects_rack::SlotKey,
+    effects::AfxRegistration,
+    effects_rack::{EffectsRack, SlotKey},
     params::{ParamKey, ParamSpec, ParamUnit},
+};
+use simple_video_capture::{
+    CaptureSource, PixelData, ScreenCaptureConfig, ScreenSource, has_screen_capture_permission,
+    request_screen_capture_permission, screen_capture_supported, screen_sources, webcams,
 };
 
 use self::{
@@ -20,10 +26,11 @@ use self::{
 use iced::{
     Alignment, Color, ContentFit, Element, Length, Padding, Task,
     widget::{
-        Button, Column, Responsive, Row, Text, center, column, container, image, mouse_area,
-        opaque, row, slider, stack,
+        Button, Column, Radio, Responsive, Row, Scrollable, Text, center, column, container, image,
+        mouse_area, opaque, row, slider, stack,
     },
 };
+use messenger_interface::interface::{VideoBroadcastKind, VideoResolution, VideoStreamId};
 use messenger_interface::types::{
     Details, House, ID, Identifier, Message as InterfaceMessage, Place, Revision, Room, User,
     VoiceState,
@@ -40,7 +47,7 @@ pub(super) const PLACEHOLDER_PFP: &str = "./public/imgs/placeholder.jpg";
 #[derive(Clone)]
 pub(crate) enum Main {
     Contacts(Contacts),
-    Chat(Chat),
+    Chat(Box<Chat>),
 }
 
 pub struct Messenger {
@@ -51,6 +58,8 @@ pub struct Messenger {
     inspect: Option<Inspect>,
     /// Afx sheet (a live channel's effect chain) shown as a modal, if any.
     afx: Option<AfxSheet>,
+    /// Outgoing camera/screen source picker shown before broadcast starts.
+    video_input_picker: Option<VideoInputPicker>,
 }
 
 impl Messenger {
@@ -61,6 +70,7 @@ impl Messenger {
             pending_counter: ID::MAX,
             inspect: None,
             afx: None,
+            video_input_picker: None,
         }
     }
 
@@ -69,6 +79,154 @@ impl Messenger {
         self.pending_counter = self.pending_counter.wrapping_sub(1);
         id
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_input_defaults_match_content_type() {
+        let camera = default_video_settings(VideoBroadcastKind::Camera);
+        assert_eq!(camera.frames_per_second, 30);
+        assert_eq!(camera.resolution, VideoResolution::new(1280, 720));
+        assert_eq!(camera.bitrate_bps, 1_200_000);
+
+        let screen = default_video_settings(VideoBroadcastKind::Screen);
+        assert_eq!(screen.frames_per_second, 15);
+        assert_eq!(screen.resolution, VideoResolution::new(1280, 720));
+        assert_eq!(screen.bitrate_bps, 1_500_000);
+    }
+}
+
+fn video_capture_details() -> Details {
+    let mut details = Details::default();
+
+    match webcams() {
+        Ok(webcams) => {
+            details.push("Webcams", webcams.len().to_string());
+            for (index, webcam) in webcams.iter().enumerate() {
+                let mut value = format!("{} (ID: {})", webcam.name(), webcam.id());
+                if !webcam.description().is_empty() {
+                    value.push_str(&format!("\nDescription: {}", webcam.description()));
+                }
+                if !webcam.miscellaneous().is_empty() {
+                    value.push_str(&format!("\nBackend data: {}", webcam.miscellaneous()));
+                }
+                details.push(format!("Webcam {}", index + 1), value);
+            }
+        }
+        Err(err) => {
+            details.push("Webcams", format!("Discovery failed: {err}"));
+        }
+    }
+
+    details.push(
+        "Screen support",
+        if screen_capture_supported() {
+            "supported"
+        } else {
+            "not supported"
+        },
+    );
+    details.push(
+        "Screen access",
+        if has_screen_capture_permission() {
+            "granted"
+        } else {
+            "not granted"
+        },
+    );
+
+    let screens = screen_sources();
+    details.push("Screen targets", screens.len().to_string());
+    for (index, screen) in screens.iter().enumerate() {
+        let id = screen
+            .id()
+            .map_or_else(|| "platform default".to_owned(), |id| id.to_string());
+        details.push(
+            format!("Target {}", index + 1),
+            format!("{} ({:?}, ID: {id})", screen.title(), screen.kind()),
+        );
+    }
+
+    if cfg!(target_os = "linux") {
+        details.push(
+            "Linux target",
+            "Concrete screen/window is selected through desktop portal when capture starts.",
+        );
+    }
+
+    details
+}
+
+fn screen_capture_test_details() -> Result<Details, String> {
+    if !screen_capture_supported() {
+        return Err("Screen capture is not supported on this system.".to_owned());
+    }
+    if !has_screen_capture_permission() && !request_screen_capture_permission() {
+        return Err("Screen capture permission was not granted.".to_owned());
+    }
+
+    let source = ScreenSource::platform_default();
+    let mut capture = source
+        .open(ScreenCaptureConfig::default())
+        .map_err(|error| error.to_string())?;
+    let frame = capture.next_frame().map_err(|error| error.to_string())?;
+    capture.stop();
+
+    let (format, bytes) = match &frame.pixel_data {
+        PixelData::Rgba8(data) => ("RGBA8", data.len().to_string()),
+        PixelData::Rgb8(data) => ("RGB8", data.len().to_string()),
+        PixelData::SharedRgba8(data) => ("RGBA8 (shared)", data.len().to_string()),
+        PixelData::SharedRgb8(data) => ("RGB8 (shared)", data.len().to_string()),
+        _ => ("unknown", "unknown".to_owned()),
+    };
+    let mut details = Details::default();
+    details.push("Selection", "accepted");
+    details.push("Resolution", format!("{}x{}", frame.width, frame.height));
+    details.push("Pixel format", format);
+    details.push("Frame bytes", bytes);
+    if cfg!(target_os = "linux") {
+        details.push(
+            "Portal target",
+            "Selected target metadata is not exposed by scap 0.0.8.",
+        );
+    }
+    Ok(details)
+}
+
+fn discover_video_inputs(
+    kind: VideoBroadcastKind,
+) -> (Vec<crate::pages::VideoInputSource>, Option<String>) {
+    let mut inputs = vec![crate::pages::VideoInputSource::CyanTestPattern];
+    let warning = match kind {
+        VideoBroadcastKind::Camera => match webcams() {
+            Ok(webcams) => {
+                inputs.extend(
+                    webcams
+                        .into_iter()
+                        .map(CaptureSource::Webcam)
+                        .map(crate::pages::VideoInputSource::Capture),
+                );
+                None
+            }
+            Err(error) => Some(format!("Webcam discovery failed: {error}")),
+        },
+        VideoBroadcastKind::Screen if !screen_capture_supported() => {
+            Some("Screen capture is not supported on this system.".to_owned())
+        }
+        VideoBroadcastKind::Screen => {
+            inputs.extend(
+                screen_sources()
+                    .into_iter()
+                    .map(CaptureSource::Screen)
+                    .map(crate::pages::VideoInputSource::Capture),
+            );
+            None
+        }
+    };
+    (inputs, warning)
 }
 
 /// The inspect modal: an entity's name/icon plus backend detail fields.
@@ -107,20 +265,23 @@ impl Inspect {
             InspectState::Loaded(details) if details.fields.is_empty() => {
                 Text::new("No details available").into()
             }
-            InspectState::Loaded(details) => {
+            InspectState::Loaded(details) => container(Scrollable::new(
                 Column::from_iter(details.fields.iter().map(|(label, value)| {
                     row![
                         Text::new(label.as_str())
                             .size(13)
                             .width(Length::Fixed(110.0)),
-                        Text::new(value.as_str()),
+                        Text::new(value.as_str()).width(Length::Fill),
                     ]
                     .spacing(8.0)
                     .into()
                 }))
                 .spacing(6.0)
-                .into()
-            }
+                .width(Length::Fill),
+            ))
+            .max_height(320.0)
+            .width(Length::Fill)
+            .into(),
         };
 
         container(
@@ -133,6 +294,153 @@ impl Inspect {
         )
         .padding(18.0)
         .width(Length::Fixed(380.0))
+        .style(container::rounded_box)
+        .into()
+    }
+}
+
+struct VideoInputPicker {
+    call: Call,
+    kind: VideoBroadcastKind,
+    state: VideoInputPickerState,
+    selected_input: Option<usize>,
+    settings: VideoInputSettings,
+}
+
+enum VideoInputPickerState {
+    Loading,
+    Loaded {
+        inputs: Vec<crate::pages::VideoInputSource>,
+        warning: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct VideoInputSettings {
+    frames_per_second: u32,
+    resolution: VideoResolution,
+    bitrate_bps: u32,
+}
+
+const VIDEO_FRAME_RATE_CHOICES: [u32; 6] = [5, 10, 15, 20, 24, 30];
+const VIDEO_RESOLUTION_CHOICES: [VideoResolution; 3] = [
+    VideoResolution::new(640, 360),
+    VideoResolution::new(960, 540),
+    VideoResolution::new(1280, 720),
+];
+const MIN_VIDEO_BITRATE_BPS: u32 = 250_000;
+const MAX_VIDEO_BITRATE_BPS: u32 = 5_000_000;
+const VIDEO_BITRATE_STEP_BPS: u32 = 50_000;
+
+fn default_video_settings(kind: VideoBroadcastKind) -> VideoInputSettings {
+    let (frames_per_second, bitrate_bps) = match kind {
+        VideoBroadcastKind::Camera => (30, 1_200_000),
+        VideoBroadcastKind::Screen => (15, 1_500_000),
+    };
+    VideoInputSettings {
+        frames_per_second,
+        resolution: VideoResolution::new(1280, 720),
+        bitrate_bps,
+    }
+}
+
+impl VideoInputPicker {
+    fn view(&self) -> Element<'_, Message> {
+        let title = match self.kind {
+            VideoBroadcastKind::Camera => "Start camera",
+            VideoBroadcastKind::Screen => "Start screen share",
+        };
+        let body: Element<'_, Message> = match &self.state {
+            VideoInputPickerState::Loading => Text::new("Finding video inputs...").into(),
+            VideoInputPickerState::Loaded { inputs, warning } => {
+                let mut choices =
+                    Column::from_iter(inputs.iter().enumerate().map(|(index, input)| {
+                        Radio::new(
+                            input.label(),
+                            index,
+                            self.selected_input,
+                            Message::SelectVideoInput,
+                        )
+                        .into()
+                    }))
+                    .spacing(6.0)
+                    .width(Length::Fill);
+                if let Some(warning) = warning {
+                    choices = choices.push(
+                        Text::new(warning.as_str())
+                            .size(12)
+                            .color(Color::from_rgb(0.8, 0.4, 0.2)),
+                    );
+                }
+
+                let frame_rates =
+                    Column::from_iter(VIDEO_FRAME_RATE_CHOICES.chunks(3).map(|choices| {
+                        Row::from_iter(choices.iter().copied().map(|frames_per_second| {
+                            Radio::new(
+                                frames_per_second.to_string(),
+                                frames_per_second,
+                                Some(self.settings.frames_per_second),
+                                Message::SetVideoFrameRate,
+                            )
+                            .into()
+                        }))
+                        .spacing(10.0)
+                        .into()
+                    }))
+                    .spacing(6.0);
+                let resolutions =
+                    Row::from_iter(VIDEO_RESOLUTION_CHOICES.into_iter().map(|resolution| {
+                        Radio::new(
+                            format!("{}×{}", resolution.width, resolution.height),
+                            resolution,
+                            Some(self.settings.resolution),
+                            Message::SetVideoResolution,
+                        )
+                        .into()
+                    }))
+                    .spacing(10.0);
+                let mut start = Button::new("Start broadcast").width(Length::Fill);
+                if self.selected_input.is_some() {
+                    start = start.on_press(Message::StartVideo);
+                }
+
+                column![
+                    Text::new("Source").size(14),
+                    container(Scrollable::new(choices))
+                        .max_height(180.0)
+                        .width(Length::Fill),
+                    Text::new("Frames per second").size(14),
+                    frame_rates,
+                    Text::new("Resolution").size(14),
+                    resolutions,
+                    Text::new(format!(
+                        "Bitrate: {} kbps",
+                        self.settings.bitrate_bps / 1_000
+                    ))
+                    .size(14),
+                    slider(
+                        MIN_VIDEO_BITRATE_BPS..=MAX_VIDEO_BITRATE_BPS,
+                        self.settings.bitrate_bps,
+                        Message::SetVideoBitrate,
+                    )
+                    .step(VIDEO_BITRATE_STEP_BPS),
+                    start,
+                ]
+                .spacing(8.0)
+                .into()
+            }
+        };
+
+        container(
+            column![
+                Text::new(title).size(20),
+                body,
+                Button::new("Cancel").on_press(Message::CloseVideoInputPicker),
+            ]
+            .spacing(12.0),
+        )
+        .padding(16.0)
+        .width(Length::Fixed(360.0))
         .style(container::rounded_box)
         .into()
     }
@@ -154,6 +462,7 @@ fn format_param(spec: &ParamSpec, value: f32) -> String {
     }
     match spec.unit {
         ParamUnit::Amplitude => format!("{:.0}%", value * 100.0),
+        ParamUnit::Ratio => format!("{value:.1}:1"),
         ParamUnit::Decibels => format!("{value:.1} dB"),
         ParamUnit::Milliseconds => format!("{value:.0} ms"),
         ParamUnit::Hertz => format!("{value:.0} Hz"),
@@ -210,9 +519,9 @@ impl AfxSheet {
 
                 let add_row = Row::from_iter(
                     std::iter::once(Element::from(Text::new("Add:").size(13))).chain(
-                        AfxKind::ALL.iter().map(|kind| {
-                            Button::new(Text::new(format!("+ {}", kind.name())).size(13))
-                                .on_press(Message::AfxAdd(*kind))
+                        EffectsRack::available_effects().iter().map(|effect| {
+                            Button::new(Text::new(format!("+ {}", effect.name())).size(13))
+                                .on_press(Message::AfxAdd(*effect))
                                 .into()
                         }),
                     ),
@@ -241,6 +550,7 @@ impl AfxSheet {
 
 #[derive(Clone)]
 pub(crate) enum Message {
+    OpenSettings,
     Chat(ChatAction),
     Contacts(ContactsAction),
     Navbar(NavbarAction),
@@ -281,8 +591,21 @@ pub(crate) enum Message {
     /// The inspect sheet fetch resolved.
     InspectLoaded(Result<Details, String>),
     CloseInspect,
+    /// Native capture-source discovery completed for outgoing video.
+    VideoInputsLoaded {
+        kind: VideoBroadcastKind,
+        inputs: Vec<crate::pages::VideoInputSource>,
+        warning: Option<String>,
+    },
+    SelectVideoInput(usize),
+    SetVideoFrameRate(u32),
+    SetVideoResolution(VideoResolution),
+    SetVideoBitrate(u32),
+    /// Start broadcast using every value selected in the single picker.
+    StartVideo,
+    CloseVideoInputPicker,
     /// Add the picked effect to the open afx sheet's channel.
-    AfxAdd(AfxKind),
+    AfxAdd(AfxRegistration),
     /// Remove an effect from the open afx sheet's channel.
     AfxRemove(SlotKey),
     /// A parameter slider in the afx sheet moved.
@@ -308,6 +631,7 @@ pub(crate) enum Message {
 
 pub enum Action {
     None,
+    OpenSettings,
     Run(Task<Message>),
     ModifyMessengerData {
         id: MessengerId,
@@ -322,6 +646,19 @@ pub enum Action {
     SetCallState {
         call: Call,
         state: VoiceState,
+    },
+    /// Toggle the client's own video broadcast of `kind` (camera or screen
+    /// share) for an active call.
+    SetVideo {
+        call: Call,
+        kind: VideoBroadcastKind,
+        enabled: bool,
+        input: Option<SelectedVideoInput>,
+    },
+    /// Start receiving one remote source after an explicit UI action.
+    SubscribeVideo {
+        messenger: MessengerId,
+        stream: VideoStreamId,
     },
     /// An audio edit for the app-owned `AudioControls` (volume, afx chain).
     Audio(AudioOp),
@@ -372,8 +709,56 @@ impl Messenger {
         )
     }
 
+    /// Open capture-source debug sheet and discover native targets off UI path.
+    fn start_inspect_video_capture(&mut self) -> Action {
+        self.inspect = Some(Inspect {
+            title: "Video capture sources".to_owned(),
+            icon: None,
+            state: InspectState::Loading,
+        });
+        Action::Run(
+            Task::future(smol::unblock(video_capture_details))
+                .then(|details| Task::done(Message::InspectLoaded(Ok(details)))),
+        )
+    }
+
+    /// Open native screen selection and report one frame from selected target.
+    fn start_pick_screen_capture(&mut self) -> Action {
+        self.inspect = Some(Inspect {
+            title: "Screen capture picker".to_owned(),
+            icon: None,
+            state: InspectState::Loading,
+        });
+        Action::Run(
+            Task::future(smol::unblock(screen_capture_test_details))
+                .then(|result| Task::done(Message::InspectLoaded(result))),
+        )
+    }
+
+    fn start_video_input_picker(&mut self, call: Call, kind: VideoBroadcastKind) -> Action {
+        self.video_input_picker = Some(VideoInputPicker {
+            call,
+            kind,
+            state: VideoInputPickerState::Loading,
+            selected_input: None,
+            settings: default_video_settings(kind),
+        });
+        Action::Run(
+            Task::future(smol::unblock(move || discover_video_inputs(kind))).then(
+                move |(inputs, warning)| {
+                    Task::done(Message::VideoInputsLoaded {
+                        kind,
+                        inputs,
+                        warning,
+                    })
+                },
+            ),
+        )
+    }
+
     pub(crate) fn update(&mut self, message: Message, messengers: &MessengerRegistry) -> Action {
         match message {
+            Message::OpenSettings => Action::OpenSettings,
             Message::SetSidebarServer(server) => {
                 self.sidebar.server_selected = server;
                 Action::None
@@ -392,9 +777,7 @@ impl Messenger {
             Message::UpdateChat { id, kv } => Action::ModifyMessengerData {
                 id,
                 modify: Box::new(move |data| {
-                    if let Some(room) = data.room_mut(kv.0) {
-                        room.messages = Some(kv.1);
-                    }
+                    data.merge_message_snapshot(kv.0, kv.1);
                 }),
             },
             Message::GuildRoomsLoaded {
@@ -408,6 +791,7 @@ impl Messenger {
                     modify: Box::new(move |data| {
                         if let Some(guild) = data.guilds.iter_mut().find(|g| *g.id() == guild_id) {
                             guild.rooms = Some(rooms);
+                            data.rebuild_room_index();
                         }
                     }),
                 }
@@ -440,16 +824,7 @@ impl Messenger {
             } => Action::ModifyMessengerData {
                 id,
                 modify: Box::new(move |data| {
-                    data.pending_sends.retain(|p| p.pending_id != pending_id);
-
-                    if let Some(room) = data.room_mut(room_id)
-                        && let Some(msgs) = room.messages.as_mut()
-                        && let Some(pending) = msgs.iter_mut().find(|m| *m.id() == pending_id)
-                    {
-                        // Pending message still exists — replace in-place with confirmed
-                        *pending = confirmed;
-                    }
-                    // If pending_id wasn't found, the socket already replaced it — nothing to do
+                    data.confirm_pending_message(room_id, pending_id, confirmed);
                 }),
             },
             Message::RemovePending {
@@ -480,10 +855,97 @@ impl Messenger {
                 self.inspect = None;
                 Action::None
             }
-            Message::AfxAdd(kind) => match &self.afx {
+            Message::VideoInputsLoaded {
+                kind,
+                inputs,
+                warning,
+            } => {
+                if let Some(picker) = &mut self.video_input_picker
+                    && picker.kind == kind
+                {
+                    picker.state = VideoInputPickerState::Loaded { inputs, warning };
+                }
+                Action::None
+            }
+            Message::SelectVideoInput(index) => {
+                let Some(picker) = &mut self.video_input_picker else {
+                    return Action::None;
+                };
+                let VideoInputPickerState::Loaded { inputs, .. } = &picker.state else {
+                    return Action::None;
+                };
+                if index >= inputs.len() {
+                    return Action::None;
+                }
+                picker.selected_input = Some(index);
+                Action::None
+            }
+            Message::SetVideoFrameRate(frames_per_second) => {
+                let Some(picker) = &mut self.video_input_picker else {
+                    return Action::None;
+                };
+                if VIDEO_FRAME_RATE_CHOICES.contains(&frames_per_second) {
+                    picker.settings.frames_per_second = frames_per_second;
+                }
+                Action::None
+            }
+            Message::SetVideoResolution(resolution) => {
+                let Some(picker) = &mut self.video_input_picker else {
+                    return Action::None;
+                };
+                if VIDEO_RESOLUTION_CHOICES.contains(&resolution) {
+                    picker.settings.resolution = resolution;
+                }
+                Action::None
+            }
+            Message::SetVideoBitrate(bitrate_bps) => {
+                let Some(picker) = &mut self.video_input_picker else {
+                    return Action::None;
+                };
+                picker.settings.bitrate_bps =
+                    bitrate_bps.clamp(MIN_VIDEO_BITRATE_BPS, MAX_VIDEO_BITRATE_BPS);
+                Action::None
+            }
+            Message::StartVideo => {
+                let input = {
+                    let Some(picker) = &mut self.video_input_picker else {
+                        return Action::None;
+                    };
+                    let Some(index) = picker.selected_input else {
+                        return Action::None;
+                    };
+                    let VideoInputPickerState::Loaded { inputs, .. } = &mut picker.state else {
+                        return Action::None;
+                    };
+                    if index >= inputs.len() {
+                        return Action::None;
+                    }
+                    inputs.swap_remove(index)
+                };
+                let Some(picker) = self.video_input_picker.take() else {
+                    return Action::None;
+                };
+                Action::SetVideo {
+                    call: picker.call,
+                    kind: picker.kind,
+                    enabled: true,
+                    input: Some(SelectedVideoInput {
+                        source: input,
+                        frames_per_second: picker.settings.frames_per_second,
+                        resolution: picker.settings.resolution,
+                        bitrate_bps: picker.settings.bitrate_bps,
+                        generation: 0,
+                    }),
+                }
+            }
+            Message::CloseVideoInputPicker => {
+                self.video_input_picker = None;
+                Action::None
+            }
+            Message::AfxAdd(effect) => match &self.afx {
                 Some(sheet) => Action::Audio(AudioOp::AddEffect {
                     target: sheet.target,
-                    kind,
+                    effect,
                 }),
                 None => Action::None,
             },
@@ -518,12 +980,7 @@ impl Messenger {
             } => Action::ModifyMessengerData {
                 id,
                 modify: Box::new(move |data| {
-                    if let Some(room) = data.room_mut(room_id)
-                        && let Some(msgs) = room.messages.as_mut()
-                        && let Some(existing) = msgs.iter_mut().find(|m| m.id() == updated.id())
-                    {
-                        *existing = updated;
-                    }
+                    data.update_message(room_id, updated);
                 }),
             },
             Message::ConfirmDelete {
@@ -533,11 +990,7 @@ impl Messenger {
             } => Action::ModifyMessengerData {
                 id,
                 modify: Box::new(move |data| {
-                    if let Some(room) = data.room_mut(room_id)
-                        && let Some(msgs) = room.messages.as_mut()
-                    {
-                        msgs.retain(|m| *m.id() != message_id);
-                    }
+                    data.delete_message(room_id, message_id);
                 }),
             },
             Message::Chat(msg) => {
@@ -582,60 +1035,65 @@ impl Messenger {
                                     },
                                 );
 
-                                Action::Run(Task::batch([
+                                Action::Run(
                                     // Add pending message to the chat store immediately
                                     Task::done(Message::PendingMessage {
                                         id,
                                         room_id,
                                         message: pending_msg,
-                                    }),
-                                    // Fire the async send and handle result
-                                    Task::future({
-                                        let api = interface.api.clone();
-                                        async move {
-                                            let text = api.text().map_err(|e| {
-                                                Box::new(e) as Box<dyn Error + Send + Sync>
-                                            })?;
-                                            let confirmed = text
-                                                .send_message(
-                                                    &room,
-                                                    InterfaceMessage {
-                                                        content: Revision {
-                                                            at: None,
-                                                            text: contents,
-                                                        },
-                                                        history: Vec::new(),
-                                                        reactions: Vec::new(),
-                                                        author: None,
-                                                    },
-                                                )
-                                                .await?;
-                                            Ok(confirmed)
-                                        }
                                     })
-                                    .then(
-                                        move |result: Result<_, Box<dyn Error + Send + Sync>>| {
-                                            match result {
-                                                Ok(confirmed) => {
-                                                    Task::done(Message::ConfirmPending {
-                                                        id,
-                                                        room_id,
-                                                        pending_id,
-                                                        confirmed,
-                                                    })
-                                                }
-                                                Err(e) => {
-                                                    error!("Failed to send message: {e:#?}");
-                                                    Task::done(Message::RemovePending {
-                                                        id,
-                                                        room_id,
-                                                        pending_id,
-                                                    })
-                                                }
+                                    .chain(
+                                        // Fire the async send and handle result
+                                        Task::future({
+                                            let api = interface.api.clone();
+                                            async move {
+                                                let text = api.text().map_err(|e| {
+                                                    Box::new(e) as Box<dyn Error + Send + Sync>
+                                                })?;
+                                                let confirmed = text
+                                                    .send_message(
+                                                        &room,
+                                                        InterfaceMessage {
+                                                            content: Revision {
+                                                                at: None,
+                                                                text: contents,
+                                                            },
+                                                            history: Vec::new(),
+                                                            reactions: Vec::new(),
+                                                            author: None,
+                                                        },
+                                                    )
+                                                    .await?;
+                                                Ok(confirmed)
                                             }
-                                        },
+                                        })
+                                        .then(
+                                            move |result: Result<
+                                                _,
+                                                Box<dyn Error + Send + Sync>,
+                                            >| {
+                                                match result {
+                                                    Ok(confirmed) => {
+                                                        Task::done(Message::ConfirmPending {
+                                                            id,
+                                                            room_id,
+                                                            pending_id,
+                                                            confirmed,
+                                                        })
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Failed to send message: {e:#?}");
+                                                        Task::done(Message::RemovePending {
+                                                            id,
+                                                            room_id,
+                                                            pending_id,
+                                                        })
+                                                    }
+                                                }
+                                            },
+                                        ),
                                     ),
-                                ]))
+                                )
                             }
                             ChatUpdateResult::Edit {
                                 interface,
@@ -845,6 +1303,20 @@ impl Messenger {
             Message::Sidebar(action) => match action {
                 SidebarAction::Disconnect(call) => Action::DisconnectFromCall(call),
                 SidebarAction::SetCallState(call, state) => Action::SetCallState { call, state },
+                SidebarAction::SetVideo(call, kind, enabled) => Action::SetVideo {
+                    call,
+                    kind,
+                    enabled,
+                    input: None,
+                },
+                SidebarAction::PickVideoInput(call, kind) => {
+                    self.start_video_input_picker(call, kind)
+                }
+                SidebarAction::InspectVideoCapture => self.start_inspect_video_capture(),
+                SidebarAction::PickScreenCapture => self.start_pick_screen_capture(),
+                SidebarAction::SubscribeVideo { messenger, stream } => {
+                    Action::SubscribeVideo { messenger, stream }
+                }
                 SidebarAction::SetUserVolume {
                     messenger,
                     user,
@@ -890,17 +1362,17 @@ impl Messenger {
                             .room(*conversation.id())
                             .is_some_and(|room| room.messages.is_some())
                     {
-                        return Action::Run(Task::done(Message::ChangeMain(Main::Chat(
+                        return Action::Run(Task::done(Message::ChangeMain(Main::Chat(Box::new(
                             Chat::new(interface.clone(), conversation),
-                        ))));
+                        )))));
                     }
 
                     // Otherwise fetch
                     Action::Run(Task::batch([
-                        Task::done(Message::ChangeMain(Main::Chat(Chat::new(
+                        Task::done(Message::ChangeMain(Main::Chat(Box::new(Chat::new(
                             interface.clone(),
                             conversation.clone(),
-                        )))),
+                        ))))),
                         Task::future({
                             let interface = interface.clone();
                             async move {
@@ -942,26 +1414,35 @@ impl Messenger {
         &'a self,
         messengers: &'a MessengerRegistry,
         audio: &'a AudioControls,
+        remote_video: &'a RemoteVideo,
     ) -> iced::Element<'a, Message> {
-        let profiles = row![Text::from(
-            messengers
-                .iter()
-                .next()
-                .map(|(_, entry)| {
-                    entry
-                        .data
-                        .profile
-                        .as_ref()
-                        .map(|p| p.name.as_str())
-                        .unwrap_or("No connection made?")
-                })
-                .unwrap_or("No messengers connected")
-        )];
+        let profiles = row![
+            Text::from(
+                messengers
+                    .iter()
+                    .next()
+                    .map(|(_, entry)| {
+                        entry
+                            .data
+                            .profile
+                            .as_ref()
+                            .map(|p| p.name.as_str())
+                            .unwrap_or("No connection made?")
+                    })
+                    .unwrap_or("No messengers connected")
+            ),
+            iced::widget::Space::new().width(Length::Fill),
+            Button::new("Settings").on_press(Message::OpenSettings),
+        ]
+        .align_y(Alignment::Center);
 
         let navbar = Navbar::get_element(messengers).map(Message::Navbar);
 
         let window = Responsive::new(move |size| {
-            let sidebar = self.sidebar.view(messengers, audio).map(Message::Sidebar);
+            let sidebar = self
+                .sidebar
+                .view(messengers, audio, remote_video)
+                .map(Message::Sidebar);
 
             let main = match &self.main {
                 Main::Contacts(contacts) => contacts.get_element(messengers).map(Message::Contacts),
@@ -978,14 +1459,17 @@ impl Messenger {
         let base = Element::from(column![profiles, row![navbar, window]]);
 
         // Modals: dimmed backdrop closes on click, the card itself swallows
-        // clicks. Inspect wins if both are somehow open.
-        let (card, close): (Element<'a, Message>, Message) = if let Some(inspect) = &self.inspect {
-            (inspect.view(), Message::CloseInspect)
-        } else if let Some(afx) = &self.afx {
-            (afx.view(audio), Message::CloseAfx)
-        } else {
-            return base;
-        };
+        // clicks. Source selection wins if multiple sheets are somehow open.
+        let (card, close): (Element<'a, Message>, Message) =
+            if let Some(picker) = &self.video_input_picker {
+                (picker.view(), Message::CloseVideoInputPicker)
+            } else if let Some(inspect) = &self.inspect {
+                (inspect.view(), Message::CloseInspect)
+            } else if let Some(afx) = &self.afx {
+                (afx.view(audio), Message::CloseAfx)
+            } else {
+                return base;
+            };
         stack![
             base,
             opaque(

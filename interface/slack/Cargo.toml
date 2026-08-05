@@ -1,0 +1,17 @@
+[package]
+name = "slack"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+facet = { workspace = true }
+facet-json = { workspace = true }
+futures = { workspace = true }
+messenger_downloader = { path = "../../crate/messenger_downloader" }
+messenger_interface = { path = "../../crate/messenger_interface" }
+percent-encoding = "2"
+secure-string = "0.3.0"
+surf = "2.3.2"

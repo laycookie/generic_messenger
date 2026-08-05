@@ -8,7 +8,7 @@ use messenger_interface::types::{
 };
 use tracing::debug;
 
-use crate::components::message_text::{PENDING_ID_THRESHOLD, message_text};
+use crate::components::message_text::message_text;
 use messenger_unifier::{MessengerInterface, MessengerRegistry};
 
 /// Cap on emoji shown at once in the picker grid; the full Unicode set is
@@ -85,7 +85,14 @@ pub struct Chat {
     custom_emojis: Option<Vec<Emoji>>,
     /// Stickers sendable in this room; loaded alongside `custom_emojis`.
     stickers: Option<Vec<Sticker>>,
+    /// Bound widget construction for long-lived rooms. Users can expand the
+    /// window in chunks without paying to rebuild every loaded message on
+    /// every keystroke or media frame.
+    visible_message_limit: usize,
 }
+
+const INITIAL_VISIBLE_MESSAGES: usize = 200;
+const VISIBLE_MESSAGE_CHUNK: usize = 200;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -126,6 +133,8 @@ pub enum Message {
         emojis: Vec<Emoji>,
         stickers: Vec<Sticker>,
     },
+    ShowOlder,
+    OpenLink(String),
 }
 
 #[derive(Clone)]
@@ -237,6 +246,7 @@ impl Chat {
             picker: None,
             custom_emojis: None,
             stickers: None,
+            visible_message_limit: INITIAL_VISIBLE_MESSAGES,
         }
     }
 
@@ -246,16 +256,20 @@ impl Chat {
         let room = self.room.clone();
         Task::future(async move {
             let (emojis, stickers) = match api.text() {
-                Ok(text) => (
-                    text.pickable_emojis(&room).await.unwrap_or_else(|e| {
-                        debug!("No custom emoji palette: {e}");
-                        Vec::new()
-                    }),
-                    text.pickable_stickers(&room).await.unwrap_or_else(|e| {
-                        debug!("No sticker palette: {e}");
-                        Vec::new()
-                    }),
-                ),
+                Ok(text) => {
+                    let (emojis, stickers) =
+                        futures::join!(text.pickable_emojis(&room), text.pickable_stickers(&room));
+                    (
+                        emojis.unwrap_or_else(|e| {
+                            debug!("No custom emoji palette: {e}");
+                            Vec::new()
+                        }),
+                        stickers.unwrap_or_else(|e| {
+                            debug!("No sticker palette: {e}");
+                            Vec::new()
+                        }),
+                    )
+                }
                 Err(_) => (Vec::new(), Vec::new()),
             };
             Message::PaletteLoaded { emojis, stickers }
@@ -434,73 +448,96 @@ impl Chat {
             );
         }
 
-        let messages = messengers
-            .data(self.interface.id)
+        let data = messengers.data(self.interface.id);
+        let room_id = *self.room.id();
+        let messages = data
             .and_then(|d| d.room(*self.room.id()))
             .and_then(|room| room.messages.as_ref())
             .or_else(|| self.room.messages.as_ref());
 
-        let client_id = messengers
-            .data(self.interface.id)
-            .and_then(|d| d.profile.as_ref())
-            .map(|p| *p.id());
+        let client_id = data.and_then(|d| d.profile.as_ref()).map(|p| *p.id());
+        let pending_sends = data.map(|data| data.pending_sends.as_slice());
 
         let can_edit = self.interface.edit.is_some();
         let can_delete = self.interface.delete.is_some();
         let can_react = self.interface.reactions.is_some();
 
         let chat = Scrollable::new(match messages {
-            Some(messages) => messages
-                .iter()
-                .map(|msg| {
-                    let rendered = message_text(
-                        msg,
-                        |msg, emoji, reacted| {
-                            Action::Message(Message::ToggleReaction {
-                                message_id: *msg.id(),
-                                emoji: emoji.to_owned(),
-                                reacted,
+            Some(messages) => {
+                let hidden = messages.len().saturating_sub(self.visible_message_limit);
+                let messages = messages
+                    .iter()
+                    .skip(hidden)
+                    .map(|msg| {
+                        let pending = pending_sends.is_some_and(|pending_sends| {
+                            pending_sends.iter().any(|pending_send| {
+                                pending_send.room_id == room_id
+                                    && pending_send.pending_id == *msg.id()
                             })
-                        },
-                        |author| Action::Message(Message::InspectUser(author.clone())),
-                    );
+                        });
+                        let rendered = message_text(
+                            msg,
+                            pending,
+                            |msg, emoji, reacted| {
+                                Action::Message(Message::ToggleReaction {
+                                    message_id: *msg.id(),
+                                    emoji: emoji.to_owned(),
+                                    reacted,
+                                })
+                            },
+                            |author| Action::Message(Message::InspectUser(author.clone())),
+                            |href| Action::Message(Message::OpenLink(href.to_owned())),
+                        );
 
-                    let own = client_id.is_some_and(|client_id| {
-                        msg.author.as_ref().is_some_and(|a| *a.id() == client_id)
+                        let own = client_id.is_some_and(|client_id| {
+                            msg.author.as_ref().is_some_and(|a| *a.id() == client_id)
+                        });
+                        let can_edit = own && can_edit;
+                        let can_delete = own && can_delete;
+                        if pending || !(can_react || can_edit || can_delete) {
+                            return rendered;
+                        }
+
+                        let message_id = *msg.id();
+                        let mut actions = row![rendered].spacing(4.0);
+                        if can_react {
+                            actions = actions.push(
+                                Button::new(Text::new("React").size(12))
+                                    .on_press(Action::Message(Message::StartReact { message_id })),
+                            );
+                        }
+                        if can_edit {
+                            actions =
+                                actions.push(Button::new(Text::new("Edit").size(12)).on_press(
+                                    Action::Message(Message::StartEdit {
+                                        message_id,
+                                        current: msg.content.text.to_plain(),
+                                    }),
+                                ));
+                        }
+                        if can_delete {
+                            actions = actions.push(
+                                Button::new(Text::new("Delete").size(12))
+                                    .on_press(Action::Message(Message::Delete { message_id })),
+                            );
+                        }
+                        actions.into()
+                    })
+                    .fold(Column::new().spacing(15.0), |column, widget| {
+                        column.push(widget)
                     });
-                    let can_edit = own && can_edit;
-                    let can_delete = own && can_delete;
-                    if *msg.id() >= PENDING_ID_THRESHOLD || !(can_react || can_edit || can_delete) {
-                        return rendered;
-                    }
-
-                    let message_id = *msg.id();
-                    let mut actions = row![rendered].spacing(4.0);
-                    if can_react {
-                        actions = actions.push(
-                            Button::new(Text::new("React").size(12))
-                                .on_press(Action::Message(Message::StartReact { message_id })),
-                        );
-                    }
-                    if can_edit {
-                        actions = actions.push(Button::new(Text::new("Edit").size(12)).on_press(
-                            Action::Message(Message::StartEdit {
-                                message_id,
-                                current: msg.content.text.to_plain(),
-                            }),
-                        ));
-                    }
-                    if can_delete {
-                        actions = actions.push(
-                            Button::new(Text::new("Delete").size(12))
-                                .on_press(Action::Message(Message::Delete { message_id })),
-                        );
-                    }
-                    actions.into()
-                })
-                .fold(Column::new().spacing(15.0), |column, widget| {
-                    column.push(widget)
-                }),
+                if hidden == 0 {
+                    messages
+                } else {
+                    Column::new()
+                        .spacing(15.0)
+                        .push(
+                            Button::new(Text::new(format!("Show {hidden} older loaded messages")))
+                                .on_press(Action::Message(Message::ShowOlder)),
+                        )
+                        .push(messages)
+                }
+            }
             None => Column::new(),
         })
         .anchor_bottom()
@@ -690,8 +727,45 @@ impl Chat {
                 self.stickers = Some(stickers);
                 UpdateResult::Task(Task::none())
             }
+            Message::ShowOlder => {
+                self.visible_message_limit = self
+                    .visible_message_limit
+                    .saturating_add(VISIBLE_MESSAGE_CHUNK);
+                UpdateResult::Task(Task::none())
+            }
+            Message::OpenLink(href) => {
+                if let Err(error) = open_external_link(&href) {
+                    debug!("Could not open message link: {error}");
+                }
+                UpdateResult::Task(Task::none())
+            }
         }
     }
+}
+
+/// Launch an untrusted message link without a shell. Restrict schemes so
+/// backend text cannot invoke local file/application handlers.
+fn open_external_link(href: &str) -> Result<(), String> {
+    let lower = href.to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        return Err("only http/https links are allowed".to_owned());
+    }
+
+    #[cfg(target_os = "windows")]
+    let child = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", href])
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let child = std::process::Command::new("open").arg(href).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let child = std::process::Command::new("xdg-open").arg(href).spawn();
+    #[cfg(not(any(unix, target_os = "windows")))]
+    let child: std::io::Result<std::process::Child> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "link opening is unsupported on this platform",
+    ));
+
+    child.map(|_| ()).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

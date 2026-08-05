@@ -7,6 +7,7 @@ LoginInfo
 /.cursor
 # Claude Code: ignore local state, keep shared caveman config
 /.claude/*
+/.agents/*
 !/.claude/settings.json
 !/.claude/skills/
 !/.claude/skills/**
@@ -17,4 +18,5 @@ Cargo.lock
 # not in the flake.nix
 # flake.lock 
 
+/.devenv/
 .direnv

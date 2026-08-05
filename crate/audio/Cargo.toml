@@ -6,11 +6,28 @@ description = "Simple audio mixer"
 license = "GPL-2.0-only"
 repository = "https://github.com/laycookie/generic_messenger"
 
+[features]
+default = []
+bench-internals = []
+
 [dependencies]
 tracing = { workspace = true }
 asyncs-sync = { workspace = true }
 simple-audio-channels-macro = { path = "macro" }
 ringbuf = "0.4.8"
+crossbeam-queue = "0.3.13"
 # async-broadcast = "0.7.2"
 cpal = "0.17.3"
 fundsp = { version = "0.23.0", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "effects"
+harness = false
+
+[[bench]]
+name = "simd_kernels"
+harness = false
+required-features = ["bench-internals"]

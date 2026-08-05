@@ -1,13 +1,13 @@
-//! Steam voice calls — the `Voice` capability.
+//! Steam voice calls — the `Audio` capability.
 //!
 //! # Pipeline
 //!
-//! [`connect`](Voice::connect) joins the Steam voice session
+//! [`connect`](Audio::connect) joins the Steam voice session
 //! (`ChatRoom.JoinVoiceChat`, group rooms only), brings up a media
 //! [`VoiceTransport`](crate::gns::transport::VoiceTransport), then spawns the
 //! per-call audio session ([`SteamAudioSession`]) and hands its `AudioEvent`
 //! stream to the UI as [`VoiceEvent::CallStreamReady`] through the
-//! [`listen`](Voice::listen) stream. The UI attaches the mic and per-speaker
+//! [`listen`](Audio::listen) stream. The UI attaches the mic and per-speaker
 //! playback channels; the session bridges them to Opus over the transport. The
 //! full media plane — mic → Opus → transport → Opus → playback — is implemented
 //! and runs for real.
@@ -41,7 +41,7 @@ use steam_vent_proto::steammessages_chat_steamclient::{
 };
 use tracing::{info, warn};
 
-use messenger_interface::interface::{CallStatus, Voice, VoiceEvent, WeakSocketStream};
+use messenger_interface::interface::{Audio, CallStatus, VoiceEvent, WeakSocketStream};
 use messenger_interface::types::{Identifier, Place, Room};
 
 use crate::SteamMessenger;
@@ -51,20 +51,17 @@ use crate::gns::call::{SteamAudioSession, VoiceEventStream};
 use crate::gns::transport::{LoopbackTransport, VoiceTransport};
 use crate::session::Connected;
 
-/// Resolve a UI room identifier to its Steam location. Mirrors the fallback the
-/// `Text` impl uses: an unmapped room id is a friend DM whose id *is* the
-/// SteamID. (See `query.rs`'s `get_messages`/`send_message`.)
+/// Resolve only room identifiers registered by this live Steam session.
+/// Unknown ids must not be interpreted as user SteamIDs: a stale or colliding
+/// group-room hash could otherwise target an unrelated direct conversation.
 fn resolve_room_location(
     connected: &Connected,
     location: &Identifier<Place<Room>>,
-) -> ChatRoomLocation {
+) -> Option<ChatRoomLocation> {
     connected
         .chat_room_locations
         .get(location.id())
         .map(|location| *location)
-        .unwrap_or(ChatRoomLocation::Direct {
-            steamid: *location.id(),
-        })
 }
 
 impl SteamMessenger {
@@ -130,7 +127,10 @@ impl SteamMessenger {
         match self.voice_events.lock().unwrap().as_ref() {
             Some(sender) => {
                 if sender
-                    .unbounded_send(VoiceEvent::CallStreamReady(stream))
+                    .unbounded_send(VoiceEvent::CallStreamReady {
+                        room: Identifier::new(*location.id(), ()),
+                        stream,
+                    })
                     .is_err()
                 {
                     warn!("Steam: no voice listener; call audio has no sink");
@@ -143,14 +143,21 @@ impl SteamMessenger {
 }
 
 #[async_trait]
-impl Voice for SteamMessenger {
+impl Audio for SteamMessenger {
     async fn connect(
         &self,
         location: &Identifier<Place<Room>>,
     ) -> Result<CallStatus, Box<dyn Error + Sync + Send>> {
         let connected = self.connected().await?;
 
-        match resolve_room_location(&connected, location) {
+        let room_location = resolve_room_location(&connected, location).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Steam: unknown room id {}", location.id()),
+            )
+        })?;
+
+        match room_location {
             ChatRoomLocation::Group {
                 chat_group_id,
                 chat_id,
@@ -210,7 +217,15 @@ impl Voice for SteamMessenger {
             }
         };
 
-        match resolve_room_location(&connected, location) {
+        let Some(room_location) = resolve_room_location(&connected, location) else {
+            warn!(
+                room_id = *location.id(),
+                "Steam: unknown room during voice disconnect"
+            );
+            return;
+        };
+
+        match room_location {
             ChatRoomLocation::Group {
                 chat_group_id,
                 chat_id,

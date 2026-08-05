@@ -23,6 +23,13 @@ impl MuteSwitch {
     pub fn get(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
+
+    /// Whether an effect rack still owns another handle to this switch.
+    /// Control registries use this to prune handles after their audio channel
+    /// disappears without adding callbacks to realtime code.
+    pub fn is_attached(&self) -> bool {
+        Arc::strong_count(&self.0) > 1
+    }
 }
 
 /// Paramless rack effect controlled by a [`MuteSwitch`].

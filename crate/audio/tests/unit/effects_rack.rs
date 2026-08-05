@@ -1,5 +1,5 @@
 use super::*;
-use crate::effects::{Gain, Gate};
+use crate::effects::{Compressor, Gain, Gate};
 use crate::params::AfxParams;
 use crate::{SampleFormat, SampleRate};
 use std::sync::{Arc, Mutex};
@@ -51,6 +51,28 @@ fn format() -> StreamFormat {
 
 fn first_param(rack: &EffectsRack) -> ParamState {
     rack.snapshot()[0].params().next().unwrap()
+}
+
+#[test]
+fn registered_effects_are_discoverable_and_insertable() {
+    let registrations = EffectsRack::available_effects();
+    let names: Vec<_> = registrations.iter().map(|effect| effect.name()).collect();
+    assert_eq!(
+        names,
+        ["Gate", "Gain", "Low cut", "Compressor", "Normalizer"]
+    );
+
+    let compressor = registrations
+        .iter()
+        .copied()
+        .find(|effect| effect.name() == Compressor::NAME)
+        .unwrap();
+    let (mut rack, _backend) = EffectsRack::new();
+    rack.insert_registered(compressor);
+
+    let slots = rack.snapshot();
+    assert_eq!(slots[0].name, Compressor::NAME);
+    assert_eq!(slots[0].specs[0].key, Compressor::THRESHOLD_DB);
 }
 
 #[test]
@@ -155,6 +177,36 @@ fn set_param_reaches_the_effect_and_clamps() {
     rack.set_param(id, ParamKey(7), 1.0);
     rack.set_param(id + 1, param.spec.key, 1.0);
     assert_eq!(first_param(&rack).value, param.spec.max);
+}
+
+#[test]
+fn rapid_parameter_updates_coalesce_without_queue_growth() {
+    let (mut rack, mut backend) = EffectsRack::new();
+    let id = rack.insert(Box::new(Gain::with_multiplier(1.0)));
+    backend.prepare(format());
+    let key = first_param(&rack).spec.key;
+
+    for index in 0..10_000 {
+        rack.set_param(id, key, index as f32 / 10_000.0);
+    }
+    let expected = first_param(&rack).value;
+
+    let mut audio = [1.0; 48];
+    for _ in 0..400 {
+        audio.fill(1.0);
+        backend.apply(&mut audio);
+    }
+    assert!(audio.iter().all(|sample| (*sample - expected).abs() < 1e-4));
+}
+
+#[test]
+fn structural_edits_past_old_channel_capacity_never_block_or_drop() {
+    let (mut rack, mut backend) = EffectsRack::new();
+    for _ in 0..128 {
+        rack.insert(Box::new(Gain::with_multiplier(1.0)));
+    }
+    backend.prepare(format());
+    assert_eq!(backend.slots.len(), 128);
 }
 
 #[test]

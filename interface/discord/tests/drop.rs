@@ -14,7 +14,8 @@ fn token_credential(token: String) -> Credential {
 #[test]
 fn messenger_drop_frees_memory() {
     let Some(token) = token() else {
-        panic!("SKIPPED: Token wasn't provided");
+        eprintln!("skipped: DISCORD_TOKEN wasn't provided");
+        return;
     };
     let messenger = smol::block_on(Discord::create_messenger(token_credential(token))).unwrap();
     let weak = Arc::downgrade(&messenger);
@@ -27,7 +28,8 @@ fn messenger_drop_frees_memory() {
 #[test]
 fn messenger_drop_frees_streams() {
     let Some(token) = token() else {
-        panic!("SKIPPED: Token wasn't provided");
+        eprintln!("skipped: DISCORD_TOKEN wasn't provided");
+        return;
     };
     smol::block_on(async {
         let messenger = Discord::create_messenger(token_credential(token))
@@ -37,7 +39,7 @@ fn messenger_drop_frees_streams() {
 
         let q = messenger.clone().arc_query().unwrap();
         let t = messenger.clone().arc_text().unwrap();
-        let v = messenger.clone().arc_voice().unwrap();
+        let v = messenger.clone().arc_audio().unwrap();
 
         let _q_stream = q.listen().await.unwrap();
         let _t_stream = t.listen().await.unwrap();

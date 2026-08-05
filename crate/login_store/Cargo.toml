@@ -7,3 +7,4 @@ publish = false
 [dependencies]
 messenger_interface = { path = "../messenger_interface" }
 secure-string = "0.3.0"
+tempfile = "3"

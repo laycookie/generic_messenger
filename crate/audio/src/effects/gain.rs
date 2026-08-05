@@ -1,6 +1,7 @@
 use crate::{
     AudioSampleType, StreamFormat,
     params::{AfxParams, ParamUnit},
+    simd,
 };
 
 use super::Afx;
@@ -19,6 +20,8 @@ pub struct Gain {
     pub desired_multiplier: f32,
     /// Smoothed multiplier currently being applied to samples.
     current_multiplier: AudioSampleType,
+    smoothing_sample_rate: u32,
+    smoothing_coefficient: AudioSampleType,
 }
 
 impl Gain {
@@ -31,6 +34,26 @@ impl Gain {
         Gain {
             desired_multiplier,
             current_multiplier: desired_multiplier,
+            smoothing_sample_rate: 0,
+            smoothing_coefficient: 1.0,
+        }
+    }
+
+    fn smoothing_coefficient(sample_rate: u32) -> AudioSampleType {
+        // One-pole coefficient reaching ~63% of a step over the smoothing
+        // window; a window of one frame or less is instantaneous.
+        let frames = Self::SMOOTHING_MS / 1000.0 * sample_rate as AudioSampleType;
+        if frames <= 1.0 {
+            1.0
+        } else {
+            1.0 - (-1.0 / frames).exp()
+        }
+    }
+
+    fn prepare_smoothing(&mut self, sample_rate: u32) {
+        if self.smoothing_sample_rate != sample_rate {
+            self.smoothing_sample_rate = sample_rate;
+            self.smoothing_coefficient = Self::smoothing_coefficient(sample_rate);
         }
     }
 }
@@ -46,29 +69,24 @@ impl Afx for Gain {
         Gain::NAME
     }
 
+    fn prepare(&mut self, format: StreamFormat) {
+        self.prepare_smoothing(format.sample_rate);
+    }
+
     fn apply_to(&mut self, format: StreamFormat, audio: &mut [AudioSampleType]) -> bool {
         let channels = (format.channels as usize).max(1);
-        // One-pole coefficient reaching ~63% of a step over the smoothing
-        // window; a window of one frame or less is instantaneous.
-        let frames = Self::SMOOTHING_MS / 1000.0 * format.sample_rate as AudioSampleType;
-        let coef = if frames <= 1.0 {
-            1.0
-        } else {
-            1.0 - (-1.0 / frames).exp()
-        };
-
         let target = self.desired_multiplier.max(0.0);
         if target == self.current_multiplier {
             if self.current_multiplier != 1.0 {
-                for sample in audio.iter_mut() {
-                    *sample *= self.current_multiplier;
-                }
+                simd::multiply(audio, self.current_multiplier);
             }
             return true;
         }
+        self.prepare_smoothing(format.sample_rate);
+        let coefficient = self.smoothing_coefficient;
 
         for frame in audio.chunks_mut(channels) {
-            self.current_multiplier += (target - self.current_multiplier) * coef;
+            self.current_multiplier += (target - self.current_multiplier) * coefficient;
             for sample in frame.iter_mut() {
                 *sample *= self.current_multiplier;
             }

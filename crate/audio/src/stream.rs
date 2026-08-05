@@ -11,13 +11,15 @@ use cpal::{SupportedStreamConfig, traits::StreamTrait as _};
 use ringbuf::{CachingCons, CachingProd, StaticRb, traits::Split as _};
 use tracing::{debug, warn};
 
-use crate::{MIX_SCRATCH_LEN, Notify};
+use crate::{MAX_AUDIO_CHANNELS, MIX_SCRATCH_LEN, Notify};
+
+const EVENT_CAPACITY: usize = MAX_AUDIO_CHANNELS;
 
 /// Producer/consumer ends of the channel-event ring: control-thread → audio-thread
 /// messages that hand a newly created channel to an already-running stream. Eight
 /// slots is ample; channels are added rarely and drained every callback.
-pub(crate) type EventProd<E> = CachingProd<Arc<StaticRb<E, 8>>>;
-pub(crate) type EventCons<E> = CachingCons<Arc<StaticRb<E, 8>>>;
+pub(crate) type EventProd<E> = CachingProd<Arc<StaticRb<E, EVENT_CAPACITY>>>;
+pub(crate) type EventCons<E> = CachingCons<Arc<StaticRb<E, EVENT_CAPACITY>>>;
 
 /// A running stream and the live wiring to it: the kept-alive `cpal::Stream`,
 /// the producer end of the channel-event ring, and the close notification.
@@ -57,9 +59,12 @@ impl<E> Master<E> {
     }
 
     /// Tear down the running stream. Channels survive; a later [`start`](Self::start)
-    /// adopts them again.
+    /// adopts them again. Wake lifecycle waiter before dropping handle so an
+    /// explicit Settings restart cannot leave one pending task per attempt.
     pub(crate) fn stop(&mut self) {
-        self.stream = None;
+        if let Some(stream) = self.stream.take() {
+            stream.close_notify.notify_one();
+        }
     }
 
     /// Start a stream over this device's preferred config. `build` turns the
@@ -90,7 +95,7 @@ impl<E> Master<E> {
             "Starting {direction} stream with config {stream_config:?}, format {sample_format:?}"
         );
 
-        let (event_prod, event_cons) = StaticRb::<E, 8>::default().split();
+        let (event_prod, event_cons) = StaticRb::<E, EVENT_CAPACITY>::default().split();
         let close_notify = Arc::new(Notify::new());
 
         let stream = build(
@@ -148,16 +153,18 @@ pub(crate) fn update_presence(any_channels: bool, had_channels: &mut bool, close
 
 /// Monomorphise a typed stream builder over cpal's runtime [`cpal::SampleFormat`],
 /// mapping the per-type build error into `Box<dyn Error>`. Centralises the
-/// ten-arm dispatch both directions would otherwise spell out by hand.
+/// twelve-arm dispatch both directions would otherwise spell out by hand.
 macro_rules! for_each_sample_format {
     ($fmt:expr, $build:ident $(, $arg:expr)* $(,)?) => {{
         match $fmt {
             ::cpal::SampleFormat::I8 => $build::<i8>($($arg),*).map_err(::core::convert::Into::into),
             ::cpal::SampleFormat::I16 => $build::<i16>($($arg),*).map_err(::core::convert::Into::into),
+            ::cpal::SampleFormat::I24 => $build::<::cpal::I24>($($arg),*).map_err(::core::convert::Into::into),
             ::cpal::SampleFormat::I32 => $build::<i32>($($arg),*).map_err(::core::convert::Into::into),
             ::cpal::SampleFormat::I64 => $build::<i64>($($arg),*).map_err(::core::convert::Into::into),
             ::cpal::SampleFormat::U8 => $build::<u8>($($arg),*).map_err(::core::convert::Into::into),
             ::cpal::SampleFormat::U16 => $build::<u16>($($arg),*).map_err(::core::convert::Into::into),
+            ::cpal::SampleFormat::U24 => $build::<::cpal::U24>($($arg),*).map_err(::core::convert::Into::into),
             ::cpal::SampleFormat::U32 => $build::<u32>($($arg),*).map_err(::core::convert::Into::into),
             ::cpal::SampleFormat::U64 => $build::<u64>($($arg),*).map_err(::core::convert::Into::into),
             ::cpal::SampleFormat::F32 => $build::<f32>($($arg),*).map_err(::core::convert::Into::into),

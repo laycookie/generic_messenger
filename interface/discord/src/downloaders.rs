@@ -4,7 +4,7 @@ use messenger_downloader::DownloadResult;
 pub(crate) use messenger_downloader::{Body, Cached, Fetch, Fresh};
 use messenger_interface::types::CacheCategory;
 
-use crate::{INTERFACE_NAME, api_types::SNOWFLAKE};
+use crate::{INTERFACE_NAME, api::SNOWFLAKE};
 
 const IMG_EXT: &str = "webp";
 const DISCORD_CDN: &str = "https://cdn.discordapp.com";
@@ -13,6 +13,8 @@ const DISCORD_CDN: &str = "https://cdn.discordapp.com";
 /// segment. Each variant owns enough to derive its CDN URL, cache filename, and
 /// [`CacheCategory`], so all of that construction lives here rather than being
 /// duplicated at call sites.
+///
+/// <https://docs.discord.food/reference#cdn-endpoints>
 pub(crate) enum CdnImage {
     Avatar { user: SNOWFLAKE, hash: String },
     GuildIcon { guild: SNOWFLAKE, hash: String },
@@ -108,7 +110,7 @@ impl CdnImage {
         Fetch::<Cached>::cached_fetch(
             INTERFACE_NAME,
             || surf::get(&url),
-            Vec::new(),
+            [] as [(&str, &str); 0],
             self.category(),
             &file_name,
         )

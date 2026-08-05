@@ -1,0 +1,27 @@
+[package]
+name = "simple-video"
+version = "0.0.1"
+edition = "2024"
+description = "Video frames, latest-frame channels, and codec wrappers"
+license = "GPL-2.0-only"
+repository = "https://github.com/laycookie/generic_messenger"
+
+[features]
+default = []
+av1 = ["dep:rav1e"]
+h264 = ["dep:openh264"]
+bench-internals = ["av1"]
+
+[dependencies]
+futures = { workspace = true }
+openh264 = { version = "0.9.7", optional = true }
+rav1e = { version = "0.8.1", default-features = false, features = ["threading"], optional = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "simd_conversions"
+harness = false
+required-features = ["bench-internals"]

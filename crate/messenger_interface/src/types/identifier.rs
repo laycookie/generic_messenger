@@ -2,7 +2,15 @@
 
 use std::ops::{Deref, DerefMut};
 
-/// Unique identifier type used throughout the messenger interface.
+/// Compact identifier supplied by one backend implementation.
+///
+/// Scope is **one live messenger instance plus one entity namespace**. It is
+/// not globally unique: adapters may hash native string/tuple ids into this
+/// representation, and equal values from different backends are unrelated.
+/// Cross-backend collections must pair it with the host's messenger handle
+/// (for example `messenger_unifier::ScopedId<K>`). Each adapter owns its native
+/// id hashing and must keep routing data private; unified models never clone
+/// native identifiers merely to establish scope.
 pub type ID = u64;
 
 /// A type-safe identifier that pairs a unique ID with associated data.

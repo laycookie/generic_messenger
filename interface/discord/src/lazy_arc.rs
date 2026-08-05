@@ -3,6 +3,9 @@ use std::{ops::Deref, sync::Arc};
 use arc_swap::ArcSwapOption;
 use futures::lock::Mutex as AsyncMutex;
 
+// TODO: Replace this later with some sort of optimized read-write lock, note
+// that default rust RwLock might not be the best fit
+
 /// `ArcSwapOption<T>` paired with an async init lock. Reads stay lock-free
 /// via `Deref` to the inner swap; `get_or_try_init` serializes construction
 /// so concurrent callers don't each build a `T` and race the final `store`.

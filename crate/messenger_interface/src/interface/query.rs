@@ -5,20 +5,14 @@ use std::{error::Error, sync::Arc};
 use async_trait::async_trait;
 
 use super::MessengerError;
-use super::caster::capability_caster;
 use crate::stream::WeakSocketStream;
 use crate::types::{Details, House, ID, Identifier, Place, Room, User, UserStatus};
-
-capability_caster!(
-    /// Capability: fetching user presence/status indicators.
-    QueryCasterUserStatuses: Query => UserStatuses { statuses, arc_statuses }
-);
 
 /// Query-only API for fetching state from a messenger.
 ///
 /// This is intentionally read-only; mutations belong in more specialized traits.
 #[async_trait]
-pub trait Query: Send + Sync + QueryCasterUserStatuses {
+pub trait Query: Send + Sync {
     /// Fetch the current "client user" (the authenticated account / profile).
     async fn client_user(&self) -> Result<Identifier<User>, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
@@ -66,25 +60,19 @@ pub trait Query: Send + Sync + QueryCasterUserStatuses {
     ) -> Result<Details, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
     }
+
+    /// Subscribe to realtime state changes that invalidate or extend query
+    /// results, such as newly-created rooms and presence updates.
+    ///
+    /// Intended for one long-lived consumer per backend. The returned weak
+    /// stream does not keep the backend alive. REST-only implementations may
+    /// synthesize these events with polling. The default reports
+    /// [`MessengerError::NotImplemented`].
     async fn listen(
         self: Arc<Self>,
     ) -> Result<WeakSocketStream<QueryEvent>, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
     }
-}
-
-/// Capability: user presence/status indicators.
-///
-/// Backends that do not implement this leave [`User::status`] as `None`, and
-/// callers should render no status indicator for those users.
-#[async_trait]
-pub trait UserStatuses: Query {
-    /// Fetch statuses for known users. Missing entries mean the backend did
-    /// not report a status for that specific user.
-    async fn user_statuses(
-        &self,
-        users: &[Identifier<User>],
-    ) -> Result<Vec<(ID, UserStatus)>, Box<dyn Error + Sync + Send>>;
 }
 
 pub enum QueryEvent {
@@ -93,6 +81,12 @@ pub enum QueryEvent {
         r#where: Option<Identifier<()>>,
         // r#where: Option<Identifier<Place<House>>>,
         room: Identifier<Place<Room>>,
+    },
+    /// A channel/room disappeared. `where` identifies its former house when
+    /// known; consumers may remove by `room_id` globally within this backend.
+    ChannelDeleted {
+        r#where: Option<Identifier<()>>,
+        room_id: ID,
     },
     /// A user's presence/status changed.
     UserStatusChanged { user_id: ID, status: UserStatus },

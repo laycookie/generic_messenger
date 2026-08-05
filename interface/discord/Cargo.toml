@@ -10,7 +10,7 @@ tracing = "0.1.43"
 # Async
 asyncs-sync = { workspace = true }
 async-trait = { workspace = true }
-async-tungstenite =  { version = "0.34.0", features = ["async-std-runtime", "async-tls"] }
+async-tungstenite = { version = "0.34.0", features = ["smol-runtime", "smol-native-tls"] }
 # Futures
 futures = { workspace = true }
 futures-locks = "0.7.1"
@@ -20,6 +20,7 @@ pin-project = "1.1.11"
 arc-swap = "1.9.1"
 dashmap = "6.1.0"
 crossbeam = "0.8.4"
+uuid = { version = "1.23.4", features = ["v4"] }
 # Time
 chrono = { workspace = true }
 # Fetch
@@ -38,10 +39,18 @@ pnet_macros_support = "0.35.0"
 # Audio
 simple-audio-channels = { path = "../../crate/audio", version = "0.0.1" }
 opus = "0.3.1"
+# Video
+simple-video = { path = "../../crate/video", version = "0.0.1", features = ["h264", "av1"] }
 # Security
 secure-string = "0.3.0"
 libsodium-rs = "0.2.4"
-davey = "0.1.3"
+rsa = { version = "0.9.10", features = ["sha2"] }
+rand = "0.8.5"
+# 0.1.4 is the minimum viable version for *video*: 0.1.3's frame
+# reconstruction dropped the ciphertext of any frame whose unencrypted
+# prefix was at least as large as its encrypted body (tiny P-frames), so
+# receivers failed DAVE authentication on nearly every inter frame.
+davey = "0.1.4"
 # Interface
 messenger_interface = { path = "../../crate/messenger_interface" }
 messenger_downloader = { path = "../../crate/messenger_downloader" }
@@ -49,3 +58,10 @@ messenger_downloader = { path = "../../crate/messenger_downloader" }
 num_enum = "0.7.6"
 # Bitflags
 bitflags = { workspace = true }
+credential_macro = { path = "../../macro" }
+unitstruct = { path = "../../crate/unitstruct" }
+
+[dev-dependencies]
+openmls = "0.8.1"
+openmls_basic_credential = "0.5.0"
+openmls_rust_crypto = "0.5.1"

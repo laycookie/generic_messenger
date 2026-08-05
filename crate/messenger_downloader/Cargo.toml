@@ -6,10 +6,15 @@ publish = false
 
 [dependencies]
 async-fs = "2.2.0"
+async-lock = "3.4.1"
 facet = { workspace = true }
 facet-json = { workspace = true }
+futures = { workspace = true }
 futures-timer = "3.0.3"
+httpdate = "1.0.3"
+image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 messenger_interface = { path = "../messenger_interface" }
+smol = "2.0.2"
 surf = "2.3.2"
 tempfile = "3"
 tracing = { workspace = true }

@@ -13,12 +13,13 @@ mod rich_text;
 mod user;
 
 pub use cache::{
-    CACHE_IMGS_DIR, CacheCategory, TEMP_FILE_SUFFIX, cache_dir, cache_img_dir,
-    sweep_stale_temp_files,
+    CACHE_IMGS_DIR, CacheCategory, CacheCleanupPolicy, CacheCleanupStats, CacheJanitor,
+    TEMP_FILE_SUFFIX, cache_dir, cache_img_dir, cleanup_cache, prepare_cache_file_parent,
+    record_cache_access, sweep_stale_temp_files, validate_cache_file_parent,
 };
 pub use details::Details;
 pub use identifier::{ID, Identifier};
 pub use message::{Message, Reaction, Revision};
 pub use place::{House, Place, Room, RoomCapabilities};
 pub use rich_text::{Emoji, RichText, Span, Sticker, TextStyle};
-pub use user::{User, UserStatus, VoiceState};
+pub use user::{User, UserStatus, VideoBroadcast, VoiceState};

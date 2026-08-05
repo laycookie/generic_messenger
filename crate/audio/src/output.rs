@@ -2,17 +2,19 @@ use std::{error::Error, fmt::Debug, io, sync::Arc};
 
 use cpal::{FromSample, Sample, SizedSample, traits::DeviceTrait as _};
 use ringbuf::{
-    CachingCons, CachingProd, StaticRb,
+    CachingCons, CachingProd,
     traits::{Consumer as _, Observer as _, Producer as _},
 };
 use tracing::error;
 
 use crate::{
-    AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, CHANNEL_HEADROOM, CONVERT_SCRATCH_LEN,
+    AudioMixer, AudioSampleType, CHANNEL_BUFFER_SIZE, CONVERT_SCRATCH_LEN, MAX_AUDIO_CHANNELS,
     MIX_SCRATCH_LEN, Notify, SampleConsum, SampleProd, SampleRb, StreamFormat,
     effects_rack::RackBackend,
+    limiter::PeakLimiter,
     resample::Resampler,
-    stream::{for_each_sample_format, update_presence},
+    simd,
+    stream::{EventCons, for_each_sample_format, update_presence},
 };
 
 /// Application handle for pushing audio into an output channel.
@@ -31,6 +33,11 @@ pub struct SampleProducer {
 }
 
 impl SampleProducer {
+    /// Whether mixer still owns receiving end of this channel.
+    pub fn is_connected(&self) -> bool {
+        self.producer.read_is_held()
+    }
+
     /// Push interleaved samples in the channel's declared format.
     ///
     /// Returns how many samples were consumed (always whole frames). A short
@@ -111,6 +118,9 @@ impl AudioMixer {
             return Err("invalid stream format: zero channels or sample rate".into());
         }
         self.prune_output_channels();
+        if self.output_channels.len() >= MAX_AUDIO_CHANNELS {
+            return Err(format!("output channel limit reached ({MAX_AUDIO_CHANNELS})").into());
+        }
         let Some(master) = &mut self.output else {
             return Err("no output device available".into());
         };
@@ -204,17 +214,45 @@ impl AudioMixer {
 #[path = "../tests/unit/output.rs"]
 mod tests;
 
-/// Build the real-time playback callback. It must stay free of locks,
-/// allocation and blocking: it drains the channel-event ring, mixes channel
-/// rings into the device buffer in frame-aligned chunks, and signals
-/// `close_notify` once when the last channel disappears (`notify_one` is
-/// lock-free unless a task is parked on it; firing it only on that transition
-/// keeps the cost off the steady-state path).
+/// Add every available whole frame, up to `mix.len()`, directly from a channel
+/// ring into the mix buffer. Ring storage may wrap into two physical slices;
+/// both are consumed under one frame-aligned count.
+fn mix_channel<const N: usize>(
+    consumer: &mut SampleConsum<N>,
+    mix: &mut [AudioSampleType],
+    channels: usize,
+) -> usize {
+    debug_assert!(channels > 0);
+    debug_assert_eq!(mix.len() % channels, 0);
+    let take = {
+        let (first, second) = consumer.as_slices();
+        let occupied = first.len() + second.len();
+        let take = (occupied - occupied % channels).min(mix.len());
+        let first_len = first.len().min(take);
+
+        simd::add_assign(&mut mix[..first_len], &first[..first_len]);
+
+        let second_len = take - first_len;
+        simd::add_assign(&mut mix[first_len..take], &second[..second_len]);
+        take
+    };
+
+    if take > 0 {
+        consumer.skip(take);
+    }
+    take
+}
+
+/// Build the real-time playback callback. Audio movement stays allocation-free
+/// and nonblocking: it drains the channel-event ring and mixes channel rings
+/// into the device buffer in frame-aligned chunks. `close_notify` may briefly
+/// take its waiter lock; it fires only when the last channel disappears, keeping
+/// that cost off the steady-state path.
 fn build_output_stream_typed<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     mut sample_consumers: Vec<SampleConsum<CHANNEL_BUFFER_SIZE>>,
-    mut events: CachingCons<Arc<StaticRb<OutputRxEvent, 8>>>,
+    mut events: EventCons<OutputRxEvent>,
     close_notify: Arc<Notify>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
@@ -223,17 +261,25 @@ where
     let device_channels = config.channels as usize;
     // Frame-aligned chunking so a partial pop can never shift interleaving.
     let chunk_len = (MIX_SCRATCH_LEN / device_channels) * device_channels;
-    sample_consumers.reserve(CHANNEL_HEADROOM);
+    let missing_capacity = MAX_AUDIO_CHANNELS.saturating_sub(sample_consumers.len());
+    sample_consumers.reserve(missing_capacity);
     let mut had_channels = !sample_consumers.is_empty();
     let mut mix_buf = [0.0 as AudioSampleType; MIX_SCRATCH_LEN];
-    let mut chan_buf = [0.0 as AudioSampleType; MIX_SCRATCH_LEN];
+    let samples_per_second = config
+        .sample_rate
+        .saturating_mul(u32::from(config.channels));
+    let mut limiter = PeakLimiter::new(samples_per_second);
 
     device.build_output_stream(
         config,
         move |data: &mut [T], _| {
             for event in events.pop_iter() {
                 match event {
-                    OutputRxEvent::AddOutputChannel(cons) => sample_consumers.push(cons),
+                    OutputRxEvent::AddOutputChannel(cons) => {
+                        if sample_consumers.len() < MAX_AUDIO_CHANNELS {
+                            sample_consumers.push(cons);
+                        }
+                    }
                 }
             }
             // Channels whose producer is gone are dropped here, but the mixer
@@ -250,17 +296,9 @@ where
                 let len = chunk.len();
                 mix_buf[..len].fill(0.0);
                 for consumer in sample_consumers.iter_mut() {
-                    let available = consumer.occupied_len();
-                    // Whole frames only: an underrun must not flip parity.
-                    let take = (available - available % device_channels).min(len);
-                    let popped = consumer.pop_slice(&mut chan_buf[..take]);
-                    for (mixed, sample) in mix_buf[..popped].iter_mut().zip(&chan_buf[..popped]) {
-                        *mixed += sample;
-                    }
+                    mix_channel(consumer, &mut mix_buf[..len], device_channels);
                 }
-                for (out, mixed) in chunk.iter_mut().zip(&mix_buf[..len]) {
-                    *out = T::from_sample(mixed.clamp(-1.0, 1.0));
-                }
+                limiter.process_into(&mix_buf[..len], chunk);
             }
         },
         move |err| {

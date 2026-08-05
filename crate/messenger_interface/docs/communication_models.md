@@ -127,7 +127,7 @@ follow the same approach.
 
 ## Implications for `messenger_interface`
 
-The trait split into `Query`, `Text`, `Voice` deliberately stays agnostic
+The trait split into `Query`, `Text`, `Audio`, and `Video` deliberately stays agnostic
 to which model a backend uses. A socket-only backend can implement `Query`
 by reading its local cache; a REST-only backend can implement `listen()`
 as a polling loop; a hybrid backend has to handle both paths.

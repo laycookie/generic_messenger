@@ -10,10 +10,13 @@
 //! field (the key is the field's schema key), so a secret containing `:` `&` `=`
 //! or a newline round-trips intact. On load, each key is resolved back to one of
 //! the backend's known field keys.
+//!
+//! TODO(security): credentials remain plaintext. Replace this file with an OS
+//! credential vault/keyring while retaining this codec only for migration.
 
 use std::{
-    fs::OpenOptions,
-    io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
+    fs::{self, File},
+    io::{self, BufRead, BufReader, Write},
     path::Path,
 };
 
@@ -100,19 +103,18 @@ fn decode(value: &str) -> Option<String> {
 
 /// Reads `path`, mapping each `name:auth` line through `resolve`.
 ///
-/// The file is created if it does not exist (yielding an empty `Vec`). Lines
-/// without a `:` separator, and lines whose `resolve` returns `None` (e.g. an
-/// unrecognized platform), are skipped — a single bad line does not abort the
-/// load.
+/// A missing file yields an empty `Vec`. Lines without a `:` separator, and
+/// lines whose `resolve` returns `None` (e.g. an unrecognized platform), are
+/// skipped — a single bad line does not abort the load.
 pub fn load<T>(
     path: impl AsRef<Path>,
     mut resolve: impl FnMut(&str, &str) -> Option<T>,
 ) -> io::Result<Vec<T>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(path)?;
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
 
     let mut loaded = Vec::new();
 
@@ -131,27 +133,60 @@ pub fn load<T>(
     Ok(loaded)
 }
 
-/// Truncates `path` and writes one `name:auth` line per entry.
+/// Atomically replace `path` with one `name:auth` line per entry.
+///
+/// New contents are fully written and synced to a private sibling temp file
+/// before rename. Failed writes therefore leave previous credential file
+/// untouched.
 pub fn save<I, K, V>(path: impl AsRef<Path>, entries: I) -> io::Result<()>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,
     V: AsRef<str>,
 {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
+    let path = path.as_ref();
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
 
-    file.seek(SeekFrom::Start(0))?;
-    file.set_len(0)?;
-
+    let mut contents = Vec::new();
     for (name, auth) in entries {
-        writeln!(file, "{}:{}", name.as_ref(), auth.as_ref())?;
+        writeln!(contents, "{}:{}", name.as_ref(), auth.as_ref())?;
     }
 
+    let mut temp = tempfile::Builder::new()
+        .prefix(".LoginInfo-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    set_private_permissions(temp.as_file())?;
+    temp.write_all(&contents)?;
+    temp.flush()?;
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|err| err.error)?;
+    sync_parent_directory(parent)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_permissions(file: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -207,5 +242,39 @@ mod tests {
     fn unknown_keys_are_rejected() {
         // A stored key the schema doesn't declare rejects the whole credential.
         assert!(from_line("ghost=value", &["token"]).is_none());
+    }
+
+    #[test]
+    fn missing_login_file_loads_empty_without_creating_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("LoginInfo");
+        let loaded = load::<()>(&path, |_, _| None).unwrap();
+        assert!(loaded.is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn save_atomically_replaces_previous_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("LoginInfo");
+        fs::write(&path, "old:value\nold:stale\n").unwrap();
+
+        save(&path, [("discord", "token=new")]).unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), "discord:token=new\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_credentials_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("LoginInfo");
+        save(&path, [("discord", "token=secret")]).unwrap();
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

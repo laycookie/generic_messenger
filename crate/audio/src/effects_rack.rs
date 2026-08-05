@@ -1,14 +1,47 @@
-use std::sync::mpsc;
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicU32, Ordering},
+};
+
+use crossbeam_queue::SegQueue;
 
 use crate::{
     AudioSampleType, StreamFormat,
-    effects::Afx,
+    effects::{Afx, AfxRegistration, REGISTERED_AFX},
     params::{ParamKey, ParamSpec, ParamState},
 };
 
 /// Identifies one effect [`Slot`] inside an [`EffectsRack`], for listing and
 /// removal — the slot-level counterpart of [`ParamKey`].
 pub type SlotKey = u64;
+
+#[derive(Debug)]
+struct LiveParams {
+    revision: AtomicU32,
+    values: Box<[AtomicU32]>,
+}
+
+impl LiveParams {
+    fn new(values: &[f32]) -> Self {
+        Self {
+            revision: AtomicU32::new(0),
+            values: values
+                .iter()
+                .map(|value| AtomicU32::new(value.to_bits()))
+                .collect(),
+        }
+    }
+
+    fn set(&self, key: ParamKey, value: f32) {
+        let Some(slot) = self.values.get(key.0) else {
+            return;
+        };
+        slot.store(value.to_bits(), Ordering::Relaxed);
+        // Publishes the preceding value write. Backend's Acquire revision load
+        // makes it visible before reading parameter bits.
+        self.revision.fetch_add(1, Ordering::Release);
+    }
+}
 
 /// One effect slot in a rack frontend.
 #[derive(Clone, Debug)]
@@ -18,6 +51,7 @@ pub struct Slot {
     pub specs: &'static [ParamSpec],
     /// Current parameter values, indexed like `specs`.
     pub values: Vec<f32>,
+    live_params: Arc<LiveParams>,
 }
 
 impl Slot {
@@ -37,14 +71,10 @@ enum RackCommand {
     Insert {
         id: SlotKey,
         effect: Box<dyn Afx + Send>,
+        live_params: Arc<LiveParams>,
     },
     Remove {
         id: SlotKey,
-    },
-    SetParam {
-        id: SlotKey,
-        key: ParamKey,
-        value: f32,
     },
 }
 
@@ -56,10 +86,12 @@ enum RackCommand {
 /// authoritative structure and parameter values for UI reads - sound because
 /// parameters only ever change through [`set_param`](EffectsRack::set_param)
 /// (an effect must not mutate its own parameters) - and mirrors every edit to
-/// the backend over an unbounded channel, adopted before the backend's next
-/// buffer. A rack whose channel has closed keeps working as a UI-only record.
+/// the backend. Rare structural edits use a lossless lock-free queue; parameter
+/// values use per-slot atomics and coalesce to the newest value. Frontend holds
+/// only a weak queue reference, so edits do not accumulate after audio backend
+/// closes. Such rack keeps working as a UI-only record.
 pub struct EffectsRack {
-    tx: mpsc::Sender<RackCommand>,
+    commands: Weak<SegQueue<RackCommand>>,
     next_id: SlotKey,
     slots: Vec<Slot>,
 }
@@ -69,25 +101,41 @@ pub struct EffectsRack {
 /// adopted at the head of [`prepare`](RackBackend::prepare) and
 /// [`apply`](RackBackend::apply).
 pub struct RackBackend {
-    rx: mpsc::Receiver<RackCommand>,
+    commands: Arc<SegQueue<RackCommand>>,
     /// The channel's processing format, known once the backend is attached.
     format: Option<StreamFormat>,
-    slots: Vec<(SlotKey, Box<dyn Afx + Send>)>,
+    slots: Vec<BackendSlot>,
+}
+
+struct BackendSlot {
+    id: SlotKey,
+    effect: Box<dyn Afx + Send>,
+    live_params: Arc<LiveParams>,
+    observed_revision: u32,
 }
 
 impl EffectsRack {
+    /// All built-in effects intended for user insertion.
+    ///
+    /// UI clients can render this catalog directly. Adding a registration in
+    /// the audio crate then makes the effect available without app-side type
+    /// matching or factory changes.
+    pub fn available_effects() -> &'static [AfxRegistration] {
+        REGISTERED_AFX
+    }
+
     /// A new, empty chain: the frontend to keep for edits and snapshots, and
     /// the backend to hand to the channel that will process audio through it.
     pub fn new() -> (EffectsRack, RackBackend) {
-        let (tx, rx) = mpsc::channel();
+        let commands = Arc::new(SegQueue::new());
         (
             EffectsRack {
-                tx,
+                commands: Arc::downgrade(&commands),
                 next_id: 0,
                 slots: Vec::new(),
             },
             RackBackend {
-                rx,
+                commands,
                 format: None,
                 slots: Vec::new(),
             },
@@ -100,23 +148,39 @@ impl EffectsRack {
         let id = self.next_id;
         self.next_id += 1;
         let specs = effect.param_specs();
+        let values = specs
+            .iter()
+            .map(|spec| effect.param_value(spec.key).unwrap_or(spec.default))
+            .collect::<Vec<_>>();
+        let live_params = Arc::new(LiveParams::new(&values));
         self.slots.push(Slot {
             id,
             name: effect.name(),
             specs,
-            values: specs
-                .iter()
-                .map(|spec| effect.param_value(spec.key).unwrap_or(spec.default))
-                .collect(),
+            values,
+            live_params: live_params.clone(),
         });
-        let _ = self.tx.send(RackCommand::Insert { id, effect });
+        if let Some(commands) = self.commands.upgrade() {
+            commands.push(RackCommand::Insert {
+                id,
+                effect,
+                live_params,
+            });
+        }
         id
+    }
+
+    /// Construct and append one effect from [`available_effects`](Self::available_effects).
+    pub fn insert_registered(&mut self, registration: AfxRegistration) -> SlotKey {
+        self.insert(registration.build())
     }
 
     /// Remove the effect `id`, if it is still present.
     pub fn remove(&mut self, id: SlotKey) {
         self.slots.retain(|slot| slot.id != id);
-        let _ = self.tx.send(RackCommand::Remove { id });
+        if let Some(commands) = self.commands.upgrade() {
+            commands.push(RackCommand::Remove { id });
+        }
     }
 
     /// Whether the effect `id` is still in the chain.
@@ -139,11 +203,7 @@ impl EffectsRack {
         };
         let value = value.clamp(spec.min, spec.max);
         *slot_value = value;
-        let _ = self.tx.send(RackCommand::SetParam {
-            id,
-            key: param,
-            value,
-        });
+        slot.live_params.set(param, value);
     }
 
     /// The current chain in processing order, with every parameter's value.
@@ -155,23 +215,40 @@ impl EffectsRack {
 impl RackBackend {
     /// Adopt every edit queued by the frontend.
     fn drain(&mut self) {
-        while let Ok(command) = self.rx.try_recv() {
+        while let Some(command) = self.commands.pop() {
             match command {
-                RackCommand::Insert { id, mut effect } => {
+                RackCommand::Insert {
+                    id,
+                    mut effect,
+                    live_params,
+                } => {
                     if let Some(format) = self.format {
                         effect.prepare(format);
                     }
-                    self.slots.push((id, effect));
+                    self.slots.push(BackendSlot {
+                        id,
+                        effect,
+                        live_params,
+                        // Force one synchronization. A parameter may have
+                        // changed while this structural command was queued.
+                        observed_revision: u32::MAX,
+                    });
                 }
-                RackCommand::Remove { id } => self.slots.retain(|(slot_id, _)| *slot_id != id),
-                RackCommand::SetParam { id, key, value } => {
-                    if let Some((_, effect)) =
-                        self.slots.iter_mut().find(|(slot_id, _)| *slot_id == id)
-                    {
-                        effect.set_param(key, value);
-                    }
-                }
+                RackCommand::Remove { id } => self.slots.retain(|slot| slot.id != id),
             }
+        }
+        for slot in &mut self.slots {
+            let revision = slot.live_params.revision.load(Ordering::Acquire);
+            if revision == slot.observed_revision {
+                continue;
+            }
+            for (index, value) in slot.live_params.values.iter().enumerate() {
+                slot.effect.set_param(
+                    ParamKey(index),
+                    f32::from_bits(value.load(Ordering::Relaxed)),
+                );
+            }
+            slot.observed_revision = revision;
         }
     }
 
@@ -180,8 +257,8 @@ impl RackBackend {
     pub(crate) fn prepare(&mut self, format: StreamFormat) {
         self.drain();
         self.format = Some(format);
-        for (_, effect) in self.slots.iter_mut() {
-            effect.prepare(format);
+        for slot in &mut self.slots {
+            slot.effect.prepare(format);
         }
     }
 
@@ -194,7 +271,7 @@ impl RackBackend {
         };
         self.slots
             .iter_mut()
-            .all(|(_, effect)| effect.apply_to(format, audio))
+            .all(|slot| slot.effect.apply_to(format, audio))
     }
 }
 

@@ -3,11 +3,13 @@ name = "messenger_interface"
 version = "0.0.1"
 edition = "2024"
 description = "Interface for messaging system"
+readme = "README.md"
 license = "GPL-2.0-only"
 repository = "https://github.com/laycookie/generic_messenger"
 
 [dependencies]
 simple-audio-channels = { path = "../audio", version = "0.0.1" }
+simple-video = { path = "../video", version = "0.0.1" }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -17,3 +19,7 @@ bitflags = { workspace = true }
 chrono = { workspace = true }
 secure-string = "0.3.0"
 credential_macro = { path = "../../macro" }
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }

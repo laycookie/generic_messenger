@@ -387,15 +387,22 @@ impl SteamStreams {
         }
     }
 
-    async fn next_update(
+    /// Process one update already removed from `updates`.
+    ///
+    /// Keep receive and processing separate: callers may put a timeout around
+    /// waiting for a raw update, but must never cancel after dequeue. Message
+    /// conversion performs cache-backed asset I/O and can outlive a short poll
+    /// interval; cancelling it would silently consume and lose the message.
+    async fn process_update(
         &mut self,
+        update: Option<SteamUpdate>,
         conn: &Connection,
         friends: &DashMap<ID, FriendEntry>,
         room_locations: &DashMap<ID, ChatRoomLocation>,
         client_steamid: ID,
         username: &str,
     ) -> UpdatePoll {
-        match self.updates.next().await {
+        match update {
             Some(SteamUpdate::Friends(Ok(list))) => {
                 info!(
                     "Steam: friends list update ({} entries)",
@@ -637,17 +644,30 @@ impl Connected {
         let client_steamid = self.client_steamid;
         let username = self.username.clone();
         let mut streams = self.streams.lock().await;
-        let update = streams
-            .next_update(&conn, &friends, &room_locations, client_steamid, &username)
-            .compat();
-        futures::pin_mut!(update);
-        let delay = Delay::new(timeout);
-        futures::pin_mut!(delay);
-
-        let outcome = match select(update, delay).await {
-            Either::Left((update, _)) => update,
-            Either::Right((_, _)) => UpdatePoll::Timeout,
+        // Timeout only the cancellable wait. Once SelectAll yields an update,
+        // finish its reducer/conversion exactly once even if CDN enrichment is
+        // slower than this polling interval.
+        let update = {
+            let update = streams.updates.next().compat();
+            futures::pin_mut!(update);
+            let delay = Delay::new(timeout);
+            futures::pin_mut!(delay);
+            match select(update, delay).await {
+                Either::Left((update, _)) => update,
+                Either::Right((_, _)) => return UpdatePoll::Timeout,
+            }
         };
+        let outcome = streams
+            .process_update(
+                update,
+                &conn,
+                &friends,
+                &room_locations,
+                client_steamid,
+                &username,
+            )
+            .compat()
+            .await;
         // Latch death here so the next `connected()` rebuilds, from any caller
         // (queries included) — not only the stream loop that observed it.
         if matches!(outcome, UpdatePoll::Disconnected) {

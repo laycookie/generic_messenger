@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use bitflags::bitflags;
+
 /// Represents a user in the messenger system.
 #[derive(Debug, Clone)]
 pub struct User {
@@ -43,12 +45,27 @@ impl UserStatus {
     }
 }
 
-/// Mute/deafen flags of a user in a voice call. Backends that distinguish
-/// self- and server-applied states fold both in.
+bitflags! {
+    /// Video streams a call participant is broadcasting. Flags rather than an
+    /// enum because they are not mutually exclusive — some backends allow
+    /// webcam and screen share at once.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct VideoBroadcast: u8 {
+        /// Webcam.
+        const CAMERA = 1 << 0;
+        /// Screen/window capture (e.g. Discord "Go Live").
+        const SCREENSHARE = 1 << 1;
+    }
+}
+
+/// Mute/deafen/video flags of a user in a voice call. Backends that
+/// distinguish self- and server-applied states fold both in.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VoiceState {
     /// Not transmitting microphone audio.
     pub muted: bool,
     /// Not receiving call audio (implies not transmitting on most platforms).
     pub deafened: bool,
+    /// Video streams the user is broadcasting, if any.
+    pub video: VideoBroadcast,
 }

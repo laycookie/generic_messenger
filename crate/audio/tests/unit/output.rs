@@ -1,4 +1,4 @@
-use ringbuf::traits::Consumer as _;
+use ringbuf::traits::{Consumer as _, Producer as _};
 
 use super::*;
 use crate::{SampleFormat, effects::Gain, effects_rack::EffectsRack};
@@ -86,4 +86,21 @@ fn volume_changes_amplitude_not_length() {
     // per input sample.
     let expected = AudioSampleType::from_sample(1000_i16) * 0.5;
     assert!(out[..960].iter().all(|s| (s - expected).abs() < 1e-4));
+}
+
+#[test]
+fn mixer_reads_wrapped_ring_directly_in_whole_frames() {
+    let rb = SampleRb::<8>::default();
+    let mut producer = CachingProd::new(rb.clone());
+    let mut consumer = CachingCons::new(rb);
+
+    assert_eq!(producer.push_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 6);
+    let mut discarded = [0.0; 4];
+    assert_eq!(consumer.pop_slice(&mut discarded), 4);
+    assert_eq!(producer.push_slice(&[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]), 6);
+
+    let mut mixed = [0.5; 6];
+    assert_eq!(mix_channel(&mut consumer, &mut mixed, 2), mixed.len());
+    assert_eq!(mixed, [5.5, 6.5, 7.5, 8.5, 9.5, 10.5]);
+    assert_eq!(consumer.occupied_len(), 2);
 }

@@ -6,29 +6,37 @@ use iced::{
     },
 };
 use iced_palace::widget::ellipsized_text;
+use messenger_interface::interface::{VideoBroadcastKind, VideoStreamId};
 use messenger_interface::types::{
-    House, ID, Identifier, Place, Room, RoomCapabilities, User, VoiceState,
+    House, ID, Identifier, Place, Room, RoomCapabilities, User, VideoBroadcast, VoiceState,
 };
 use messenger_unifier::{Call, MessengerData, MessengerId, MessengerRegistry};
 
 use super::PLACEHOLDER_PFP;
 use crate::audio_controls::{AfxTarget, AudioControls};
 use crate::components::user_status::{known_user_status, one_to_one_room_status, status_indicator};
+use crate::pages::{RemoteVideo, RemoteVideoStatus};
 
-/// "M"/"D" badges next to a muted/deafened voice participant.
+/// "M"/"D" (muted/deafened) and "Cam"/"Live" (camera/screen share) badges
+/// next to a voice participant.
 fn voice_state_badges<'a>(participant: &User) -> Vec<Element<'a, Action>> {
     let Some(state) = participant.voice else {
         return Vec::new();
     };
-    [(state.muted, "M"), (state.deafened, "D")]
-        .into_iter()
-        .filter(|(active, _)| *active)
-        .map(|(_, label)| {
-            container(Text::new(label).size(10))
-                .padding(Padding::new(0.0).left(4.0))
-                .into()
-        })
-        .collect()
+    [
+        (state.muted, "M"),
+        (state.deafened, "D"),
+        (state.video.contains(VideoBroadcast::CAMERA), "Cam"),
+        (state.video.contains(VideoBroadcast::SCREENSHARE), "Live"),
+    ]
+    .into_iter()
+    .filter(|(active, _)| *active)
+    .map(|(_, label)| {
+        container(Text::new(label).size(10))
+            .padding(Padding::new(0.0).left(4.0))
+            .into()
+    })
+    .collect()
 }
 
 /// Green tint marking a voice channel/button as joinable.
@@ -73,6 +81,20 @@ pub enum Action {
     Disconnect(Call),
     /// Broadcast the client's own mute/deafen flags for an active call.
     SetCallState(Call, VoiceState),
+    /// Toggle the client's own video broadcast of `kind` (camera or screen
+    /// share) for an active call.
+    SetVideo(Call, VideoBroadcastKind, bool),
+    /// Choose a local input before starting a video broadcast.
+    PickVideoInput(Call, VideoBroadcastKind),
+    /// Inspect webcam and screen targets reported by video-capture backends.
+    InspectVideoCapture,
+    /// Open the native screen/window picker and verify one captured frame.
+    PickScreenCapture,
+    /// User accepted an advertised remote camera/screen-share source.
+    SubscribeVideo {
+        messenger: MessengerId,
+        stream: VideoStreamId,
+    },
     OpenContacts,
     OpenChat {
         id: MessengerId,
@@ -313,6 +335,7 @@ impl Sidebar {
         &'a self,
         messengers: &'a MessengerRegistry,
         audio: &'a AudioControls,
+        remote_video: &'a RemoteVideo,
     ) -> Element<'a, Action> {
         let room_list = match &self.server_selected {
             Some(server) => Self::view_server_panel(*server, messengers),
@@ -342,7 +365,9 @@ impl Sidebar {
                         Element::from(Text::from(call.state_str()).width(Length::Fill));
                     let mic_afx_button = Element::from(
                         Button::new(Text::new("+afx").size(10)).on_press(Action::OpenAfx {
-                            target: AfxTarget::Mic,
+                            target: AfxTarget::Mic {
+                                messenger: messenger_id,
+                            },
                             title: "Microphone".to_owned(),
                         }),
                     );
@@ -367,11 +392,12 @@ impl Sidebar {
                     let can_set_state = messenger
                         .interface
                         .api
-                        .voice()
+                        .audio()
                         .is_ok_and(|voice| voice.self_state().is_ok());
                     let self_state = VoiceState {
                         muted: audio.mic_muted(),
                         deafened: audio.deafened(),
+                        ..Default::default()
                     };
                     let toggle = |label, engaged: bool, target: VoiceState| {
                         let button = Button::new(Text::new(label).size(10))
@@ -382,6 +408,57 @@ impl Sidebar {
                             button
                         }
                     };
+
+                    // Own camera / screen-share toggles (debug affordances).
+                    // Unlike the mute/deafen toggles these read the roster echo
+                    // rather than optimistic local state, so they repaint a
+                    // round-trip after the press — fine for a debug button, and
+                    // they show exactly what the server believes.
+                    let own_broadcast = call
+                        .source()
+                        .participants
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .find(|participant| {
+                            client_user_id.is_some_and(|client| client == participant.id())
+                        })
+                        .and_then(|participant| participant.voice)
+                        .map(|voice| voice.video)
+                        .unwrap_or(VideoBroadcast::empty());
+                    let video_toggle = |label, kind, engaged: bool| {
+                        let action = if engaged {
+                            Action::SetVideo(call.clone(), kind, false)
+                        } else {
+                            Action::PickVideoInput(call.clone(), kind)
+                        };
+                        let button = Button::new(Text::new(label).size(10)).on_press(action);
+                        Element::from(if engaged {
+                            button.style(engaged_toggle_style)
+                        } else {
+                            button
+                        })
+                    };
+                    let video_toggles = messenger.interface.api.video().is_ok().then(|| {
+                        [
+                            video_toggle(
+                                "Cam",
+                                VideoBroadcastKind::Camera,
+                                own_broadcast.contains(VideoBroadcast::CAMERA),
+                            ),
+                            video_toggle(
+                                "Live",
+                                VideoBroadcastKind::Screen,
+                                own_broadcast.contains(VideoBroadcast::SCREENSHARE),
+                            ),
+                            Button::new(Text::new("Test").size(10))
+                                .on_press(Action::InspectVideoCapture)
+                                .into(),
+                            Button::new(Text::new("Pick").size(10))
+                                .on_press(Action::PickScreenCapture)
+                                .into(),
+                        ]
+                    });
 
                     let header = row![call_status]
                         .extend(
@@ -410,10 +487,94 @@ impl Sidebar {
                                 .into_iter()
                                 .flatten(),
                         )
+                        .extend(video_toggles.into_iter().flatten())
                         .push(mic_afx_button)
                         .push(disconnect_button);
 
-                    Element::from(column![header, call_participants])
+                    // Request-driven backends advertise before delivering.
+                    // Automatic backends skip this list and appear directly
+                    // in previews after `AddVideoStream`.
+                    let incoming_controls = Element::from(Column::from_iter(
+                        remote_video
+                            .streams
+                            .iter()
+                            .filter(move |((id, _), stream)| {
+                                *id == messenger_id
+                                    && stream
+                                        .metadata
+                                        .location
+                                        .is_none_or(|room| room == call.id())
+                                    && stream.status != RemoteVideoStatus::Active
+                            })
+                            .map(|((_, id), stream)| {
+                                let kind = match stream.metadata.kind {
+                                    VideoBroadcastKind::Camera => "camera",
+                                    VideoBroadcastKind::Screen => "screen share",
+                                };
+                                let owner = stream
+                                    .metadata
+                                    .user
+                                    .map(|user| format!(" from {user}"))
+                                    .unwrap_or_default();
+                                match stream.status {
+                                    RemoteVideoStatus::Available => {
+                                        Button::new(Text::new(format!("Watch {kind}{owner}")))
+                                            .on_press(Action::SubscribeVideo {
+                                                messenger: messenger_id,
+                                                stream: *id,
+                                            })
+                                            .into()
+                                    }
+                                    RemoteVideoStatus::Requested => {
+                                        Button::new(Text::new(format!("Opening {kind}{owner}...")))
+                                            .into()
+                                    }
+                                    RemoteVideoStatus::Active => unreachable!(),
+                                }
+                            }),
+                    ));
+
+                    // Debug previews: newest decoded frame of every active
+                    // incoming source. Camera and screen share have distinct
+                    // keys, even when owned by the same participant.
+                    let previews =
+                        Element::from(Column::from_iter(remote_video.streams.iter().filter_map(
+                            move |((id, _), stream)| {
+                                if *id != messenger_id
+                                    || stream
+                                        .metadata
+                                        .location
+                                        .is_some_and(|room| room != call.id())
+                                {
+                                    return None;
+                                }
+                                let handle = stream.preview.as_ref()?;
+                                let kind = match stream.metadata.kind {
+                                    VideoBroadcastKind::Camera => "camera",
+                                    VideoBroadcastKind::Screen => "screen share",
+                                };
+                                let label = stream.metadata.user.map_or_else(
+                                    || format!("{kind} from unknown"),
+                                    |user| format!("{kind} from {user}"),
+                                );
+                                Some(
+                                    column![
+                                        Text::new(label).size(10),
+                                        image(handle.clone())
+                                            .width(Length::Fixed(160.0))
+                                            .content_fit(ContentFit::Contain),
+                                    ]
+                                    .into(),
+                                )
+                            },
+                        )));
+
+                    Element::from(column![
+                        header,
+                        call_participants,
+                        incoming_controls,
+                        previews
+                    ])
                 });
 
                 Element::from(Column::from_iter(active_call_panel))

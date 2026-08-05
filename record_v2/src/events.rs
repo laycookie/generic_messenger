@@ -1,6 +1,19 @@
-use futures::StreamExt;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use futures::{
+    StreamExt,
+    future::{Either, select},
+};
+use futures_timer::Delay;
 use iced::Task;
-use messenger_interface::interface::{AudioEvent, CallState, QueryEvent, TextEvent, VoiceEvent};
+use messenger_interface::interface::{
+    AudioEvent, CallState, FrameScaler, PixelData, QueryEvent, TextEvent, VideoEvent, VideoFrame,
+    VideoInput as InterfaceVideoInput, VideoResolution, VoiceEvent, frame_channel,
+};
 use messenger_interface::types::{Emoji, ID, Identifier, Place, Room, User, UserStatus};
 use messenger_unifier::{MessengerData, MessengerId, MessengerRegistry};
 use simple_audio_channels::{
@@ -8,10 +21,13 @@ use simple_audio_channels::{
     effects::{Gain, Gate, Mute},
     effects_rack::EffectsRack,
 };
+use simple_video_capture::{CaptureLimits, capture_to_channel_bounded};
 use tracing::{debug, trace, warn};
 
 use crate::audio_controls::AudioControls;
-use crate::pages::{AppMessage, StreamDirection};
+use crate::pages::{
+    AppMessage, RemoteVideo, SelectedVideoInput, StreamDirection, VideoInputKey, VideoInputSource,
+};
 
 fn apply_user_status_to_user(user: &mut Identifier<User>, user_id: ID, status: UserStatus) {
     if *user.id() == user_id {
@@ -124,6 +140,7 @@ pub fn process_query_event(
                     None => {
                         if !data.conversations.iter().any(|r| r.id() == room.id()) {
                             data.conversations.push(room);
+                            data.rebuild_room_index();
                         }
                     }
                     Some(server_id) => {
@@ -133,11 +150,27 @@ pub fn process_query_event(
                             && !rooms.iter().any(|r| r.id() == room.id())
                         {
                             rooms.push(room);
+                            data.rebuild_room_index();
                         } else {
                             warn!("Couldn't find server for channel creation");
                         }
                     }
                 }
+            }
+        }
+        QueryEvent::ChannelDeleted {
+            r#where: _,
+            room_id,
+        } => {
+            if let Some(data) = messengers.data_mut(id) {
+                data.conversations.retain(|room| *room.id() != room_id);
+                for guild in &mut data.guilds {
+                    if let Some(rooms) = guild.rooms.as_mut() {
+                        rooms.retain(|room| *room.id() != room_id);
+                    }
+                }
+                data.calls.retain(|call| call.id() != room_id);
+                data.rebuild_room_index();
             }
         }
         QueryEvent::UserStatusChanged { user_id, status } => {
@@ -158,24 +191,19 @@ pub fn process_text_event(
         TextEvent::MessageCreated { room, message } => {
             if let Some(data) = messengers.data_mut(id) {
                 let room_id = *room.id();
-                let pending_id = data
-                    .pending_sends
-                    .iter()
-                    .position(|p| p.room_id == room_id)
-                    .map(|pending_pos| data.pending_sends.remove(pending_pos).pending_id);
-
-                if let Some(room) = data.room_mut(room_id) {
+                if !data.message_is_deleted(room_id, *message.id())
+                    && let Some(room) = data.room_mut(room_id)
+                {
                     let msgs = room.messages.get_or_insert_with(Vec::new);
 
-                    // Check if there's a pending message for this room we should replace
-                    if let Some(pending_id) = pending_id {
-                        if let Some(pending_msg) = msgs.iter_mut().find(|m| *m.id() == pending_id) {
-                            *pending_msg = message;
-                        } else {
-                            msgs.push(message);
-                        }
-                    } else if !msgs.iter().any(|m| m.id() == message.id()) {
-                        // No pending send — append if not a duplicate
+                    // A room may contain several pending sends, and this event
+                    // may belong to another user. Without a backend-provided
+                    // client nonce there is no sound way to correlate it with
+                    // one pending row. Keep pending rows until the matching
+                    // HTTP send future returns; that result carries the exact
+                    // server ID. `ConfirmPending` removes an early socket echo
+                    // with the same server ID.
+                    if !msgs.iter().any(|m| m.id() == message.id()) {
                         msgs.push(message);
                     }
                 }
@@ -184,20 +212,13 @@ pub fn process_text_event(
             }
         }
         TextEvent::MessageUpdated { room, message } => {
-            if let Some(data) = messengers.data_mut(id)
-                && let Some(room) = data.room_mut(*room.id())
-                && let Some(msgs) = room.messages.as_mut()
-                && let Some(existing) = msgs.iter_mut().find(|m| m.id() == message.id())
-            {
-                *existing = message;
+            if let Some(data) = messengers.data_mut(id) {
+                data.update_message(*room.id(), message);
             }
         }
         TextEvent::MessageDeleted { room, message_id } => {
-            if let Some(data) = messengers.data_mut(id)
-                && let Some(room) = data.room_mut(*room.id())
-                && let Some(msgs) = room.messages.as_mut()
-            {
-                msgs.retain(|m| *m.id() != message_id);
+            if let Some(data) = messengers.data_mut(id) {
+                data.delete_message(*room.id(), message_id);
             }
         }
         TextEvent::ReactionAdded {
@@ -270,21 +291,22 @@ pub fn process_voice_event(
     controls: &mut AudioControls,
 ) -> Task<AppMessage> {
     match event {
-        VoiceEvent::CallStatusUpdate(status) => {
+        VoiceEvent::CallStatusUpdate { room, status } => {
             debug!("{}", status.as_str());
-            if let Some(data) = messengers.data_mut(id) {
-                for call in &mut data.calls {
-                    call.set_state(CallState::Pending(status));
-                }
+            if let Some(data) = messengers.data_mut(id)
+                && let Some(call) = data.calls.iter_mut().find(|call| call.id() == *room.id())
+                && !call.is_connected()
+            {
+                call.set_state(CallState::Pending(status));
             }
         }
-        VoiceEvent::CallStreamReady(stream) => {
-            if let Some(data) = messengers.data_mut(id) {
-                for call in &mut data.calls {
-                    call.set_state(CallState::Connected);
-                }
+        VoiceEvent::CallStreamReady { room, stream } => {
+            if let Some(data) = messengers.data_mut(id)
+                && let Some(call) = data.calls.iter_mut().find(|call| call.id() == *room.id())
+            {
+                call.set_state(CallState::Connected);
+                return Task::stream(stream.map(move |event| AppMessage::AudioEvent((id, event))));
             }
-            return Task::stream(stream.map(move |event| AppMessage::AudioEvent((id, event))));
         }
         VoiceEvent::ParticipantJoined { room, user } => {
             trace!("{:?} joined {room:?}", user.id());
@@ -358,6 +380,269 @@ pub fn process_voice_event(
     Task::none()
 }
 
+/// Cap UI texture churn while preserving realtime motion. Incoming channels
+/// remain latest-wins, so a slow render drops stale frames instead of lagging.
+const PREVIEW_INTERVAL: Duration = Duration::from_millis(33);
+const PREVIEW_MAX_WIDTH: u32 = 320;
+const PREVIEW_MAX_HEIGHT: u32 = 180;
+const MAX_TEST_PATTERN_PIXELS: usize = 4096 * 2160;
+
+fn elapsed_micros(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn capture_limits(resolution: VideoResolution, frames_per_second: u32) -> CaptureLimits {
+    CaptureLimits {
+        max_width: resolution.width,
+        max_height: resolution.height,
+        max_frames_per_second: frames_per_second.clamp(1, 30),
+    }
+}
+
+pub fn process_video_event(
+    id: MessengerId,
+    event: VideoEvent,
+    video: &mut RemoteVideo,
+    video_inputs: &HashMap<VideoInputKey, SelectedVideoInput>,
+) -> Task<AppMessage> {
+    match event {
+        VideoEvent::VideoStreamAvailable {
+            id: stream,
+            metadata,
+        } => {
+            debug!("Video stream available on request: {stream:?}");
+            video.available((id, stream), metadata);
+            Task::none()
+        }
+        VideoEvent::AddVideoStream {
+            id: stream,
+            metadata,
+            channel,
+        } => {
+            debug!("Video stream started: {stream:?}");
+            let key = (id, stream);
+            let (generation, cancelled) = video.start(key, metadata);
+            let (producer, consumer) = frame_channel();
+            if channel.send(producer).is_err() {
+                warn!("Couldn't send video channel to the adapter");
+                if video.is_current(&key, generation) {
+                    video.remove(&key);
+                }
+                return Task::none();
+            }
+            // Realtime preview: emit first decoded frame immediately, then
+            // sample newest frame at display cadence. Downscale before iced
+            // uploads it; sidebar renders only 160 logical pixels wide.
+            let frames = futures::stream::unfold(
+                (
+                    consumer,
+                    Box::pin(cancelled),
+                    None::<Instant>,
+                    FrameScaler::new(),
+                ),
+                |(mut consumer, cancelled, next_refresh, mut scaler)| async move {
+                    let cancelled = if let Some(deadline) = next_refresh {
+                        match deadline.checked_duration_since(Instant::now()) {
+                            Some(wait) => match select(Box::pin(Delay::new(wait)), cancelled).await
+                            {
+                                Either::Left(((), cancelled)) => cancelled,
+                                Either::Right(_) => return None,
+                            },
+                            None => cancelled,
+                        }
+                    } else {
+                        cancelled
+                    };
+                    let (mut frame, cancelled) =
+                        match select(Box::pin(consumer.pop()), cancelled).await {
+                            Either::Left((Some(frame), cancelled)) => (frame, cancelled),
+                            Either::Left((None, _)) | Either::Right(_) => return None,
+                        };
+                    let mut newer_frames = 0_u32;
+                    while let Some(newer) = consumer.try_pop() {
+                        frame = newer;
+                        newer_frames = newer_frames.saturating_add(1);
+                    }
+                    let source_width = frame.width;
+                    let source_height = frame.height;
+                    let scale_started = Instant::now();
+                    let frame = match frame.downscale_to_fit_with(
+                        &mut scaler,
+                        PREVIEW_MAX_WIDTH,
+                        PREVIEW_MAX_HEIGHT,
+                    ) {
+                        Ok(frame) => frame,
+                        Err(err) => {
+                            warn!(error = %err, "Couldn't scale incoming video preview");
+                            return None;
+                        }
+                    };
+                    trace!(
+                        target: "video_timing",
+                        stage = "ui.preview_select",
+                        source_width,
+                        source_height,
+                        output_width = frame.width,
+                        output_height = frame.height,
+                        newer_frames,
+                        scale_us = elapsed_micros(scale_started),
+                        "video stage complete"
+                    );
+                    Some((
+                        frame,
+                        (
+                            consumer,
+                            cancelled,
+                            Some(Instant::now() + PREVIEW_INTERVAL),
+                            scaler,
+                        ),
+                    ))
+                },
+            );
+            Task::stream(frames.map(move |frame| AppMessage::VideoPreview {
+                messenger: id,
+                stream,
+                generation,
+                frame,
+            }))
+            .chain(Task::done(AppMessage::VideoPreviewEnded {
+                messenger: id,
+                stream,
+                generation,
+            }))
+        }
+        VideoEvent::RemoveVideoStream { id: stream } => {
+            debug!("Video stream ended: {stream:?}");
+            video.remove(&(id, stream));
+            Task::none()
+        }
+        VideoEvent::AddVideoInput { kind, channel } => {
+            let Some(input) = video_inputs.get(&(id, kind)).cloned() else {
+                warn!("Video input requested without selected source: kind={kind:?}");
+                return Task::none();
+            };
+            let frames_per_second = input.frames_per_second.clamp(1, 30);
+            let resolution = input.resolution;
+            let generation = input.generation;
+            let input_key = (id, kind);
+            let (producer, consumer) = frame_channel();
+            if channel
+                .send(InterfaceVideoInput::new(
+                    consumer,
+                    frames_per_second,
+                    resolution,
+                    input.bitrate_bps,
+                ))
+                .is_err()
+            {
+                warn!("Couldn't send video input channel to the adapter");
+                return Task::none();
+            }
+
+            match input.source {
+                VideoInputSource::CyanTestPattern => {
+                    debug!("Feeding cyan test pattern: kind={kind:?}");
+                    let pixels = usize::try_from(resolution.width)
+                        .ok()
+                        .and_then(|width| {
+                            usize::try_from(resolution.height)
+                                .ok()
+                                .and_then(|height| width.checked_mul(height))
+                        })
+                        .filter(|pixels| *pixels > 0 && *pixels <= MAX_TEST_PATTERN_PIXELS);
+                    let Some(pixels) = pixels else {
+                        return Task::done(AppMessage::VideoCaptureResult {
+                            key: input_key,
+                            generation,
+                            result: Err(format!(
+                                "Invalid test-pattern resolution: {}x{}",
+                                resolution.width, resolution.height
+                            )),
+                        });
+                    };
+                    Task::future(async move {
+                        let mut producer = producer;
+                        let (width, height) = (resolution.width, resolution.height);
+                        let cyan: Arc<[u8]> = [0, 255, 255, 255].repeat(pixels).into();
+                        while !producer.is_closed() {
+                            producer.push(VideoFrame::new(
+                                width,
+                                height,
+                                // Static frame: clone Arc header, not several
+                                // megabytes of pixels every capture interval.
+                                PixelData::SharedRgba8(cyan.clone()),
+                            ));
+                            Delay::new(Duration::from_secs_f64(1.0 / f64::from(frames_per_second)))
+                                .await;
+                        }
+                        debug!("Cyan video input ended (consumer dropped)");
+                        AppMessage::VideoCaptureResult {
+                            key: input_key,
+                            generation,
+                            result: Err("Video backend stopped consuming test input".to_owned()),
+                        }
+                    })
+                }
+                VideoInputSource::Capture(source) => {
+                    let source_name = source.name().to_owned();
+                    let thread_name = format!("video-input-{kind:?}").to_lowercase();
+                    let limits = capture_limits(resolution, frames_per_second);
+                    debug!("Opening {kind:?} video input: {source_name}");
+                    let (completed, completion) = futures::channel::oneshot::channel();
+                    let spawn = std::thread::Builder::new()
+                        .name(thread_name)
+                        .spawn(move || {
+                            let open_started = Instant::now();
+                            let result =
+                                match source.open_bounded(limits) {
+                                    Ok(capture) => {
+                                        trace!(
+                                            target: "video_timing",
+                                            stage = "capture.open",
+                                            ?kind,
+                                            source = %source_name,
+                                            elapsed_us = elapsed_micros(open_started),
+                                            "video stage complete"
+                                        );
+                                        capture_to_channel_bounded(capture, producer, limits)
+                                    .map_err(|error| {
+                                        format!("Video capture failed for {source_name}: {error}")
+                                    })
+                                    .and_then(|()| {
+                                        Err(format!(
+                                            "Video backend stopped consuming {source_name}"
+                                        ))
+                                    })
+                                    }
+                                    Err(error) => Err(format!(
+                                        "Couldn't open video input {source_name}: {error}"
+                                    )),
+                                };
+                            let _ = completed.send(result);
+                        });
+                    if let Err(error) = spawn {
+                        return Task::done(AppMessage::VideoCaptureResult {
+                            key: input_key,
+                            generation,
+                            result: Err(format!("Couldn't start video capture thread: {error}")),
+                        });
+                    }
+                    Task::future(async move {
+                        let result = completion.await.unwrap_or_else(|_| {
+                            Err("Video capture thread exited without a result".to_owned())
+                        });
+                        AppMessage::VideoCaptureResult {
+                            key: input_key,
+                            generation,
+                            result,
+                        }
+                    })
+                }
+            }
+        }
+    }
+}
+
 pub fn process_audio_event(
     id: MessengerId,
     event: AudioEvent,
@@ -375,27 +660,33 @@ pub fn process_audio_event(
                 .map(|user| controls.user_volume(id, user))
                 .unwrap_or(1.0);
             let gain = rack.insert(Box::new(Gain::with_multiplier(volume)));
-            let producer = audio
-                .create_output_channel(
-                    StreamFormat {
-                        channels: 2,
-                        sample_format: SampleFormat::I16,
-                        sample_rate: 48_000,
-                    },
-                    backend,
-                )
-                .unwrap();
-            controls.attach_output_mute(deafen_switch);
+            let producer = match audio.create_output_channel(
+                StreamFormat {
+                    channels: 2,
+                    sample_format: SampleFormat::I16,
+                    sample_rate: 48_000,
+                },
+                backend,
+            ) {
+                Ok(producer) => producer,
+                Err(error) => {
+                    return Task::done(AppMessage::MediaError(format!(
+                        "Couldn't create voice playback channel: {error}"
+                    )));
+                }
+            };
+
+            if channel.send(producer).is_err() {
+                warn!("Couldn't send audio channel to the adapter");
+                return Task::none();
+            }
+            controls.attach_output_mute(id, user, deafen_switch);
 
             // Known speaker: keep the rack frontend in their controls, so the
             // participant volume slider / "+ afx" sheet reach the backend. The
             // Gain is seeded with any volume set before (or between) channels.
             if let Some(user) = user {
                 controls.attach_user(id, user, rack, gain, vec![deafen_id]);
-            }
-
-            if channel.send(producer).is_err() {
-                warn!("Couldn't send audio channel to the adapter");
             }
 
             if !audio.is_streaming_output() {
@@ -415,22 +706,27 @@ pub fn process_audio_event(
             ));
 
             // Voice backends encode f32 stereo frames at 48kHz.
-            let input = audio
-                .create_input_channel(
-                    StreamFormat {
-                        channels: 2,
-                        sample_format: SampleFormat::F32,
-                        sample_rate: 48_000,
-                    },
-                    backend,
-                )
-                .unwrap();
-
-            controls.attach_mic(rack, mic_mute_switch, vec![mic_mute_id]);
+            let input = match audio.create_input_channel(
+                StreamFormat {
+                    channels: 2,
+                    sample_format: SampleFormat::F32,
+                    sample_rate: 48_000,
+                },
+                backend,
+            ) {
+                Ok(input) => input,
+                Err(error) => {
+                    return Task::done(AppMessage::MediaError(format!(
+                        "Couldn't create microphone channel: {error}"
+                    )));
+                }
+            };
 
             if sender.send(input).is_err() {
                 warn!("Couldn't send audio input channel to the adapter");
+                return Task::none();
             }
+            controls.attach_mic(id, rack, mic_mute_switch, vec![mic_mute_id]);
 
             if !audio.is_streaming_input() {
                 return Task::done(AppMessage::StartStream(StreamDirection::Input));
@@ -438,4 +734,179 @@ pub fn process_audio_event(
         }
     }
     Task::none()
+}
+
+#[cfg(test)]
+mod video_tests {
+    use futures::channel::oneshot;
+    use messenger_interface::interface::{VideoBroadcastKind, VideoStreamId, VideoStreamMetadata};
+
+    use super::*;
+    use crate::pages::RemoteVideoStatus;
+
+    fn stream(kind: VideoBroadcastKind) -> (VideoStreamId, VideoStreamMetadata) {
+        (
+            VideoStreamId::new(7),
+            VideoStreamMetadata::new(Some(7), Some(11), kind),
+        )
+    }
+
+    #[test]
+    fn advertised_source_waits_for_ui_request() {
+        let messenger = MessengerId::default();
+        let (stream, metadata) = stream(VideoBroadcastKind::Screen);
+        let mut video = RemoteVideo::default();
+        let video_inputs = HashMap::new();
+
+        let _task = process_video_event(
+            messenger,
+            VideoEvent::VideoStreamAvailable {
+                id: stream,
+                metadata,
+            },
+            &mut video,
+            &video_inputs,
+        );
+
+        assert_eq!(
+            video
+                .streams
+                .get(&(messenger, stream))
+                .map(|stream| stream.status),
+            Some(RemoteVideoStatus::Available)
+        );
+        assert!(
+            video
+                .streams
+                .values()
+                .all(|stream| stream.preview.is_none())
+        );
+    }
+
+    #[test]
+    fn automatic_source_attaches_immediately() {
+        let messenger = MessengerId::default();
+        let (stream, metadata) = stream(VideoBroadcastKind::Camera);
+        let mut video = RemoteVideo::default();
+        let video_inputs = HashMap::new();
+        let (channel, mut reply) = oneshot::channel();
+
+        let task = process_video_event(
+            messenger,
+            VideoEvent::AddVideoStream {
+                id: stream,
+                metadata,
+                channel,
+            },
+            &mut video,
+            &video_inputs,
+        );
+
+        assert_eq!(
+            video
+                .streams
+                .get(&(messenger, stream))
+                .map(|stream| stream.status),
+            Some(RemoteVideoStatus::Active)
+        );
+        assert!(matches!(reply.try_recv(), Ok(Some(_))));
+        drop(task);
+    }
+
+    #[test]
+    fn replaced_stream_rejects_old_channel_generation() {
+        let messenger = MessengerId::default();
+        let (stream, metadata) = stream(VideoBroadcastKind::Camera);
+        let key = (messenger, stream);
+        let mut video = RemoteVideo::default();
+
+        let (old, _old_cancelled) = video.start(key, metadata);
+        let (current, _current_cancelled) = video.start(key, metadata);
+
+        assert!(!video.is_current(&key, old));
+        assert!(video.is_current(&key, current));
+    }
+
+    #[test]
+    fn replacement_preserves_explicit_subscription_ownership() {
+        let messenger = MessengerId::default();
+        let (stream, metadata) = stream(VideoBroadcastKind::Camera);
+        let key = (messenger, stream);
+        let mut video = RemoteVideo::default();
+        video.available(key, metadata);
+        let request = video.begin_subscription(&key).unwrap();
+
+        let (_first, _cancelled) = video.start(key, metadata);
+        assert!(video.is_current_subscription(&key, request));
+        let (_replacement, _cancelled) = video.start(key, metadata);
+
+        assert_eq!(video.owned_subscriptions().collect::<Vec<_>>(), vec![key]);
+    }
+
+    #[test]
+    fn stale_subscription_failure_cannot_roll_back_recreated_stream() {
+        let messenger = MessengerId::default();
+        let (stream, metadata) = stream(VideoBroadcastKind::Camera);
+        let key = (messenger, stream);
+        let mut video = RemoteVideo::default();
+        video.available(key, metadata);
+        let old = video.begin_subscription(&key).unwrap();
+        video.remove(&key);
+        video.available(key, metadata);
+        let current = video.begin_subscription(&key).unwrap();
+
+        video.subscription_failed(&key, old);
+
+        assert!(!video.is_current_subscription(&key, old));
+        assert!(video.is_current_subscription(&key, current));
+        assert_eq!(
+            video.streams.get(&key).map(|stream| stream.status),
+            Some(RemoteVideoStatus::Requested)
+        );
+    }
+
+    #[test]
+    fn clear_cancels_active_preview_consumer() {
+        let messenger = MessengerId::default();
+        let (stream, metadata) = stream(VideoBroadcastKind::Camera);
+        let key = (messenger, stream);
+        let mut video = RemoteVideo::default();
+        let (_generation, cancelled) = video.start(key, metadata);
+
+        video.clear();
+
+        assert!(futures::executor::block_on(cancelled).is_ok());
+    }
+
+    #[test]
+    fn selected_cyan_input_is_attached_to_backend_request() {
+        let messenger = MessengerId::default();
+        let kind = VideoBroadcastKind::Camera;
+        let mut video = RemoteVideo::default();
+        let mut video_inputs = HashMap::new();
+        video_inputs.insert(
+            (messenger, kind),
+            SelectedVideoInput {
+                source: VideoInputSource::CyanTestPattern,
+                frames_per_second: 15,
+                resolution: VideoResolution::new(640, 360),
+                bitrate_bps: 2_500_000,
+                generation: 0,
+            },
+        );
+        let (channel, mut reply) = oneshot::channel();
+
+        let task = process_video_event(
+            messenger,
+            VideoEvent::AddVideoInput { kind, channel },
+            &mut video,
+            &video_inputs,
+        );
+
+        let input = reply.try_recv().unwrap().unwrap();
+        assert_eq!(input.frames_per_second, 15);
+        assert_eq!(input.resolution, VideoResolution::new(640, 360));
+        assert_eq!(input.bitrate_bps, 2_500_000);
+        drop(task);
+    }
 }

@@ -16,7 +16,7 @@
 //! - [`session`]: the live [`Connected`](session::Connected) session and the
 //!   friend/persona/message update streams it drives.
 //! - [`query`]: the `Query`/`Text` implementations.
-//! - [`voice`]: the `Voice` capability — currently a signaling-only scaffold
+//! - [`voice`]: the `Audio` capability — currently a signaling-only scaffold
 //!   (join/leave a Steam voice session; no audio transport yet).
 //! - [`gns`]: GameNetworkingSockets P2P media — an integration skeleton for the
 //!   not-yet-functional audio path (see the module docs for what's blocked).
@@ -123,7 +123,7 @@ pub(crate) struct SteamMessenger {
     /// Lazily-established session, behind an async mutex so concurrent first
     /// callers log in exactly once.
     connected: AsyncMutex<Option<Arc<Connected>>>,
-    /// Sink for [`Voice::listen`]'s event stream, set when the app starts
+    /// Sink for [`Audio::listen`]'s event stream, set when the app starts
     /// listening. `connect` pushes `CallStreamReady` here to hand the UI the
     /// call's audio stream. `None` until `listen` is called.
     voice_events: Mutex<Option<mpsc::UnboundedSender<VoiceEvent>>>,

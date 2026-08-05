@@ -72,6 +72,8 @@ pub struct Gate {
     glide: An<AFollow<f32>>,
     open: bool,
     hold_counter: u32,
+    sample_rate: u32,
+    hold_frames: u32,
 }
 
 /// Output below this magnitude counts as silence when deciding whether a
@@ -113,6 +115,8 @@ impl Gate {
             ),
             open: false,
             hold_counter: 0,
+            sample_rate: 0,
+            hold_frames: 0,
         };
         gate.recompute();
         gate.glide.filter_mono(gate.floor_gain);
@@ -142,6 +146,17 @@ impl Gate {
         };
         self.glide
             .set_time(self.attack_ms / 1000.0, self.release_ms / 1000.0);
+        self.hold_frames =
+            (self.hold_ms / 1000.0 * self.sample_rate.max(1) as AudioSampleType) as u32;
+    }
+
+    fn adopt_sample_rate(&mut self, sample_rate: u32) {
+        if self.sample_rate != sample_rate {
+            self.sample_rate = sample_rate;
+            self.hold_frames =
+                (self.hold_ms / 1000.0 * sample_rate.max(1) as AudioSampleType) as u32;
+            self.glide.set_sample_rate(sample_rate.max(1) as f64);
+        }
     }
 }
 
@@ -160,7 +175,8 @@ impl Afx for Gate {
     /// envelope to closed (a new stream starts from silence).
     fn prepare(&mut self, format: StreamFormat) {
         self.glide.reset();
-        self.glide.set_sample_rate(format.sample_rate as f64);
+        self.sample_rate = format.sample_rate;
+        self.glide.set_sample_rate(format.sample_rate.max(1) as f64);
         self.recompute();
         // A freshly reset smoother jumps straight to its first input; feed it
         // the closed floor so the stream starts silent with smoothing armed.
@@ -174,8 +190,8 @@ impl Afx for Gate {
             return true;
         }
         let channels = (format.channels as usize).max(1);
-        let hold_frames = (self.hold_ms / 1000.0 * format.sample_rate as AudioSampleType) as u32;
-        self.glide.set_sample_rate(format.sample_rate as f64);
+        self.adopt_sample_rate(format.sample_rate);
+        let hold_frames = self.hold_frames;
         let floor = self.floor_gain;
         let mut produced_signal = false;
 

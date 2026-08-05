@@ -79,14 +79,7 @@ mod tests {
     use messenger_unifier::MessengerData;
 
     fn data() -> MessengerData {
-        MessengerData {
-            profile: None,
-            contacts: Vec::new(),
-            conversations: Vec::new(),
-            guilds: Vec::new(),
-            calls: Vec::new(),
-            pending_sends: Vec::new(),
-        }
+        MessengerData::default()
     }
 
     fn user(

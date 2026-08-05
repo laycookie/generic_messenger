@@ -8,13 +8,20 @@ use std::{
 use discord::Discord;
 use iced::{
     Alignment,
-    widget::{Button, ComboBox, Container, Radio, Row, TextInput, column, combo_box::State, text},
+    widget::{
+        Button, ComboBox, Container, Radio, Row, TextInput, column, combo_box::State, qr_code, text,
+    },
 };
 use messenger_interface::{
-    auth::{AuthMethod, Credential, CredentialField},
+    auth::{AuthMethod, Credential, CredentialField, InteractiveAuthMethod, InteractiveAuthPrompt},
     interface::Messenger as NeoMessenger,
 };
+#[cfg(feature = "slack")]
+use slack::Slack;
+#[cfg(feature = "steam")]
 use steam::Steam;
+#[cfg(feature = "telegram")]
+use telegram::Telegram;
 
 /// The future returned by a backend's async constructor, type-erased so the
 /// registry can hold heterogeneous backends behind one fn pointer.
@@ -33,6 +40,7 @@ pub struct Backend {
     pub name: &'static str,
     pub auth_methods: fn() -> &'static [AuthMethod],
     pub create: fn(Credential) -> CreateFuture,
+    interactive_auth_methods: &'static [InteractiveAuthMethod],
 }
 
 static BACKENDS: LazyLock<Vec<Backend>> = LazyLock::new(|| {
@@ -41,11 +49,28 @@ static BACKENDS: LazyLock<Vec<Backend>> = LazyLock::new(|| {
             name: "Discord",
             auth_methods: Discord::auth_methods,
             create: |cred| Box::pin(Discord::create_messenger(cred)),
+            interactive_auth_methods: Discord::interactive_auth_methods(),
         },
+        #[cfg(feature = "steam")]
         Backend {
             name: "Steam",
             auth_methods: Steam::auth_methods,
             create: |cred| Box::pin(Steam::create_messenger(cred)),
+            interactive_auth_methods: &[],
+        },
+        #[cfg(feature = "slack")]
+        Backend {
+            name: "Slack",
+            auth_methods: Slack::auth_methods,
+            create: |cred| Box::pin(Slack::create_messenger(cred)),
+            interactive_auth_methods: &[],
+        },
+        #[cfg(feature = "telegram")]
+        Backend {
+            name: "Telegram",
+            auth_methods: Telegram::auth_methods,
+            create: |cred| Box::pin(Telegram::create_messenger(cred)),
+            interactive_auth_methods: &[],
         },
     ]
 });
@@ -63,8 +88,17 @@ pub fn backend(name: &str) -> Option<&'static Backend> {
 /// Index of a backend's first UI-rendered (non-hidden) method, if it has one.
 /// Used to seat the selection on a method the user can actually see.
 fn first_visible_method(name: &str) -> Option<usize> {
-    let methods = (backend(name)?.auth_methods)();
-    methods.iter().position(|method| !method.hidden)
+    let backend = backend(name)?;
+    let methods = (backend.auth_methods)();
+    methods
+        .iter()
+        .position(|method| !method.hidden)
+        .or_else(|| (!backend.interactive_auth_methods.is_empty()).then_some(methods.len()))
+}
+
+enum SelectedLogin {
+    Credential(&'static AuthMethod),
+    Interactive(InteractiveAuthMethod),
 }
 
 #[derive(Debug, Clone)]
@@ -74,33 +108,42 @@ pub enum Message {
     /// A login field changed; carries the field's key and its new value.
     FieldInput(&'static str, String),
     Submit,
-    /// Credential verification failed; show the error and re-enable submit so
-    /// the user can correct and retry. The app does not save or navigate.
-    LoginFailed(String),
+    Cancel,
 }
 
 pub enum Action {
     None,
+    Cancel,
     /// The user submitted a login; the app resolves it into a live messenger
     /// (which may require async work, e.g. a Discord token fetch).
     Login {
+        attempt: u64,
         backend: &'static str,
         credential: Credential,
     },
+    InteractiveLogin {
+        attempt: u64,
+        backend: &'static str,
+        method: InteractiveAuthMethod,
+    },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Login {
     /// Combo-box state over the backend names.
     platform: State<&'static str>,
     selected_platform: &'static str,
-    /// Index into the selected backend's [`AuthMethod`]s.
+    /// Selection id: credential methods use their [`AuthMethod`] index;
+    /// interactive methods follow the credential-method slice.
     selected_method: usize,
     /// Current value of each field the form has collected, keyed by the field's
     /// schema key. Values for fields not in the selected method are simply
     /// ignored on submit, so they survive switching methods.
     values: HashMap<&'static str, String>,
-    button_state: bool,
+    next_attempt: u64,
+    pending_attempt: Option<u64>,
+    qr_code: Option<qr_code::Data>,
+    status: Option<&'static str>,
     /// Last login error, shown under the form. Cleared on a new submit.
     error: Option<String>,
 }
@@ -113,7 +156,10 @@ impl Default for Login {
             selected_platform,
             selected_method: first_visible_method(selected_platform).unwrap_or(0),
             values: HashMap::new(),
-            button_state: true,
+            next_attempt: 0,
+            pending_attempt: None,
+            qr_code: None,
+            status: None,
             error: None,
         }
     }
@@ -123,42 +169,138 @@ impl Login {
     pub(crate) fn update(&mut self, message: Message) -> Action {
         match message {
             Message::PlatformInput(name) => {
+                if name == self.selected_platform {
+                    return Action::None;
+                }
+                let canceled = self.cancel_attempt();
                 self.selected_platform = name;
                 // Method indices are per-backend; reset to the new backend's
                 // first rendered method (0 if it has none).
                 self.selected_method = first_visible_method(name).unwrap_or(0);
+                if canceled {
+                    return Action::Cancel;
+                }
             }
-            Message::MethodInput(index) => self.selected_method = index,
+            Message::MethodInput(index) => {
+                if index == self.selected_method {
+                    return Action::None;
+                }
+                let canceled = self.cancel_attempt();
+                self.selected_method = index;
+                self.error = None;
+                if canceled {
+                    return Action::Cancel;
+                }
+            }
             Message::FieldInput(key, value) => {
                 self.values.insert(key, value);
             }
-            Message::LoginFailed(error) => {
-                self.error = Some(error);
-                self.button_state = true;
+            Message::Cancel => {
+                if self.cancel_attempt() {
+                    return Action::Cancel;
+                }
             }
             Message::Submit => {
-                self.button_state = false;
+                if self.pending_attempt.is_some() {
+                    return Action::None;
+                }
                 self.error = None;
-                let Some(method) = self.selected_method() else {
+                self.qr_code = None;
+                let Some(selected) = self.selected_login() else {
                     return Action::None;
                 };
-                return Action::Login {
-                    backend: self.selected_platform,
-                    credential: self.build_credential(method),
-                };
+                let attempt = self.next_attempt;
+                self.next_attempt = self.next_attempt.wrapping_add(1);
+                self.pending_attempt = Some(attempt);
+                match selected {
+                    SelectedLogin::Interactive(method) => {
+                        self.status = Some("Starting interactive login…");
+                        return Action::InteractiveLogin {
+                            attempt,
+                            backend: self.selected_platform,
+                            method,
+                        };
+                    }
+                    SelectedLogin::Credential(method) => {
+                        self.status = Some("Signing in…");
+                        return Action::Login {
+                            attempt,
+                            backend: self.selected_platform,
+                            credential: self.build_credential(method),
+                        };
+                    }
+                }
             }
         }
         Action::None
     }
 
-    /// The currently selected auth method, or `None` when the index doesn't point
-    /// at a rendered method (a stale index, or a backend with no visible methods).
-    /// Callers render nothing in that case rather than falling back.
-    fn selected_method(&self) -> Option<&'static AuthMethod> {
-        let methods = (backend(self.selected_platform)?.auth_methods)();
-        methods
+    fn selected_login(&self) -> Option<SelectedLogin> {
+        let backend = backend(self.selected_platform)?;
+        let methods = (backend.auth_methods)();
+        if let Some(method) = methods
             .get(self.selected_method)
             .filter(|method| !method.hidden)
+        {
+            return Some(SelectedLogin::Credential(method));
+        }
+        let interactive_index = self.selected_method.checked_sub(methods.len())?;
+        backend
+            .interactive_auth_methods
+            .get(interactive_index)
+            .copied()
+            .map(SelectedLogin::Interactive)
+    }
+
+    fn cancel_attempt(&mut self) -> bool {
+        let canceled = self.pending_attempt.take().is_some();
+        self.qr_code = None;
+        self.status = None;
+        canceled
+    }
+
+    pub(crate) fn is_pending(&self, attempt: u64) -> bool {
+        self.pending_attempt == Some(attempt)
+    }
+
+    pub(crate) fn show_interactive_prompt(
+        &mut self,
+        attempt: u64,
+        prompt: InteractiveAuthPrompt,
+    ) -> Result<bool, String> {
+        if !self.is_pending(attempt) {
+            return Ok(false);
+        }
+        match prompt {
+            InteractiveAuthPrompt::QrCode { payload } => {
+                self.qr_code =
+                    Some(qr_code::Data::new(payload.as_str()).map_err(|error| error.to_string())?);
+                self.status = Some("Scan QR code, then approve login.");
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn fail(&mut self, attempt: u64, error: String) -> bool {
+        if !self.is_pending(attempt) {
+            return false;
+        }
+        self.pending_attempt = None;
+        self.qr_code = None;
+        self.status = None;
+        self.error = Some(error);
+        true
+    }
+
+    pub(crate) fn finish(&mut self, attempt: u64) -> bool {
+        if !self.is_pending(attempt) {
+            return false;
+        }
+        self.pending_attempt = None;
+        self.qr_code = None;
+        self.status = None;
+        self.error = None;
+        true
     }
 
     /// Assemble the [`Credential`] the selected method declares, pulling each
@@ -197,20 +339,31 @@ impl Login {
 
         // The methods the UI actually renders, each paired with its real index so
         // a hidden method interleaved in the list doesn't shift the selection.
-        let visible: Vec<(usize, &AuthMethod)> = methods
+        let mut visible: Vec<(usize, &'static str)> = methods
             .iter()
             .enumerate()
             .filter(|(_, method)| !method.hidden)
+            .map(|(index, method)| (index, method.label))
             .collect();
+        if let Some(backend) = backend(self.selected_platform) {
+            visible.extend(
+                backend
+                    .interactive_auth_methods
+                    .iter()
+                    .enumerate()
+                    .map(|(index, method)| (methods.len() + index, method.label)),
+            );
+        }
+        let selected_login = self.selected_login();
+        let interactive_selected = matches!(&selected_login, Some(SelectedLogin::Interactive(_)));
 
-        // Method picker, only when the backend offers more than one rendered
-        // method (e.g. Discord token vs. email & password).
+        // Method picker, only when backend offers multiple rendered methods.
         if visible.len() > 1 {
             let picker = visible
                 .iter()
-                .fold(Row::new().spacing(10), |row, &(index, method)| {
+                .fold(Row::new().spacing(10), |row, &(index, label)| {
                     row.push(Radio::new(
-                        method.label,
+                        label,
                         index,
                         Some(self.selected_method),
                         Message::MethodInput,
@@ -220,21 +373,40 @@ impl Login {
         }
 
         // Input fields, generated from the selected method's declared schema.
-        if let Some(method) = self.selected_method() {
+        if let Some(SelectedLogin::Credential(method)) = selected_login {
             for spec in method.fields {
                 let value = self.values.get(spec.key).map(String::as_str).unwrap_or("");
                 let key = spec.key;
                 content = content.push(
                     TextInput::new(spec.label, value)
-                        .on_input(move |value| Message::FieldInput(key, value))
+                        .on_input_maybe(
+                            self.pending_attempt
+                                .is_none()
+                                .then_some(move |value| Message::FieldInput(key, value)),
+                        )
                         .secure(spec.secret),
                 );
             }
         }
 
-        let mut content = content.push(
-            Button::new("Submit").on_press_maybe(self.button_state.then_some(Message::Submit)),
-        );
+        if let Some(data) = &self.qr_code {
+            content = content.push(qr_code(data).total_size(220.0));
+        }
+        if let Some(status) = self.status {
+            content = content.push(text(status));
+        }
+
+        let button = if self.pending_attempt.is_some() {
+            Button::new("Cancel").on_press(Message::Cancel)
+        } else {
+            let label = if interactive_selected {
+                "Continue"
+            } else {
+                "Submit"
+            };
+            Button::new(label).on_press(Message::Submit)
+        };
+        let mut content = content.push(button);
         if let Some(error) = &self.error {
             content = content.push(text(error.clone()).style(iced::widget::text::danger));
         }
@@ -249,5 +421,58 @@ impl Login {
             .align_x(Alignment::Center)
             .align_y(Alignment::Center)
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qr_login_can_be_started_shown_and_canceled() {
+        let mut login = Login::default();
+        let qr_method = Discord::auth_methods().len();
+
+        assert!(matches!(
+            login.update(Message::MethodInput(qr_method)),
+            Action::None
+        ));
+        let attempt = match login.update(Message::Submit) {
+            Action::InteractiveLogin {
+                attempt, backend, ..
+            } => {
+                assert_eq!(backend, "Discord");
+                attempt
+            }
+            _ => panic!("QR method did not start interactive login"),
+        };
+
+        assert!(login.is_pending(attempt));
+        assert!(
+            login
+                .show_interactive_prompt(
+                    attempt,
+                    InteractiveAuthPrompt::QrCode {
+                        payload: messenger_interface::auth::QrPayload::new(
+                            "https://discord.com/ra/test-fingerprint",
+                        ),
+                    },
+                )
+                .unwrap()
+        );
+        assert!(matches!(login.update(Message::Cancel), Action::Cancel));
+        assert!(!login.is_pending(attempt));
+        assert!(
+            !login
+                .show_interactive_prompt(
+                    attempt,
+                    InteractiveAuthPrompt::QrCode {
+                        payload: messenger_interface::auth::QrPayload::new(
+                            "https://discord.com/ra/stale",
+                        ),
+                    },
+                )
+                .unwrap()
+        );
     }
 }

@@ -14,8 +14,12 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chrono::DateTime;
 use dashmap::DashMap;
-use futures::future::{Either, join_all, select};
 use futures::lock::Mutex as AsyncMutex;
+use futures::{
+    StreamExt,
+    future::{Either, join_all, select},
+    stream,
+};
 use futures_timer::Delay;
 
 use messenger_interface::interface::{
@@ -61,6 +65,32 @@ const CHAT_GROUPS_TIMEOUT: Duration = Duration::from_secs(3);
 const CHAT_GROUP_STATE_TIMEOUT: Duration = Duration::from_secs(3);
 const CHAT_MESSAGE_HISTORY_TIMEOUT: Duration = Duration::from_secs(3);
 const TEXT_EVENT_IDLE_CHECK: Duration = Duration::from_millis(250);
+/// Bound startup/picker CDN work. Hundreds of friends or emoticons must not
+/// translate into hundreds of simultaneous sockets and cache writes.
+const ASSET_DOWNLOAD_CONCURRENCY: usize = 16;
+
+fn direct_history_request(
+    client: ID,
+    friend: ID,
+    before: Option<ID>,
+) -> CFriendMessages_GetRecentMessages_Request {
+    let mut request = CFriendMessages_GetRecentMessages_Request {
+        steamid1: Some(client),
+        steamid2: Some(friend),
+        count: Some(RECENT_MESSAGE_COUNT),
+        // Request BBCode so emoticons/stickers survive parsing.
+        bbcode_format: Some(true),
+        ..Default::default()
+    };
+    if let Some(before) = before {
+        // Steam orders messages by (timestamp, ordinal). These fields page
+        // backward; rtime32_start_time/start_ordinal page forward instead.
+        request.time_last = Some((before >> 32) as u32);
+        request.ordinal_last = Some(before as u32);
+    }
+    request
+}
+
 async fn timeout_after<F>(duration: Duration, future: F) -> Option<F::Output>
 where
     F: Future,
@@ -697,7 +727,10 @@ impl Query for SteamMessenger {
                     },
                 )
             });
-        let users = join_all(downloads).await;
+        let users = stream::iter(downloads)
+            .buffered(ASSET_DOWNLOAD_CONCURRENCY)
+            .collect()
+            .await;
         Ok(users)
     }
 
@@ -719,6 +752,16 @@ impl Query for SteamMessenger {
                 (friend_snapshot, last_messages)
             })
             .await?;
+
+        // Register every direct room explicitly. Treating every unknown room
+        // id as a SteamID made a stale/colliding group-room id silently target
+        // an unrelated user. All Text operations now accept only room ids this
+        // session produced.
+        for (id, _, _) in &friend_snapshot {
+            connected
+                .chat_room_locations
+                .insert(*id, ChatRoomLocation::Direct { steamid: *id });
+        }
         let downloads = friend_snapshot.into_iter().map(|(id, name, avatar_hash)| {
             let last_message_at = last_messages.get(&id).copied().unwrap_or(0);
             async move {
@@ -747,7 +790,10 @@ impl Query for SteamMessenger {
                 )
             }
         });
-        let mut rooms = join_all(downloads).await;
+        let mut rooms: Vec<_> = stream::iter(downloads)
+            .buffered(ASSET_DOWNLOAD_CONCURRENCY)
+            .collect()
+            .await;
         rooms.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let rooms = rooms.into_iter().map(|(_, _, room)| room).collect();
         Ok(rooms)
@@ -756,10 +802,12 @@ impl Query for SteamMessenger {
     async fn houses(&self) -> Result<Vec<Identifier<Place<House>>>, Box<dyn Error + Sync + Send>> {
         let connected = self.connected().await?;
         let groups = self.load_chat_groups(&connected).await?;
-        let houses = join_all(groups.into_iter().map(|group| async move {
+        let houses = stream::iter(groups.into_iter().map(|group| async move {
             let icon = steam_group_icon(&group).await;
             Identifier::new(group.id, Place::new(group.name, icon, House::new(None)))
         }))
+        .buffered(ASSET_DOWNLOAD_CONCURRENCY)
+        .collect()
         .await;
         Ok(houses)
     }
@@ -813,24 +861,20 @@ impl Text for SteamMessenger {
             .chat_room_locations
             .get(location.id())
             .map(|location| *location)
-            .unwrap_or(ChatRoomLocation::Direct {
-                steamid: *location.id(),
-            });
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Steam: unknown room id {}", location.id()),
+                )
+            })?;
 
         let mut messages = match room_location {
             ChatRoomLocation::Direct { steamid: friend } => {
+                let before = load_messages_before.as_ref().map(|message| *message.id());
                 let response = self
                     .run(async move {
-                        conn.service_method(CFriendMessages_GetRecentMessages_Request {
-                            steamid1: Some(client),
-                            steamid2: Some(friend),
-                            count: Some(RECENT_MESSAGE_COUNT),
-                            // Request the BBCode form so emoticons/stickers come
-                            // through for `rich::build_content` to parse.
-                            bbcode_format: Some(true),
-                            ..Default::default()
-                        })
-                        .await
+                        conn.service_method(direct_history_request(client, friend, before))
+                            .await
                     })
                     .await??;
 
@@ -997,7 +1041,7 @@ impl Text for SteamMessenger {
             let name = name.trim_matches(':');
             (!name.is_empty()).then(|| name.to_owned())
         });
-        Ok(join_all(names.map(|name| async move {
+        Ok(stream::iter(names.map(|name| async move {
             let image = SteamImage::emoticon(&name).fetch().await.ok();
             Emoji {
                 shortcode: name,
@@ -1005,6 +1049,8 @@ impl Text for SteamMessenger {
                 reference: None,
             }
         }))
+        .buffered(ASSET_DOWNLOAD_CONCURRENCY)
+        .collect()
         .await)
     }
 
@@ -1022,9 +1068,12 @@ impl Text for SteamMessenger {
             .chat_room_locations
             .get(location.id())
             .map(|location| *location)
-            .unwrap_or(ChatRoomLocation::Direct {
-                steamid: *location.id(),
-            });
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("Steam: unknown room id {}", location.id()),
+                )
+            })?;
 
         let (timestamp, ordinal, text) = match room_location {
             ChatRoomLocation::Direct { steamid: friend } => {
@@ -1256,6 +1305,18 @@ mod tests {
             account_id_to_steam_id(client, account_id),
             (client & !(u32::MAX as u64)) | account_id as u64
         );
+    }
+
+    #[test]
+    fn direct_history_cursor_pages_backward() {
+        let cursor = message_id(1_700_000_000, 42);
+        let request = direct_history_request(11, 22, Some(cursor));
+        assert_eq!(request.steamid1, Some(11));
+        assert_eq!(request.steamid2, Some(22));
+        assert_eq!(request.time_last, Some(1_700_000_000));
+        assert_eq!(request.ordinal_last, Some(42));
+        assert_eq!(request.rtime32_start_time, None);
+        assert_eq!(request.start_ordinal, None);
     }
 
     #[test]

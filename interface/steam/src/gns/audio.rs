@@ -42,8 +42,8 @@ pub(crate) const MAX_DECODE_SAMPLES: usize = 11_520;
 /// and resume on the next call, or `select` cancellation would drop mic samples.
 #[async_trait]
 pub(crate) trait MicSource: Send {
-    /// Resolve once a whole [`FRAME_SAMPLES`]-sample frame is captured.
-    async fn next_frame(&mut self) -> [f32; FRAME_SAMPLES];
+    /// Resolve once a whole frame is captured; `None` when mixer writer ends.
+    async fn next_frame(&mut self) -> Option<[f32; FRAME_SAMPLES]>;
 }
 
 /// Sink for decoded per-peer PCM (48 kHz stereo interleaved f32).
@@ -78,6 +78,9 @@ pub(crate) async fn run(
 
         select! {
             frame = outgoing => {
+                let Some(frame) = frame else {
+                    return Err(TransportError::Io("microphone input closed".to_owned()));
+                };
                 let encoded_len = match encoder.encode_float(&frame, &mut opus_out) {
                     Ok(len) => len,
                     Err(err) => {
@@ -134,13 +137,16 @@ impl MixerMic {
 
 #[async_trait]
 impl MicSource for MixerMic {
-    async fn next_frame(&mut self) -> [f32; FRAME_SAMPLES] {
+    async fn next_frame(&mut self) -> Option<[f32; FRAME_SAMPLES]> {
         while self.filled < FRAME_SAMPLES {
-            self.filled += self.consumer.pop(&mut self.frame[self.filled..]).await;
+            self.filled += self
+                .consumer
+                .pop_or_closed(&mut self.frame[self.filled..])
+                .await?;
         }
         let frame = self.frame;
         self.filled = 0;
-        frame
+        Some(frame)
     }
 }
 
@@ -172,9 +178,9 @@ mod tests {
 
     #[async_trait]
     impl MicSource for FakeMic {
-        async fn next_frame(&mut self) -> [f32; FRAME_SAMPLES] {
+        async fn next_frame(&mut self) -> Option<[f32; FRAME_SAMPLES]> {
             match self.frames.pop_front() {
-                Some(frame) => frame,
+                Some(frame) => Some(frame),
                 // No more mic input: park forever, like a silent gate.
                 None => std::future::pending().await,
             }

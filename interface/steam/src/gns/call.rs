@@ -78,7 +78,9 @@ impl ArcStream for VoiceEventStream {
 /// One outcome of a single media step.
 enum Step {
     /// A full mic frame is ready to encode and transmit.
-    Send([f32; FRAME_SAMPLES]),
+    Send,
+    /// Mixer capture writer ended; request replacement input.
+    MicClosed,
     /// A peer's Opus frame arrived.
     Recv(VoiceFrame),
     /// The idle heartbeat fired — loop back and re-check the kill flag.
@@ -171,6 +173,7 @@ impl SteamAudioSession {
             return ControlFlow::Continue(());
         }
 
+        let mut outgoing_frame = None;
         let step = {
             // Borrow only `state.mic` here (via the outgoing future); the rest of
             // `state` stays free for the processing below.
@@ -180,7 +183,7 @@ impl SteamAudioSession {
                     match mic.as_mut() {
                         Some(mic) => mic.next_frame().await,
                         // Receive-only: never produce an outgoing frame.
-                        None => std::future::pending::<[f32; FRAME_SAMPLES]>().await,
+                        None => std::future::pending::<Option<[f32; FRAME_SAMPLES]>>().await,
                     }
                 }
                 .fuse()
@@ -188,7 +191,13 @@ impl SteamAudioSession {
             let mut incoming = pin!(self.transport.recv().fuse());
             let mut heartbeat = pin!(Delay::new(HEARTBEAT).fuse());
             select! {
-                frame = outgoing => Step::Send(frame),
+                frame = outgoing => match frame {
+                    Some(frame) => {
+                        outgoing_frame = Some(frame);
+                        Step::Send
+                    },
+                    None => Step::MicClosed,
+                },
                 packet = incoming => match packet {
                     Ok(frame) => Step::Recv(frame),
                     Err(_) => Step::Closed,
@@ -198,11 +207,14 @@ impl SteamAudioSession {
         };
 
         match step {
-            Step::Send(frame) => {
+            Step::Send => {
+                let frame = outgoing_frame
+                    .as_ref()
+                    .expect("Send step always stores its outgoing frame");
                 let SessionState {
                     encoder, opus_out, ..
                 } = &mut *state;
-                match encoder.encode_float(&frame, opus_out) {
+                match encoder.encode_float(frame, opus_out) {
                     Ok(len) => {
                         if let Err(err) = self.transport.send(&opus_out[..len]).await {
                             debug!("Steam voice: transport closed on send: {err}");
@@ -213,6 +225,11 @@ impl SteamAudioSession {
                 }
             }
             Step::Recv(frame) => self.handle_incoming(&mut state, frame),
+            Step::MicClosed => {
+                debug!("Steam voice: microphone input closed; requesting replacement");
+                state.mic = None;
+                state.mic_retries = 0;
+            }
             Step::Idle => {}
             Step::Closed => {
                 debug!("Steam voice: transport closed");
@@ -277,6 +294,18 @@ impl SteamAudioSession {
                 }
             }
         };
+
+        if state
+            .producers
+            .get(&peer)
+            .is_some_and(|producer| !producer.is_connected())
+        {
+            state.producers.remove(&peer);
+            debug!(
+                peer,
+                "Steam voice: playback mixer channel closed; re-requesting"
+            );
+        }
 
         if let Some(producer) = state.producers.get_mut(&peer) {
             // Playback channel is I16 (see the app's create_output_channel).

@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 
 use messenger_interface::types::ID;
-use messenger_unifier::MessengerId;
+use messenger_unifier::{MessengerId, ScopedId, UserEntity};
 use simple_audio_channels::{
-    effects::{Afx, Gain, Gate, LowCut, MuteSwitch},
+    effects::{AfxRegistration, Gain, MuteSwitch},
     effects_rack::{EffectsRack, Slot, SlotKey},
     params::ParamKey,
 };
@@ -17,38 +17,10 @@ use simple_audio_channels::{
 /// Which live channel an afx edit is aimed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AfxTarget {
-    /// The local microphone channel.
-    Mic,
+    /// Local microphone channel for one messenger backend.
+    Mic { messenger: MessengerId },
     /// A voice participant's playback channel.
     User { messenger: MessengerId, user: ID },
-}
-
-/// The effects the "+ afx" picker offers.
-#[derive(Debug, Clone, Copy)]
-pub enum AfxKind {
-    Gate,
-    Gain,
-    LowCut,
-}
-
-impl AfxKind {
-    pub const ALL: [AfxKind; 3] = [AfxKind::Gate, AfxKind::Gain, AfxKind::LowCut];
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            AfxKind::Gate => Gate::NAME,
-            AfxKind::Gain => Gain::NAME,
-            AfxKind::LowCut => LowCut::NAME,
-        }
-    }
-
-    pub fn build(&self) -> Box<dyn Afx + Send> {
-        match self {
-            AfxKind::Gate => Box::new(Gate::new()),
-            AfxKind::Gain => Box::new(Gain::default()),
-            AfxKind::LowCut => Box::new(LowCut::new()),
-        }
-    }
 }
 
 /// One live channel: its rack frontend, plus which of its effects are hidden
@@ -74,6 +46,8 @@ struct UserAudio {
     gain: Option<SlotKey>,
     /// The live playback channel, while it exists.
     channel: Option<ChannelAudio>,
+    /// Playback mute owned by this user's live channel.
+    output_mute: Option<MuteSwitch>,
 }
 
 impl UserAudio {
@@ -82,24 +56,29 @@ impl UserAudio {
             volume,
             gain: None,
             channel: None,
+            output_mute: None,
         }
     }
 }
 
+struct MicAudio {
+    channel: ChannelAudio,
+    mute: MuteSwitch,
+}
+
 #[derive(Default)]
 pub struct AudioControls {
-    /// The microphone channel's insert effects, while capture is live.
-    mic: Option<ChannelAudio>,
-    /// The live mic channel's hard-mute switch, while capture is live.
-    mic_mute: Option<MuteSwitch>,
+    /// Live microphone channels grouped by backend. Several backends—and
+    /// repeated backend input requests—must all obey global mute.
+    mics: HashMap<MessengerId, Vec<MicAudio>>,
     /// Desired mic mute. Outlives the channel.
     mic_muted: bool,
     /// Live output mute switches. Includes sources without a known user, so
     /// deafen still silences them.
-    output_mutes: Vec<MuteSwitch>,
+    anonymous_output_mutes: Vec<MuteSwitch>,
     /// Desired deafen. Same optimistic/reconciled lifecycle as `mic_muted`.
     deafened: bool,
-    users: HashMap<(MessengerId, ID), UserAudio>,
+    users: HashMap<ScopedId<UserEntity>, UserAudio>,
 }
 
 impl AudioControls {
@@ -114,48 +93,76 @@ impl AudioControls {
     /// Store the desired mic mute and apply it to the live switch, if any.
     pub fn set_mic_muted(&mut self, muted: bool) {
         self.mic_muted = muted;
-        if let Some(switch) = &self.mic_mute {
-            switch.set(muted);
+        for mic in self.mics.values_mut().flatten() {
+            mic.mute.set(muted);
         }
     }
 
     /// Store the desired deafen state and silence/restore playback.
     pub fn set_deafened(&mut self, deafened: bool) {
         self.deafened = deafened;
-        for mute in &self.output_mutes {
+        for state in self.users.values() {
+            if let Some(mute) = &state.output_mute {
+                mute.set(deafened);
+            }
+        }
+        self.anonymous_output_mutes.retain(MuteSwitch::is_attached);
+        for mute in &self.anonymous_output_mutes {
             mute.set(deafened);
         }
     }
 
     /// Track one output channel's deafen mute, seeding it from stored state.
-    pub fn attach_output_mute(&mut self, mute: MuteSwitch) {
+    pub fn attach_output_mute(
+        &mut self,
+        messenger: MessengerId,
+        user: Option<ID>,
+        mute: MuteSwitch,
+    ) {
         mute.set(self.deafened);
-        self.output_mutes.push(mute);
+        if let Some(user) = user {
+            self.users
+                .entry(ScopedId::new(messenger, user))
+                .or_insert_with(|| UserAudio::new(1.0))
+                .output_mute = Some(mute);
+        } else {
+            self.anonymous_output_mutes.retain(MuteSwitch::is_attached);
+            self.anonymous_output_mutes.push(mute);
+        }
     }
 
     /// Adopt a freshly created capture channel's rack and mute, seeding the
     /// mute from the stored state.
-    pub fn attach_mic(&mut self, rack: EffectsRack, mute: MuteSwitch, hidden: Vec<SlotKey>) {
+    pub fn attach_mic(
+        &mut self,
+        messenger: MessengerId,
+        rack: EffectsRack,
+        mute: MuteSwitch,
+        hidden: Vec<SlotKey>,
+    ) {
         mute.set(self.mic_muted);
-        self.mic = Some(ChannelAudio {
-            rack,
-            hidden_effects: hidden,
+        let mics = self.mics.entry(messenger).or_default();
+        mics.retain(|mic| mic.mute.is_attached());
+        mics.push(MicAudio {
+            channel: ChannelAudio {
+                rack,
+                hidden_effects: hidden,
+            },
+            mute,
         });
-        self.mic_mute = Some(mute);
     }
 
     /// Drop the live mic handles (the capture stream closed); the stored
     /// mute state survives for the next channel.
-    pub fn detach_mic(&mut self) {
-        self.mic = None;
-        self.mic_mute = None;
+    pub fn detach_all_mics(&mut self) {
+        self.mics.clear();
     }
 
     /// The volume a (possibly future) playback channel for this user should
     /// run at.
     pub fn user_volume(&self, messenger: MessengerId, user: ID) -> f32 {
         self.users
-            .get(&(messenger, user))
+            .get(&ScopedId::new(messenger, user))
             .map(|state| state.volume)
             .unwrap_or(1.0)
     }
@@ -165,7 +172,7 @@ impl AudioControls {
     pub fn set_user_volume(&mut self, messenger: MessengerId, user: ID, volume: f32) {
         let state = self
             .users
-            .entry((messenger, user))
+            .entry(ScopedId::new(messenger, user))
             .or_insert_with(|| UserAudio::new(volume));
         state.volume = volume;
         let Some(channel) = state.channel.as_mut() else {
@@ -193,7 +200,7 @@ impl AudioControls {
     ) {
         let state = self
             .users
-            .entry((messenger, user))
+            .entry(ScopedId::new(messenger, user))
             .or_insert_with(|| UserAudio::new(1.0));
         rack.set_param(gain, Gain::DESIRED_MULTIPLIER, state.volume);
         state.gain = Some(gain);
@@ -206,9 +213,10 @@ impl AudioControls {
     /// Drop the live handles for `user` (their channel is gone); the stored
     /// volume survives for the next one.
     pub fn detach_user(&mut self, messenger: MessengerId, user: ID) {
-        if let Some(state) = self.users.get_mut(&(messenger, user)) {
+        if let Some(state) = self.users.get_mut(&ScopedId::new(messenger, user)) {
             state.gain = None;
             state.channel = None;
+            state.output_mute = None;
         }
     }
 
@@ -217,26 +225,42 @@ impl AudioControls {
         for state in self.users.values_mut() {
             state.gain = None;
             state.channel = None;
+            state.output_mute = None;
         }
-        self.output_mutes.clear();
+        self.anonymous_output_mutes.clear();
+    }
+
+    /// Forget live controls owned by one discarded backend instance.
+    pub fn detach_messenger(&mut self, messenger: MessengerId) {
+        self.mics.remove(&messenger);
+        self.users
+            .retain(|scoped, _| scoped.messenger() != messenger);
     }
 
     fn channel(&self, target: AfxTarget) -> Option<&ChannelAudio> {
         match target {
-            AfxTarget::Mic => self.mic.as_ref(),
+            AfxTarget::Mic { messenger } => self
+                .mics
+                .get(&messenger)
+                .and_then(|mics| mics.last())
+                .map(|mic| &mic.channel),
             AfxTarget::User { messenger, user } => self
                 .users
-                .get(&(messenger, user))
+                .get(&ScopedId::new(messenger, user))
                 .and_then(|state| state.channel.as_ref()),
         }
     }
 
     fn channel_mut(&mut self, target: AfxTarget) -> Option<&mut ChannelAudio> {
         match target {
-            AfxTarget::Mic => self.mic.as_mut(),
+            AfxTarget::Mic { messenger } => self
+                .mics
+                .get_mut(&messenger)
+                .and_then(|mics| mics.last_mut())
+                .map(|mic| &mut mic.channel),
             AfxTarget::User { messenger, user } => self
                 .users
-                .get_mut(&(messenger, user))
+                .get_mut(&ScopedId::new(messenger, user))
                 .and_then(|state| state.channel.as_mut()),
         }
     }
@@ -265,9 +289,9 @@ impl AudioControls {
                 user,
                 volume,
             } => self.set_user_volume(messenger, user, volume),
-            AudioOp::AddEffect { target, kind } => {
+            AudioOp::AddEffect { target, effect } => {
                 if let Some(channel) = self.channel_mut(target) {
-                    channel.rack.insert(kind.build());
+                    channel.rack.insert_registered(effect);
                 }
             }
             AudioOp::RemoveEffect { target, id } => {
@@ -278,7 +302,7 @@ impl AudioControls {
                     channel.rack.remove(id);
                 }
                 if let AfxTarget::User { messenger, user } = target
-                    && let Some(state) = self.users.get_mut(&(messenger, user))
+                    && let Some(state) = self.users.get_mut(&ScopedId::new(messenger, user))
                     && state.gain == Some(id)
                 {
                     state.gain = None;
@@ -312,7 +336,7 @@ pub enum AudioOp {
     },
     AddEffect {
         target: AfxTarget,
-        kind: AfxKind,
+        effect: AfxRegistration,
     },
     RemoveEffect {
         target: AfxTarget,
@@ -426,31 +450,42 @@ mod tests {
 
         controls.apply(AudioOp::AddEffect {
             target,
-            kind: AfxKind::Gate,
+            effect: EffectsRack::available_effects()
+                .iter()
+                .copied()
+                .find(|effect| effect.name() == "Compressor")
+                .unwrap(),
         });
         let effects = controls.effects(target).unwrap();
         assert_eq!(effects.len(), 2);
-        let gate = effects.iter().find(|effect| effect.name == "Gate").unwrap();
-        assert!(gate.params().all(|param| param.value == param.spec.default));
-        let (gate_id, threshold) = (gate.id, gate.specs[0].key);
+        let compressor = effects
+            .iter()
+            .find(|effect| effect.name == "Compressor")
+            .unwrap();
+        assert!(
+            compressor
+                .params()
+                .all(|param| param.value == param.spec.default)
+        );
+        let (compressor_id, threshold) = (compressor.id, compressor.specs[0].key);
 
         controls.apply(AudioOp::SetEffectParam {
             target,
-            effect: gate_id,
+            effect: compressor_id,
             param: threshold,
             value: -30.0,
         });
-        let gate = controls
+        let compressor = controls
             .effects(target)
             .unwrap()
             .into_iter()
-            .find(|effect| effect.name == "Gate")
+            .find(|effect| effect.name == "Compressor")
             .unwrap();
-        assert_eq!(gate.values[0], -30.0);
+        assert_eq!(compressor.values[0], -30.0);
 
         controls.apply(AudioOp::RemoveEffect {
             target,
-            id: gate_id,
+            id: compressor_id,
         });
         assert_eq!(effect_names(&controls, target), vec!["Gain"]);
     }
@@ -475,18 +510,52 @@ mod tests {
     fn deafen_toggles_all_output_mutes_and_seeds_new_ones() {
         let mut controls = AudioControls::default();
         let first = MuteSwitch::default();
-        controls.attach_output_mute(first.clone());
+        let (messenger, user) = ids();
+        controls.attach_output_mute(messenger, Some(user), first.clone());
 
         controls.set_deafened(true);
         assert!(first.get());
 
         let second = MuteSwitch::default();
-        controls.attach_output_mute(second.clone());
+        controls.attach_output_mute(messenger, None, second.clone());
         assert!(second.get());
 
         controls.set_deafened(false);
         assert!(!first.get());
         assert!(!second.get());
+    }
+
+    #[test]
+    fn detach_user_removes_its_output_mute() {
+        let (messenger, user) = ids();
+        let mut controls = AudioControls::default();
+        let mute = MuteSwitch::default();
+        controls.attach_output_mute(messenger, Some(user), mute.clone());
+
+        controls.detach_user(messenger, user);
+        controls.set_deafened(true);
+
+        assert!(!mute.get());
+    }
+
+    #[test]
+    fn global_mute_reaches_every_live_microphone() {
+        let (messenger, _) = ids();
+        let mut controls = AudioControls::default();
+        let mut switches = Vec::new();
+        for _ in 0..2 {
+            let (mut rack, _backend) = EffectsRack::new();
+            let mute = Mute::new();
+            let switch = mute.switch();
+            let mute_id = rack.insert(Box::new(mute));
+            controls.attach_mic(messenger, rack, switch.clone(), vec![mute_id]);
+            switches.push(switch);
+        }
+
+        controls.set_mic_muted(true);
+        assert!(switches.iter().all(MuteSwitch::get));
+        controls.set_mic_muted(false);
+        assert!(switches.iter().all(|switch| !switch.get()));
     }
 
     #[test]
@@ -496,21 +565,28 @@ mod tests {
         let switch = mute.switch();
         let mute_id = rack.insert(Box::new(mute));
         let mut controls = AudioControls::default();
-        controls.attach_mic(rack, switch, vec![mute_id]);
+        let (messenger, _) = ids();
+        controls.attach_mic(messenger, rack, switch, vec![mute_id]);
 
         controls.apply(AudioOp::RemoveEffect {
-            target: AfxTarget::Mic,
+            target: AfxTarget::Mic { messenger },
             id: mute_id,
         });
-        assert!(controls.is_hidden_effect(AfxTarget::Mic, mute_id));
+        assert!(controls.is_hidden_effect(AfxTarget::Mic { messenger }, mute_id));
         // Still in the live rack, just never listed for the afx sheet.
         assert!(
             controls
-                .mic
-                .as_ref()
-                .is_some_and(|channel| channel.rack.contains(mute_id))
+                .mics
+                .get(&messenger)
+                .and_then(|mics| mics.last())
+                .is_some_and(|mic| mic.channel.rack.contains(mute_id))
         );
-        assert!(controls.effects(AfxTarget::Mic).unwrap().is_empty());
+        assert!(
+            controls
+                .effects(AfxTarget::Mic { messenger })
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Ops aimed at a channel that is gone must be a no-op, not a panic.
@@ -519,8 +595,8 @@ mod tests {
         let (messenger, user) = ids();
         let mut controls = AudioControls::default();
         controls.apply(AudioOp::AddEffect {
-            target: AfxTarget::Mic,
-            kind: AfxKind::Gate,
+            target: AfxTarget::Mic { messenger },
+            effect: EffectsRack::available_effects()[0],
         });
         controls.apply(AudioOp::SetUserVolume {
             messenger,

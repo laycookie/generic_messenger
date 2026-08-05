@@ -13,9 +13,6 @@ use messenger_interface::types::{
 
 use crate::components::user_status::status_indicator;
 
-/// IDs at or above this value are pending (optimistic send, not yet confirmed).
-pub const PENDING_ID_THRESHOLD: u64 = u64::MAX - 1_000_000;
-
 const LINK_COLOR: Color = Color::from_rgb(0.0, 0.0, 1.0);
 const PENDING_COLOR: Color = Color::from_rgb(0.0, 0.8, 0.0);
 const EDITED_COLOR: Color = Color::from_rgb(0.5, 0.5, 0.5);
@@ -39,11 +36,6 @@ fn font_for(style: TextStyle) -> Font {
     }
 }
 
-/// One iced rich-text span for a styled run (the no-inline-image path).
-fn styled_span<'a>(text: &'a str, style: TextStyle) -> Span<'a> {
-    Span::new(text).font(font_for(style))
-}
-
 /// One word as a `Text` widget (the inline-image flow path).
 fn word<'a>(text: &'a str, style: TextStyle, color: Option<Color>) -> Text<'a> {
     let text = Text::new(text).font(font_for(style));
@@ -55,10 +47,11 @@ fn word<'a>(text: &'a str, style: TextStyle, color: Option<Color>) -> Text<'a> {
 
 pub fn message_text<'a, M: Clone + 'static>(
     msg: &'a Identifier<Message>,
+    pending: bool,
     on_reaction: impl Fn(&'a Identifier<Message>, &'a str, bool) -> M + 'a,
     on_author: impl Fn(&'a Identifier<User>) -> M + 'a,
+    on_link: impl Fn(&str) -> M + 'a,
 ) -> Element<'a, M> {
-    let pending = *msg.id() >= PENDING_ID_THRESHOLD;
     // === Author ===
     let icon: std::path::PathBuf = msg
         .author
@@ -103,13 +96,20 @@ pub fn message_text<'a, M: Clone + 'static>(
         for span in spans {
             match span {
                 RichSpan::Text { text, style } => {
-                    for w in text.split_whitespace() {
-                        elements.push(word(w, *style, text_color).into());
+                    // Keep delimiters inside each token. `split_whitespace`
+                    // silently collapsed repeated spaces/newlines whenever an
+                    // inline emoji forced this flow layout.
+                    for run in text.split_inclusive(char::is_whitespace) {
+                        elements.push(word(run, *style, text_color).into());
                     }
                 }
-                RichSpan::Link { text, .. } => {
-                    for w in text.split_whitespace() {
-                        elements.push(word(w, TextStyle::default(), Some(link_color)).into());
+                RichSpan::Link { text, href } => {
+                    for run in text.split_inclusive(char::is_whitespace) {
+                        elements.push(
+                            mouse_area(word(run, TextStyle::default(), Some(link_color)))
+                                .on_press(on_link(href))
+                                .into(),
+                        );
                     }
                 }
                 RichSpan::Emoji(emoji) => match &emoji.image {
@@ -135,22 +135,27 @@ pub fn message_text<'a, M: Clone + 'static>(
             elements.push(Text::new("(edited)").size(12.0).color(EDITED_COLOR).into());
         }
         Wrap::with_elements(elements)
-            .spacing(3.0)
+            .spacing(0.0)
             .line_spacing(3.0)
             .align_items(Alignment::Center)
             .width_items(Length::Fill)
             .into()
     } else {
-        let mut rich_spans: Vec<Span<'_>> = Vec::new();
+        let mut rich_spans: Vec<Span<'_, String>> = Vec::new();
         for span in spans {
             match span {
-                RichSpan::Text { text, style } => rich_spans.push(styled_span(text, *style)),
+                RichSpan::Text { text, style } => {
+                    rich_spans.push(Span::new(text.as_str()).font(font_for(*style)));
+                }
                 RichSpan::Emoji(emoji) => {
                     rich_spans.push(Span::new(format!(":{}:", emoji.shortcode)))
                 }
-                RichSpan::Link { text, .. } => {
-                    rich_spans.push(Span::new(text.as_str()).color(LINK_COLOR))
-                }
+                RichSpan::Link { text, href } => rich_spans.push(
+                    Span::new(text.as_str())
+                        .color(LINK_COLOR)
+                        .underline(true)
+                        .link(href.clone()),
+                ),
                 // Sticker images render below; a sticker with no image falls
                 // back to its alt text here.
                 RichSpan::Sticker(sticker) => {
@@ -168,7 +173,9 @@ pub fn message_text<'a, M: Clone + 'static>(
         if msg.is_edited() {
             rich_spans.push(Span::new(" (edited)").color(EDITED_COLOR).size(12.0));
         }
-        Rich::from_iter(rich_spans).into()
+        Rich::from_iter(rich_spans)
+            .on_link_click(move |href| on_link(&href))
+            .into()
     };
 
     // === Message body: text content, then any sticker images ===

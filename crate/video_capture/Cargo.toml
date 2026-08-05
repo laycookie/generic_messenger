@@ -1,0 +1,29 @@
+[package]
+name = "simple-video-capture"
+version = "0.0.1"
+edition = "2024"
+description = "Cross-platform webcam and screen capture producing simple-video frames"
+license = "GPL-2.0-only"
+repository = "https://github.com/laycookie/generic_messenger"
+readme = "README.md"
+
+[features]
+default = []
+bench-internals = []
+
+[dependencies]
+nokhwa = { version = "0.10.11", features = ["input-native"] }
+# 0.1.0-beta.1 pulls cpal 0.15, whose alsa-sys link conflicts with
+# workspace's cpal 0.17 even though scap only uses cpal on Windows.
+scap = "0.0.8"
+simple-video = { path = "../video", version = "0.0.1" }
+thiserror = "2.0.12"
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "capture_normalization"
+harness = false
+required-features = ["bench-internals"]

@@ -20,7 +20,7 @@
 /// ```ignore
 /// capability_caster!(
 ///     /// Capability: voice chat integration.
-///     MessengerCasterVoice: Messenger => Voice { voice, arc_voice }
+///     MessengerCasterAudio: Messenger => Audio { audio, arc_audio }
 /// );
 /// ```
 ///
@@ -28,27 +28,27 @@
 ///
 /// ```ignore
 /// /// Capability: voice chat integration.
-/// pub trait MessengerCasterVoice {
-///     fn voice(&self) -> Result<&dyn Voice, MessengerError>;
-///     fn arc_voice(self: Arc<Self>) -> Result<Arc<dyn Voice>, MessengerError>;
+/// pub trait MessengerCasterAudio {
+///     fn audio(&self) -> Result<&dyn Audio, MessengerError>;
+///     fn arc_audio(self: Arc<Self>) -> Result<Arc<dyn Audio>, MessengerError>;
 /// }
 /// // Base case: any `Messenger` answers NotImplemented...
-/// impl<T: Messenger> MessengerCasterVoice for T {
-///     default fn voice(&self) -> Result<&dyn Voice, MessengerError> {
+/// impl<T: Messenger> MessengerCasterAudio for T {
+///     default fn audio(&self) -> Result<&dyn Audio, MessengerError> {
 ///         Err(MessengerError::NotImplemented)
 ///     }
-///     default fn arc_voice(self: Arc<Self>) -> Result<Arc<dyn Voice>, MessengerError> {
+///     default fn arc_audio(self: Arc<Self>) -> Result<Arc<dyn Audio>, MessengerError> {
 ///         Err(MessengerError::NotImplemented)
 ///     }
 /// }
 /// // ...overridden (via `#![feature(specialization)]`) for backends whose
-/// // concrete type also implements `Voice`, which is what makes the check
+/// // concrete type also implements `Audio`, which is what makes the check
 /// // compile-time per backend.
-/// impl<T: Messenger + Voice + 'static> MessengerCasterVoice for T {
-///     fn voice(&self) -> Result<&dyn Voice, MessengerError> {
+/// impl<T: Messenger + Audio + 'static> MessengerCasterAudio for T {
+///     fn audio(&self) -> Result<&dyn Audio, MessengerError> {
 ///         Ok(self)
 ///     }
-///     fn arc_voice(self: Arc<Self>) -> Result<Arc<dyn Voice>, MessengerError> {
+///     fn arc_audio(self: Arc<Self>) -> Result<Arc<dyn Audio>, MessengerError> {
 ///         Ok(self)
 ///     }
 /// }
@@ -62,7 +62,16 @@ macro_rules! capability_caster {
     )+) => {$(
         $(#[$attr])*
         pub trait $caster {
+            /// Borrow this capability when the concrete backend supports it.
+            ///
+            /// Returns [`MessengerError::NotImplemented`] without performing
+            /// network I/O when the capability is absent.
             fn $method(&self) -> Result<&dyn $cap, MessengerError>;
+
+            /// Cast a shared owner into an owned capability trait object.
+            ///
+            /// Use this form for spawned tasks and methods whose receiver is
+            /// `self: Arc<Self>`, such as feature `listen` methods.
             fn $arc_method(self: Arc<Self>) -> Result<Arc<dyn $cap>, MessengerError>;
         }
         impl<T: $base> $caster for T {
