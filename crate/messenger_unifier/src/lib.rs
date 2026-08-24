@@ -1,22 +1,24 @@
-//! Cross-messenger unifier.
-//!
-//! Aggregates the multiple [`Messenger`] backends the app is logged into behind
-//! a single [`MessengerRegistry`], assigning each a stable [`MessengerId`] and
-//! holding the per-backend fetched state ([`MessengerData`]: profile, contacts,
-//! conversations, guilds, calls, optimistic sends). This is application-level
-//! state that sits *above* the per-backend `messenger_interface` abstraction.
+#![cfg_attr(test, feature(arbitrary_self_types))]
+
+//! Registry and application state shared across messenger backends.
+//! Each backend receives stable [`MessengerId`] scope and [`MessengerData`].
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
+    future::Future,
     hash::{Hash, Hasher},
     marker::PhantomData,
     ops::Deref,
-    sync::Arc,
 };
 
 use messenger_interface::{
-    interface::{CallState, Messenger, TextDelete, TextEdit, TextReactions},
+    interface::{
+        CallState, Messenger, MessengerError, QueryEvent, TextDelete, TextEdit, TextEvent,
+        TextReactions, VideoCodec, VideoEvent, VoiceEvent,
+    },
+    owner::Owner,
+    stream::{EventFuture, LeaseStream, StreamScope, WeakSocketStream, WeakStreamSource},
     types::{House, ID, Identifier, Message as InterfaceMessage, Place, Room, User},
 };
 
@@ -25,13 +27,8 @@ const MAX_MESSAGE_TOMBSTONES: usize = 8192;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MessengerId(usize);
 
-/// Entity id paired with its owning messenger instance.
-///
-/// Backend adapters deliberately expose compact hashed `u64` ids. Their
-/// uniqueness contract stops at one messenger instance and one entity kind;
-/// comparing raw ids across accounts/backends is therefore a bug. This
-/// zero-allocation key makes messenger scope part of equality/hash, while `K`
-/// prevents mixing rooms, users, and messages at compile time.
+/// Entity ID scoped by messenger and marker type.
+/// Prevents cross-backend and cross-kind comparisons without allocation.
 pub struct ScopedId<K> {
     messenger: MessengerId,
     raw: ID,
@@ -94,37 +91,145 @@ pub enum UserEntity {}
 pub enum RoomEntity {}
 pub enum MessageEntity {}
 
-#[derive(Clone)]
+/// Backend facade storing erased owner and metadata only.
+/// Root streams are created on demand and owned by caller.
 pub struct MessengerInterface {
     pub id: MessengerId,
-    pub api: Arc<dyn Messenger>,
-    /// Pre-cast optional text capabilities. `None` means the backend's *type*
-    /// doesn't implement the capability (decided at compile time by the
-    /// `TextCaster*` specialization in `messenger_interface`) — the UI hides
-    /// the corresponding affordance instead of calling and failing.
-    pub edit: Option<Arc<dyn TextEdit>>,
-    pub delete: Option<Arc<dyn TextDelete>>,
-    pub reactions: Option<Arc<dyn TextReactions>>,
+    owner: Owner<dyn Messenger>,
+    /// Capability flags resolved once from the concrete backend type.
+    pub edit: bool,
+    pub delete: bool,
+    pub reactions: bool,
+}
+
+fn poll_query(
+    messenger: messenger_interface::owner::Retained<dyn Messenger>,
+) -> EventFuture<QueryEvent> {
+    match messenger.retained_query() {
+        Ok(query) => query.next_event(),
+        Err(_) => Box::pin(std::future::ready(None)),
+    }
+}
+
+fn poll_text(
+    messenger: messenger_interface::owner::Retained<dyn Messenger>,
+) -> EventFuture<TextEvent> {
+    match messenger.retained_text() {
+        Ok(text) => text.next_event(),
+        Err(_) => Box::pin(std::future::ready(None)),
+    }
+}
+
+fn poll_voice(
+    messenger: messenger_interface::owner::Retained<dyn Messenger>,
+) -> EventFuture<VoiceEvent> {
+    match messenger.retained_audio() {
+        Ok(audio) => audio.next_event(),
+        Err(_) => Box::pin(std::future::ready(None)),
+    }
+}
+
+fn poll_video(
+    messenger: messenger_interface::owner::Retained<dyn Messenger>,
+) -> EventFuture<VideoEvent> {
+    match messenger.retained_video() {
+        Ok(video) => video.next_event(),
+        Err(_) => Box::pin(std::future::ready(None)),
+    }
 }
 
 impl MessengerInterface {
-    fn new(id: MessengerId, api: Arc<dyn Messenger>) -> Self {
-        let text = api.clone().arc_text().ok();
+    fn new(id: MessengerId, owner: Owner<dyn Messenger>) -> Self {
+        let messenger = owner.get();
+        let text = messenger.text().ok();
+        let edit = text.is_some_and(|text| text.edit().is_ok());
+        let delete = text.is_some_and(|text| text.delete().is_ok());
+        let reactions = text.is_some_and(|text| text.reactions().is_ok());
+
         Self {
+            owner,
             id,
-            api,
-            edit: text.clone().and_then(|t| t.arc_edit().ok()),
-            delete: text.clone().and_then(|t| t.arc_delete().ok()),
-            reactions: text.and_then(|t| t.arc_reactions().ok()),
+            edit,
+            delete,
+            reactions,
         }
+    }
+
+    /// Returns borrowed access to backend messenger operations.
+    pub fn messenger(&self) -> &(dyn Messenger + 'static) {
+        self.owner.get()
+    }
+
+    /// Returns text editing capability when supported by this backend.
+    pub fn text_edit(&self) -> Result<&dyn TextEdit, MessengerError> {
+        self.messenger().text()?.edit()
+    }
+
+    /// Returns text deletion capability when supported by this backend.
+    pub fn text_delete(&self) -> Result<&dyn TextDelete, MessengerError> {
+        self.messenger().text()?.delete()
+    }
+
+    /// Returns text reaction capability when supported by this backend.
+    pub fn text_reactions(&self) -> Result<&dyn TextReactions, MessengerError> {
+        self.messenger().text()?.reactions()
+    }
+
+    /// Binds nested source to messenger lifetime.
+    pub fn bind_stream<Event>(&self, source: WeakStreamSource<Event>) -> WeakSocketStream<Event>
+    where
+        Event: Send + 'static,
+    {
+        StreamScope::new(self.owner.downgrade()).bind(source)
+    }
+
+    /// Open query listener within messenger lifetime scope.
+    pub async fn listen_query(
+        &self,
+    ) -> Result<LeaseStream<QueryEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        let query = self.messenger().query()?;
+        LeaseStream::open(&self.owner, query.prepare_listener(), poll_query).await
+    }
+
+    /// Open text listener within messenger lifetime scope.
+    pub async fn listen_text(
+        &self,
+    ) -> Result<LeaseStream<TextEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        let text = self.messenger().text()?;
+        LeaseStream::open(&self.owner, text.prepare_listener(), poll_text).await
+    }
+
+    /// Open voice listener within messenger lifetime scope.
+    pub async fn listen_voice(
+        &self,
+    ) -> Result<LeaseStream<VoiceEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        let audio = self.messenger().audio()?;
+        LeaseStream::open(&self.owner, audio.prepare_listener(), poll_voice).await
+    }
+
+    /// Opens configured video listener.
+    pub async fn listen_video(
+        &self,
+        preferred_codec: VideoCodec,
+    ) -> Result<LeaseStream<VideoEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        let video = self.messenger().video()?;
+        let setup = async move {
+            video.set_preferred_codec(preferred_codec).await?;
+            video.prepare_listener().await
+        };
+        LeaseStream::open(&self.owner, setup, poll_video).await
+    }
+
+    fn close(&self) {
+        self.owner.close();
     }
 }
 
 impl Deref for MessengerInterface {
-    type Target = Arc<dyn Messenger>;
+    type Target = dyn Messenger + 'static;
 
     fn deref(&self) -> &Self::Target {
-        &self.api
+        self.messenger()
     }
 }
 
@@ -185,14 +290,12 @@ pub struct MessengerData {
     pub calls: Vec<Call>,
     /// Tracks optimistic messages that haven't been confirmed by the server yet.
     pub pending_sends: Vec<PendingSend>,
-    /// Recent server deletions. Prevents stale HTTP snapshots and late send
-    /// confirmations from resurrecting rows deleted by ordered socket events.
+    /// Recent deletions blocking stale HTTP/send resurrection.
     message_tombstones: HashSet<(ID, ID)>,
     message_tombstone_order: VecDeque<(ID, ID)>,
     /// Full edit payloads received before a room's initial snapshot.
     pending_message_updates: HashMap<(ID, ID), Identifier<InterfaceMessage>>,
-    /// Graph-style edge from room id to its owning top-level conversation or
-    /// guild. Stores no duplicated room/user/message payloads.
+    /// Room-to-conversation/guild index without duplicated payloads.
     room_index: HashMap<ID, RoomLocation>,
 }
 
@@ -265,9 +368,7 @@ impl MessengerData {
             return Some(room);
         }
 
-        // Public vectors remain source-compatible while migration toward
-        // normalized mutations is in progress. Fall back safely if external
-        // code changed structure without rebuilding the index.
+        // Repair stale index after direct public-vector mutation.
         self.conversations
             .iter()
             .find(|room| *room.id() == room_id)
@@ -320,9 +421,7 @@ impl MessengerData {
         {
             let conversation = self.conversations.remove(pos);
             self.conversations.insert(0, conversation);
-            // Only shifted conversation edges changed. Guild edges and later
-            // conversations remain valid; avoid scanning the whole graph on
-            // every incoming DM.
+            // Repair only shifted conversation edges.
             for (index, room) in self.conversations[..=pos].iter().enumerate() {
                 self.room_index
                     .insert(*room.id(), RoomLocation::Conversation(index));
@@ -334,8 +433,7 @@ impl MessengerData {
         self.message_tombstones.contains(&(room_id, message_id))
     }
 
-    /// Apply or defer a socket edit. Deferral covers edit-before-snapshot
-    /// without manufacturing a partial room/message graph.
+    /// Applies edit or defers it until snapshot provides graph position.
     pub fn update_message(&mut self, room_id: ID, message: Identifier<InterfaceMessage>) {
         let message_id = *message.id();
         if self.message_is_deleted(room_id, message_id) {
@@ -373,8 +471,7 @@ impl MessengerData {
         }
     }
 
-    /// Resolve one optimistic row without resurrecting a server ID already
-    /// deleted by a newer socket event.
+    /// Confirms optimistic row unless newer deletion won.
     pub fn confirm_pending_message(
         &mut self,
         room_id: ID,
@@ -415,8 +512,7 @@ impl MessengerData {
         }
     }
 
-    /// Merge initial/older HTTP rows with socket mutations which landed while
-    /// request was in flight. Socket state wins conflicts; tombstones win all.
+    /// Merges HTTP rows with newer socket state; tombstones win.
     pub fn merge_message_snapshot(
         &mut self,
         room_id: ID,
@@ -425,30 +521,16 @@ impl MessengerData {
         if self.room(room_id).is_none() {
             return;
         }
-        let mut merged = snapshot
-            .into_iter()
-            .filter(|message| !self.message_is_deleted(room_id, *message.id()))
-            .collect::<Vec<_>>();
-        let update_keys = self
-            .pending_message_updates
-            .keys()
-            .filter(|(update_room, _)| *update_room == room_id)
-            .copied()
-            .collect::<Vec<_>>();
-        let updates = update_keys
-            .into_iter()
-            .filter_map(|key| self.pending_message_updates.remove(&key))
-            .collect::<Vec<_>>();
         let live = self
             .room_mut(room_id)
             .and_then(|room| room.messages.take())
             .unwrap_or_default();
-
-        let mut positions = HashMap::with_capacity(merged.len() + updates.len() + live.len());
-        let mut deduplicated = Vec::with_capacity(positions.capacity());
-        for message in merged.drain(..).chain(updates).chain(live) {
+        let capacity = snapshot.len() + live.len();
+        let mut positions = HashMap::with_capacity(capacity);
+        let mut deduplicated = Vec::with_capacity(capacity);
+        for message in snapshot.into_iter().chain(live) {
             let message_id = *message.id();
-            if self.message_is_deleted(room_id, message_id) {
+            if self.message_tombstones.contains(&(room_id, message_id)) {
                 continue;
             }
             if let Some(index) = positions.get(&message_id).copied() {
@@ -458,6 +540,19 @@ impl MessengerData {
                 deduplicated.push(message);
             }
         }
+
+        // Apply deferred edits only where snapshot supplies ordering.
+        for ((_, message_id), message) in self
+            .pending_message_updates
+            .extract_if(|(update_room, _), _| *update_room == room_id)
+        {
+            if !self.message_tombstones.contains(&(room_id, message_id))
+                && let Some(index) = positions.get(&message_id).copied()
+            {
+                deduplicated[index] = message;
+            }
+        }
+
         if let Some(room) = self.room_mut(room_id) {
             room.messages = Some(deduplicated);
         }
@@ -471,7 +566,7 @@ impl Default for MessengerData {
 }
 
 pub struct MessengerEntry {
-    pub interface: MessengerInterface,
+    pub interface: Owner<MessengerInterface>,
     pub data: MessengerData,
 }
 
@@ -489,14 +584,15 @@ impl MessengerRegistry {
         self.entries.is_empty()
     }
 
-    pub fn add(&mut self, api: Arc<dyn Messenger>) -> MessengerId {
+    pub fn add(&mut self, owner: Owner<dyn Messenger>) -> MessengerId {
         let id = MessengerId(self.next_id);
         self.next_id += 1;
+        let interface = Owner::new(MessengerInterface::new(id, owner));
 
         self.entries.insert(
             id,
             MessengerEntry {
-                interface: MessengerInterface::new(id, api),
+                interface,
                 data: MessengerData::new(),
             },
         );
@@ -505,7 +601,9 @@ impl MessengerRegistry {
     }
 
     pub fn remove(&mut self, id: MessengerId) {
-        self.entries.remove(&id);
+        if let Some(entry) = self.entries.remove(&id) {
+            entry.interface.get().close();
+        }
     }
 
     pub fn get(&self, id: MessengerId) -> Option<&MessengerEntry> {
@@ -516,8 +614,18 @@ impl MessengerRegistry {
         self.entries.get_mut(&id)
     }
 
-    pub fn interface(&self, id: MessengerId) -> Option<&MessengerInterface> {
-        self.entries.get(&id).map(|e| &e.interface)
+    /// Builds registry-independent operation retained by [`MessengerId`].
+    pub fn with_interface_async<F, R>(
+        &self,
+        id: MessengerId,
+        operation: F,
+    ) -> Option<impl Future<Output = Option<R>> + 'static + use<F, R>>
+    where
+        F: for<'a> AsyncFnOnce(&'a MessengerInterface) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let interface = self.entries.get(&id)?.interface.downgrade();
+        Some(async move { interface.with_async(operation).await })
     }
 
     pub fn data(&self, id: MessengerId) -> Option<&MessengerData> {
@@ -535,8 +643,96 @@ impl MessengerRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use async_trait::async_trait;
+    use futures::StreamExt as _;
+    use messenger_interface::auth::{AuthMethod, Credential};
+    use messenger_interface::interface::Query;
+    use messenger_interface::owner::Owner;
+    use messenger_interface::stream::{ArcStream, WeakStreamSource};
     use messenger_interface::types::{Revision, RoomCapabilities};
+
+    struct TestMessenger;
+    struct QueryMessenger;
+
+    struct PendingStream;
+
+    #[async_trait]
+    impl ArcStream for PendingStream {
+        type Item = ();
+
+        async fn next(self: Arc<Self>) -> Option<Self::Item> {
+            futures::future::pending().await
+        }
+    }
+
+    #[async_trait]
+    impl Messenger for TestMessenger {
+        async fn create_messenger(
+            _: Credential,
+        ) -> Result<Owner<dyn Messenger>, Box<dyn std::error::Error + Send + Sync>> {
+            unreachable!()
+        }
+
+        fn auth_methods() -> &'static [AuthMethod] {
+            &[]
+        }
+
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn id(&self) -> String {
+            String::from("test")
+        }
+
+        fn auth(&self) -> Credential {
+            Credential(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl Messenger for QueryMessenger {
+        async fn create_messenger(
+            _: Credential,
+        ) -> Result<Owner<dyn Messenger>, Box<dyn std::error::Error + Send + Sync>> {
+            unreachable!()
+        }
+
+        fn auth_methods() -> &'static [AuthMethod] {
+            &[]
+        }
+
+        fn name(&self) -> &'static str {
+            "query-test"
+        }
+
+        fn id(&self) -> String {
+            String::from("query-test")
+        }
+
+        fn auth(&self) -> Credential {
+            Credential(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl Query for QueryMessenger {
+        async fn prepare_listener(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+
+        fn next_event(self: messenger_interface::owner::Retained<Self>) -> EventFuture<QueryEvent> {
+            Box::pin(async {
+                Some(QueryEvent::ChannelDeleted {
+                    r#where: None,
+                    room_id: 7,
+                })
+            })
+        }
+    }
 
     fn room(id: ID) -> Identifier<Place<Room>> {
         Identifier::new(
@@ -576,9 +772,76 @@ mod tests {
         assert_eq!(first, same);
         assert_ne!(first, other_backend);
 
-        // Different entity kinds cannot be compared or inserted into the same
-        // typed collection; this assignment is the positive compile-time side.
+        // Marker type prevents cross-kind use.
         let _: ScopedId<UserEntity> = ScopedId::new(MessengerId(1), 7);
+    }
+
+    #[test]
+    fn unsupported_feature_flags_are_false() {
+        let owner: Owner<dyn Messenger> = Owner::new(TestMessenger);
+        let interface = MessengerInterface::new(MessengerId(0), owner);
+
+        assert!(!interface.edit);
+        assert!(!interface.delete);
+        assert!(!interface.reactions);
+    }
+
+    #[test]
+    fn root_listener_projects_retained_erased_owner_on_demand() {
+        futures::executor::block_on(async {
+            let owner: Owner<dyn Messenger> = Owner::new(QueryMessenger);
+            let interface = MessengerInterface::new(MessengerId(0), owner);
+            let mut stream = interface
+                .listen_query()
+                .await
+                .expect("query listener must be supported");
+
+            assert!(matches!(
+                stream.next().await,
+                Some(QueryEvent::ChannelDeleted {
+                    r#where: None,
+                    room_id: 7,
+                })
+            ));
+        });
+    }
+
+    #[test]
+    fn removal_cancels_owned_interface_future() {
+        let owner: Owner<dyn Messenger> = Owner::new(TestMessenger);
+        let lifetime = owner.downgrade();
+        let mut registry = MessengerRegistry::default();
+        let id = registry.add(owner);
+        let interface = match registry.with_interface_async(id, async |interface| interface.name())
+        {
+            Some(interface) => interface,
+            None => unreachable!("registered messenger must yield an interface future"),
+        };
+
+        registry.remove(id);
+
+        assert!(!lifetime.is_active());
+        assert!(futures::executor::block_on(interface).is_none());
+    }
+
+    #[test]
+    fn removal_closes_wrapper_bound_stream_while_source_survives() {
+        futures::executor::block_on(async {
+            let owner: Owner<dyn Messenger> = Owner::new(TestMessenger);
+            let mut registry = MessengerRegistry::default();
+            let id = registry.add(owner);
+            let source = Arc::new(PendingStream);
+            let mut stream = registry
+                .get(id)
+                .unwrap()
+                .interface
+                .bind_stream(WeakStreamSource::from_arc(&source));
+
+            registry.remove(id);
+
+            assert!(stream.next().await.is_none());
+            assert_eq!(Arc::strong_count(&source), 1);
+        });
     }
 
     #[test]
@@ -605,6 +868,33 @@ mod tests {
         let messages = data.room(1).unwrap().messages.as_ref().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].history.len(), 1);
+    }
+
+    #[test]
+    fn pending_socket_edit_overrides_live_and_snapshot_rows() {
+        let mut data = data_with_room();
+        data.room_mut(1).unwrap().messages = Some(vec![message(7, false)]);
+        data.pending_message_updates
+            .insert((1, 7), message(7, true));
+
+        data.merge_message_snapshot(1, vec![message(7, false)]);
+
+        let messages = data.room(1).unwrap().messages.as_ref().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].history.len(), 1);
+    }
+
+    #[test]
+    fn unmatched_socket_edit_does_not_create_unordered_row() {
+        let mut data = data_with_room();
+        data.update_message(1, message(8, true));
+
+        data.merge_message_snapshot(1, vec![message(7, false)]);
+
+        let messages = data.room(1).unwrap().messages.as_ref().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(*messages[0].id(), 7);
+        assert!(data.pending_message_updates.is_empty());
     }
 
     #[test]

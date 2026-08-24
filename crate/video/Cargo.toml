@@ -2,21 +2,39 @@
 name = "simple-video"
 version = "0.0.1"
 edition = "2024"
-description = "Video frames, latest-frame channels, and codec wrappers"
+description = "Cross-platform video capture, frames, streams, and codec wrappers"
 license = "GPL-2.0-only"
 repository = "https://github.com/laycookie/generic_messenger"
+readme = "README.md"
 
 [features]
-default = []
+default = ["capture"]
 av1 = ["dep:rav1e"]
 h264 = ["dep:openh264"]
-bench-internals = ["av1"]
+capture = ["dep:nokhwa", "dep:scap", "dep:thiserror", "dep:v4l"]
+bench-internals = []
 
 [dependencies]
 futures = { workspace = true }
 openh264 = { version = "0.9.7", optional = true }
-rav1e = { version = "0.8.1", default-features = false, features = ["threading"], optional = true }
+rav1e = { version = "0.8.1", default-features = false, features = ["asm", "threading"], optional = true }
+thiserror = { version = "2.0.12", optional = true }
 tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nokhwa = { version = "0.10.11", features = ["input-v4l"], optional = true }
+v4l = { version = "0.14.0", default-features = false, features = ["v4l2-sys"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa = { version = "0.10.11", features = ["input-avfoundation"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nokhwa = { version = "0.10.11", features = ["input-msmf"], optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+# 0.1.0-beta.1 pulls cpal 0.15, whose alsa-sys link conflicts with
+# workspace's cpal 0.17 even though scap only uses cpal on Windows.
+scap = { version = "0.0.8", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
@@ -24,4 +42,9 @@ criterion = { version = "0.8.2", default-features = false, features = ["cargo_be
 [[bench]]
 name = "simd_conversions"
 harness = false
-required-features = ["bench-internals"]
+required-features = ["bench-internals", "av1"]
+
+[[bench]]
+name = "capture_normalization"
+harness = false
+required-features = ["bench-internals", "capture"]

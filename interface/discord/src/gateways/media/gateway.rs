@@ -16,20 +16,18 @@ use futures::{
     lock::{Mutex as AsyncMutex, MutexGuard},
 };
 use messenger_interface::interface::{AudioEvent, VideoBroadcastKind, VideoEvent, VideoFrame};
-use simple_video::VideoCodec;
 use surf::http::convert::json;
 use tracing::{debug, error, trace, warn};
 
 use super::{
-    AudioChannel, Endpoint, SessionId, VideoChannel, VoiceOpcode,
+    AudioChannel, DiscordVideoCodec, Endpoint, SessionId, VideoChannel, VoiceOpcode,
     connection::{Connection, Ssrc},
     payloads::{HelloPayload, SessionUpdatePayload},
 };
-use crate::gateways::general::EventHub;
 use crate::gateways::{
     Gateway, GatewayFrame, GatewayState, Handshake, Handshaking, Heartbeat, Websocket, expect_hello,
 };
-use crate::{InnerDiscord, UnitStruct, adapter::video::VideoControls, api::SNOWFLAKE};
+use crate::{DiscordRuntimeState, adapter::video::VideoControls, api::SNOWFLAKE};
 
 /// Frames to drop while waiting for the Speaking event that names an SSRC's
 /// user before attaching the channel unbound (no per-user volume/afx). At one
@@ -151,7 +149,7 @@ impl MediaConnection {
     /// Returns `false` if a new channel is being initialized and the caller should yield.
     pub(crate) fn dispatch_incoming_audio(
         &self,
-        events: &EventHub,
+        submit: impl Fn(AudioEvent),
         ssrc: Ssrc,
         samples: &[i16],
     ) -> bool {
@@ -168,7 +166,7 @@ impl MediaConnection {
                 };
                 let (sender, receiver) = oneshot::channel();
                 vacant_entry.insert(AudioChannel::Initializing(receiver).into());
-                events.submit_audio(AudioEvent::AddAudioSource {
+                submit(AudioEvent::AddAudioSource {
                     user: Some(user),
                     channel: sender,
                 });
@@ -196,7 +194,7 @@ impl MediaConnection {
                     let (sender, receiver) = oneshot::channel();
                     *channel = AudioChannel::Initializing(receiver);
                     drop(channel);
-                    events.submit_audio(AudioEvent::AddAudioSource {
+                    submit(AudioEvent::AddAudioSource {
                         user,
                         channel: sender,
                     });
@@ -270,9 +268,9 @@ impl MediaConnection {
     /// `kind` distinguishes camera video (on the call connection) from a Go
     /// Live screen share (on its own stream connection), both of which route
     /// through this same per-SSRC machinery on their respective gateways.
-    pub(crate) fn dispatch_incoming_video<T: UnitStruct>(
+    pub(crate) fn dispatch_incoming_video(
         &self,
-        discord: &InnerDiscord<T>,
+        discord: &DiscordRuntimeState,
         ssrc: Ssrc,
         frame: VideoFrame,
         kind: VideoBroadcastKind,
@@ -384,9 +382,9 @@ impl MediaConnection {
     /// the source is gone. Returns the retired SSRCs; empty when the user had no
     /// live video (e.g. an audio-only participant's periodic announce), so a
     /// caller can skip logging a non-event.
-    pub(crate) fn retire_user_video<T: UnitStruct>(
+    pub(crate) fn retire_user_video(
         &self,
-        discord: &InnerDiscord<T>,
+        discord: &DiscordRuntimeState,
         user_id: SNOWFLAKE,
         kind: VideoBroadcastKind,
     ) -> Vec<Ssrc> {
@@ -546,7 +544,7 @@ impl Gateway<Media> {
     /// Server opcode 14 response confirms selection before encoder switches.
     pub(crate) async fn update_video_codecs(
         &self,
-        preferred: VideoCodec,
+        preferred: DiscordVideoCodec,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Between Hello and Ready, connection is already visible to control
         // plane but protocol selection has not happened. Ready will read latest

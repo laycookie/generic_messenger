@@ -2,18 +2,19 @@ pub mod login;
 pub mod messenger;
 pub mod settings;
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use crate::Screen;
 use futures::channel::oneshot;
 use messenger_interface::auth::InteractiveAuthSession;
 use messenger_interface::interface::{
-    AudioEvent, CallStatus, Messenger as MessengerApi, QueryEvent, TextEvent, VideoBroadcastKind,
-    VideoEvent, VideoFrame, VideoResolution, VideoStreamId, VideoStreamMetadata, VoiceEvent,
+    AudioEvent, CallStatus, Messenger, QueryEvent, TextEvent, VideoBroadcastKind, VideoEvent,
+    VideoFrame, VideoResolution, VideoStreamId, VideoStreamMetadata, VoiceEvent,
 };
+use messenger_interface::owner::Owner;
 use messenger_interface::types::{House, ID, Identifier, Place, Room, User};
 use messenger_unifier::{MessengerId, MessengerRegistry};
-use simple_video_capture::CaptureSource;
+use simple_video::CaptureSource;
 
 pub type RemoteVideoKey = (MessengerId, VideoStreamId);
 pub type VideoInputKey = (MessengerId, VideoBroadcastKind);
@@ -265,7 +266,7 @@ pub(crate) enum AppMessage {
     RestartMessenger(MessengerId),
     MessengerRestarted {
         messenger: MessengerId,
-        result: Result<Arc<dyn MessengerApi>, String>,
+        result: Result<Owner<dyn Messenger>, String>,
     },
     ListenerStopped {
         messenger: MessengerId,
@@ -291,7 +292,7 @@ pub(crate) enum AppMessage {
     },
     LoginFinished {
         attempt: u64,
-        result: Result<Arc<dyn MessengerApi>, String>,
+        result: Result<Owner<dyn Messenger>, String>,
     },
     Chat(messenger::Message),
     Settings(settings::Message),

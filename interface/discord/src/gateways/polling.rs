@@ -1,15 +1,15 @@
-use std::{
-    pin::pin,
-    sync::{Arc, atomic::Ordering},
-};
+use std::{pin::pin, sync::Arc};
 
 use futures::{
     FutureExt as _, StreamExt,
     future::{self, Either},
-    lock::MutexGuard,
     select, stream,
 };
-use messenger_interface::interface::VideoBroadcastKind;
+use futures_locks::MutexGuard;
+use messenger_interface::{
+    interface::{VideoBroadcastKind, VideoEvent},
+    owner::Retained,
+};
 use tracing::{debug, error, trace, warn};
 
 use super::{
@@ -17,7 +17,7 @@ use super::{
     general::{General, Opcode},
     media::{ConnectionRole, Media, StreamGateway, StreamKey, VoiceOpcode},
 };
-use crate::{InnerDiscord, UnitStruct, adapter::video::VideoControls, gateways::GatewayStreamExt};
+use crate::{DiscordRuntimeState, InnerDiscord, backend::Committed, gateways::GatewayStreamExt};
 
 enum WatchedGatewayTurn {
     Event {
@@ -50,28 +50,12 @@ enum GatewayAction {
     BroadcastHeartbeat(Result<(), async_tungstenite::tungstenite::Error>),
 }
 
-/// One already-selected gateway action plus exclusive permission to execute
-/// it. Selection is cancellation-safe: no frame lives here until websocket
-/// `next()` returned. Once returned, callers must execute this turn outside any
-/// competing `select!`; the permit preserves gateway ordering until completion.
-pub(crate) struct GatewayTurn<'a> {
-    permit: MutexGuard<'a, ()>,
+/// Selected gateway action with ordering permit.
+/// Selection may be cancelled; returned turns must execute to completion.
+pub(crate) struct GatewayTurn {
+    permit: MutexGuard<()>,
     gateway: Arc<Gateway<General>>,
     action: GatewayAction,
-}
-
-enum MainGatewayAction {
-    Event(Option<GatewayFrame<Opcode>>),
-    Heartbeat(Result<(), async_tungstenite::tungstenite::Error>),
-}
-
-/// Main-gateway-only turn used by cache-first queries before capability
-/// listeners own an `Arc<InnerDiscord<_>>`. Voice/media turns require that Arc
-/// and remain exclusive to [`GatewayTurn`].
-pub(crate) struct MainGatewayTurn<'a> {
-    permit: MutexGuard<'a, ()>,
-    gateway: Arc<Gateway<General>>,
-    action: MainGatewayAction,
 }
 
 async fn poll_watched_gateway(
@@ -123,15 +107,14 @@ async fn poll_watched_gateways(
     }
 }
 
-/// Borrowed gateway-session teardown dependencies. Holds references only;
-/// lifecycle cleanup no longer expands `InnerDiscord`'s inherent API.
-struct GatewaySessions<'a, T: UnitStruct> {
-    discord: &'a InnerDiscord<T>,
+/// Borrowed gateway-session teardown dependencies.
+struct GatewaySessions<'a> {
+    runtime: &'a DiscordRuntimeState,
 }
 
-impl<'a, T: UnitStruct> GatewaySessions<'a, T> {
-    fn new(discord: &'a InnerDiscord<T>) -> Self {
-        Self { discord }
+impl<'a> GatewaySessions<'a> {
+    fn new(runtime: &'a DiscordRuntimeState) -> Self {
+        Self { runtime }
     }
 
     /// Tear down watched Go Live stream and optionally remove availability.
@@ -144,12 +127,17 @@ impl<'a, T: UnitStruct> GatewaySessions<'a, T> {
     ) {
         let source = expected.watched_source().await;
         if let Some(slot) = gateway.voice.remove_watched_stream_if(key, expected) {
-            if remove_availability && let Some((user, channel)) = source {
-                VideoControls::new(self.discord).emit_remove_participant_video(
+            if remove_availability
+                && let Some((user, channel)) = source
+                && let Some(id) = self.runtime.media.remove_participant_video(
                     user,
                     channel,
                     VideoBroadcastKind::Screen,
-                );
+                )
+            {
+                gateway
+                    .events
+                    .submit_video(VideoEvent::RemoveVideoStream { id });
             }
             slot.disconnect().await;
         }
@@ -168,93 +156,23 @@ impl<'a, T: UnitStruct> GatewaySessions<'a, T> {
     }
 
     async fn end_gateway_session(&self, gateway: &Gateway<General>) {
+        // Unpublish before teardown; turn permit blocks reinitialization.
+        self.runtime.gateway.current.store(None);
         self.end_voice_session(gateway).await;
-        self.discord.gateway.current.store(None);
     }
 }
 
-impl<T: UnitStruct> InnerDiscord<T> {
-    pub(crate) async fn wait_for_main_gateway_turn(&self) -> Option<MainGatewayTurn<'_>> {
-        if self.gateway.killed.load(Ordering::Acquire) {
-            return None;
-        }
+impl DiscordRuntimeState {
+    /// Selects next cancellation-safe gateway action.
+    pub(crate) async fn wait_for_gateway_turn(&self) -> Option<GatewayTurn> {
         let permit = self.gateway.turn.lock().await;
-        if self.gateway.killed.load(Ordering::Acquire) {
-            return None;
-        }
-        let Some(gateway) = self.gateway.current.load_full() else {
-            debug!("Gateway not connected (never started, disconnected, or killed)");
-            return None;
-        };
-        let action = {
-            let mut receiver_guard = gateway.websocket.receiver.lock().await;
-            let mut receiver = pin!(receiver_guard.gateway_frames::<Opcode>());
-            select! {
-                event = receiver.next() => MainGatewayAction::Event(event),
-                result = gateway.heartbeat().fuse() => MainGatewayAction::Heartbeat(result),
-            }
-        };
-        Some(MainGatewayTurn {
-            permit,
-            gateway,
-            action,
-        })
-    }
-
-    pub(crate) async fn execute_main_gateway_turn(&self, turn: MainGatewayTurn<'_>) -> Option<()> {
-        let MainGatewayTurn {
-            permit,
-            gateway,
-            action,
-        } = turn;
-        let sessions = GatewaySessions::new(self);
-        let outcome = match action {
-            MainGatewayAction::Event(Some(event)) => {
-                if let Err(err) = event.exec(self, &gateway).await {
-                    warn!("Failed to execute gateway event: {err}");
-                }
-                trace!("Gateway cache event handled");
-                Some(())
-            }
-            MainGatewayAction::Event(None) => {
-                error!("Gateway connection closed; tearing it down");
-                sessions.end_gateway_session(&gateway).await;
-                None
-            }
-            MainGatewayAction::Heartbeat(Ok(())) => Some(()),
-            MainGatewayAction::Heartbeat(Err(err)) => {
-                error!("Gateway heartbeat failed: {err}; tearing down the connection");
-                sessions.end_gateway_session(&gateway).await;
-                None
-            }
-        };
-        drop(permit);
-        outcome
-    }
-
-    /// Wait until one gateway frame, heartbeat, or connection closure wins.
-    ///
-    /// This phase is safe to race against interface events and media work: if
-    /// cancelled, either no frame was consumed or a completed action was
-    /// returned to the caller. [`Self::execute_gateway_turn`] must run a
-    /// returned turn outside the race so consumed frames reach completion.
-    pub(crate) async fn wait_for_gateway_turn(&self) -> Option<GatewayTurn<'_>> {
-        if self.gateway.killed.load(Ordering::Acquire) {
-            return None;
-        }
-        let permit = self.gateway.turn.lock().await;
-        if self.gateway.killed.load(Ordering::Acquire) {
-            return None;
-        }
         let Some(ref_gateway) = self.gateway.current.load_full() else {
-            debug!("Gateway not connected (never started, disconnected, or killed)");
+            debug!("Gateway not connected (never started or disconnected)");
             return None;
         };
 
         let action = {
-            // Main receiver also acts as root session liveness source. The
-            // outer turn permit, rather than this receiver guard, remains held
-            // while the selected action executes.
+            // Main receiver also signals root session liveness.
             let mut gateway_receiver_guard = ref_gateway.websocket.receiver.lock().await;
             let mut gateway_receiver = pin!(gateway_receiver_guard.gateway_frames::<Opcode>());
 
@@ -336,22 +254,18 @@ impl<T: UnitStruct> InnerDiscord<T> {
         })
     }
 
-    /// Execute one action returned by [`Self::wait_for_gateway_turn`] to
-    /// completion before releasing its ordering permit.
-    pub(crate) async fn execute_gateway_turn(
-        self: &Arc<Self>,
-        turn: GatewayTurn<'_>,
-    ) -> Option<()> {
+    /// Executes action before releasing ordering permit.
+    async fn execute_gateway_turn(&self, turn: GatewayTurn) -> Option<()> {
         let GatewayTurn {
             permit,
             gateway,
             action,
         } = turn;
-        let sessions = GatewaySessions::new(self.as_ref());
+        let sessions = GatewaySessions::new(self);
 
         let outcome = match action {
             GatewayAction::MainEvent(Some(event)) => {
-                if let Err(err) = event.exec(self.as_ref(), &gateway).await {
+                if let Err(err) = event.exec(self, &gateway).await {
                     warn!("Failed to execute gateway event: {err}");
                 }
                 trace!("Gateway main event handled");
@@ -474,11 +388,19 @@ impl<T: UnitStruct> InnerDiscord<T> {
         outcome
     }
 
-    /// Root gateway loss also ends its voice session before publishing the root
-    /// disconnect. Thin facade needed by general gateway dispatcher.
+    /// Unpublishes root gateway before dependent teardown.
     pub(crate) async fn end_gateway_session(&self, gateway: &Gateway<General>) {
         GatewaySessions::new(self)
             .end_gateway_session(gateway)
             .await;
     }
+}
+
+/// Executes committed turn and returns retained backend.
+pub(crate) async fn finish_committed_gateway_turn(
+    committed: Committed<GatewayTurn>,
+) -> Option<Retained<InnerDiscord>> {
+    let (discord, turn) = committed.into_parts();
+    discord.get().runtime().execute_gateway_turn(turn).await?;
+    Some(discord)
 }

@@ -1,6 +1,6 @@
 use asyncs_sync::Notify;
 use crossbeam::queue::SegQueue;
-use messenger_interface::interface::{AudioEvent, QueryEvent, TextEvent, VideoEvent, VoiceEvent};
+use messenger_interface::interface::{QueryEvent, TextEvent, VideoEvent, VoiceEvent};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::warn;
 
@@ -9,13 +9,12 @@ const EVENT_QUEUE_WARN_AT: usize = 4096;
 /// Session-scoped interface-event routing.
 ///
 /// Producers submit through typed methods instead of reaching into queue
-/// storage. Each submission also wakes its matching `listen()` stream, which
+/// storage. Each submission also wakes its matching listener stream, which
 /// matters for media events produced by a different stream's driver.
 pub(crate) struct EventHub {
     query: EventQueue<QueryEvent>,
     text: EventQueue<TextEvent>,
     voice: EventQueue<VoiceEvent>,
-    audio: EventQueue<AudioEvent>,
     video: EventQueue<VideoEvent>,
 }
 
@@ -25,7 +24,6 @@ impl Default for EventHub {
             query: EventQueue::new("query"),
             text: EventQueue::new("text"),
             voice: EventQueue::new("voice"),
-            audio: EventQueue::new("audio"),
             video: EventQueue::new("video"),
         }
     }
@@ -51,7 +49,6 @@ event_routes!(
     (submit_query, next_query, query, QueryEvent),
     (submit_text, next_text, text, TextEvent),
     (submit_voice, next_voice, voice, VoiceEvent),
-    (submit_audio, next_audio, audio, AudioEvent),
     (submit_video, next_video, video, VideoEvent),
 );
 

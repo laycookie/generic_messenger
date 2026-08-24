@@ -27,10 +27,10 @@ CM, and an Opus ↔ audio-graph bridge. Almost everything hard is already correc
 inside Valve's C++.
 
 **What is implemented in this repo right now** (see *Implementation*): the **whole
-voice pipeline, wired into the app and functional** — `Voice::connect`/`listen`
-join the session, bring up a transport, and drive a per-call audio session
-(mic → Opus → transport → Opus → playback) surfaced to the UI as
-`CallStreamReady`. With the **loopback transport** (`STEAM_VOICE_LOOPBACK=1`),
+voice pipeline, wired into the app and functional** — `Audio::connect` plus
+`prepare_listener`/`next_event` join the session, bring up a transport, and drive
+a per-call audio session (mic → Opus → transport → Opus → playback) surfaced to
+the UI as `CallStreamReady`. With the **loopback transport** (`STEAM_VOICE_LOOPBACK=1`),
 joining a Steam voice channel echoes your own microphone back through the entire
 real pipeline — a working voice call today. The one genuinely blocked joint is
 `GnsTransport::connect` (the `gns-sys` FFI + the live rendezvous carrier) — i.e.
@@ -292,8 +292,8 @@ wired into the app, and functional. Layout under [`src/gns/`](src/gns/) plus
 [`voice.rs`](src/voice.rs):
 
 ```
-voice.rs         impl Voice: connect (join + bring-up + CallStreamReady),
-                 disconnect (kill + leave), listen (VoiceEvent stream)
+voice.rs         impl Audio: connect (join + bring-up + CallStreamReady),
+                 disconnect (kill + leave), prepare_listener + next_event
 gns/
   mod.rs         Phase enum + establish_voice_media() sequencer + GnsError
   cert.rs        Phase 1 — Steam-signed networking cert           ✅ live-confirmed
@@ -306,15 +306,19 @@ gns/
 
 ### App integration — functional
 
-`record_v2` is messenger-agnostic for voice: it already calls `voice().listen()`,
-handles `CallStreamReady` by pumping the `AudioEvent` stream, and creates the
-mixer channels (F32 mic, I16 playback). So no app change was needed. The Steam
-side now:
+`record_v2` is messenger-agnostic for voice: it opens `LeaseStream<VoiceEvent>`
+from stored `Owner<dyn Messenger>`, then drives it until termination. Each poll
+projects `Retained<dyn Messenger>` into `Retained<dyn Audio>`. It handles
+`CallStreamReady` by pumping nested `AudioEvent` stream and creates mixer
+channels (F32 mic, I16 playback). Steam side now:
 
-- `listen()` returns a real `VoiceEvent` stream (`call::VoiceEventStream`).
+- owning backend `next_event()` returns real `VoiceEvent` values
+  (`call::VoiceEventStream`); root lease stream binds each poll to messenger
+  lifetime.
 - `connect()` joins the room, builds a transport, spawns a
-  `call::SteamAudioSession`, and pushes `CallStreamReady(audio_stream)` to the UI
-  — which transitions the call to *Connected* and starts pumping audio.
+  `call::SteamAudioSession`, and pushes `CallStreamReady(audio_source)` to the
+  UI — which binds source, transitions call to *Connected*, and starts pumping
+  audio.
 - The session uses Discord's proven **two-phase "yield"** to acquire mixer
   channels: queue an `AddAudioInput`/`AddAudioSource` (with a oneshot), return so
   `ArcStream::next` delivers it to the UI, adopt the fulfilled channel next poll.
@@ -387,9 +391,9 @@ Note: standalone GNS is one instance per process, so a full custom-signaling
 round-trip can't be tested in-process — it needs the real peer (step 2) or a
 two-process harness.
 
-Minor follow-up (independent of the transport): `listen()` currently emits only
-`CallStreamReady`; wire `ParticipantJoined`/`Left` from the `VoiceChatClient.*`
-roster notifications for the in-call participant list.
+Minor follow-up (independent of the transport): voice event polling currently
+emits only `CallStreamReady`; wire `ParticipantJoined`/`Left` from the
+`VoiceChatClient.*` roster notifications for the in-call participant list.
 
 ### Risks before that code is worth writing
 

@@ -6,7 +6,10 @@ use openh264::{
     },
     formats::{RgbSliceU8, RgbaSliceU8, YUVBuffer},
 };
-use std::time::Instant;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
 
 use crate::{EncodedVideoFrame, PixelData, VideoCodec, VideoError, VideoFrame};
 
@@ -19,6 +22,10 @@ const MAX_H264_BITRATE_BPS: u32 = 10_000_000;
 const MAX_VIDEO_PIXELS: usize = 4096 * 2160;
 const MAX_VIDEO_DIMENSION: usize = 4096;
 const MAX_OPENH264_THREADS: usize = 4;
+// openh264-rust marks nonzero decoder thread configuration unsafe because it
+// can segfault; default zero uses caller-thread decoding.
+const OPENH264_DECODER_THREAD_MODE: &str = "single-thread (OpenH264 num_threads=0)";
+static NEXT_H264_DECODER_ID: AtomicU64 = AtomicU64::new(1);
 /// Size-limited slicing activates OpenH264's partitioned encoder. Without it,
 /// OpenH264 forces single-slice mode and clamps any requested thread count to 1.
 /// Keep slice count below DAVE's one-byte supplemental-metadata limit. Each
@@ -50,6 +57,7 @@ pub enum H264EncoderUsage {
 /// Stateful OpenH264 decoder.
 pub struct H264Decoder {
     decoder: Decoder,
+    decoder_id: u64,
     frame_index: u64,
 }
 
@@ -57,8 +65,14 @@ impl H264Decoder {
     pub fn new() -> Result<Self, VideoError> {
         Ok(Self {
             decoder: Decoder::new()?,
+            decoder_id: NEXT_H264_DECODER_ID.fetch_add(1, Ordering::Relaxed),
             frame_index: 0,
         })
+    }
+
+    /// Process-unique identifier used to correlate timing events.
+    pub const fn timing_id(&self) -> u64 {
+        self.decoder_id
     }
 
     /// Decode one Annex-B access unit to RGBA8.
@@ -70,43 +84,89 @@ impl H264Decoder {
         let codec_started = timing_enabled.then(Instant::now);
         let frame_id = self.frame_index;
         self.frame_index = self.frame_index.wrapping_add(1);
-        let Some(yuv) = self.decoder.decode(access_unit)? else {
-            if let Some(total_started) = total_started {
-                tracing::trace!(
-                    target: "video_timing",
-                    stage = "h264.decode",
-                    frame_id,
-                    access_unit_bytes = access_unit.len(),
-                    codec_us = codec_started.map(elapsed_micros).unwrap_or_default(),
-                    rgba_us = 0_u64,
-                    total_us = elapsed_micros(total_started),
-                    emitted = false,
-                    "video stage complete"
-                );
-            }
-            return Ok(None);
-        };
+        let decode_result = self.decoder.decode(access_unit);
         let codec_us = codec_started.map(elapsed_micros).unwrap_or_default();
+        let yuv = match decode_result {
+            Ok(Some(yuv)) => yuv,
+            Ok(None) => {
+                if let Some(total_started) = total_started {
+                    tracing::trace!(
+                        target: "video_timing",
+                        stage = "h264.decode",
+                        decoder_id = self.decoder_id,
+                        frame_id,
+                        access_unit_bytes = access_unit.len(),
+                        codec_us,
+                        rgba_alloc_us = 0_u64,
+                        yuv_to_rgba_us = 0_u64,
+                        rgba_us = 0_u64,
+                        decoder_thread_mode = OPENH264_DECODER_THREAD_MODE,
+                        total_us = elapsed_micros(total_started),
+                        emitted = false,
+                        failed = false,
+                        "video stage complete"
+                    );
+                }
+                return Ok(None);
+            }
+            Err(err) => {
+                if let Some(total_started) = total_started {
+                    tracing::trace!(
+                        target: "video_timing",
+                        stage = "h264.decode",
+                        decoder_id = self.decoder_id,
+                        frame_id,
+                        access_unit_bytes = access_unit.len(),
+                        codec_us,
+                        rgba_alloc_us = 0_u64,
+                        yuv_to_rgba_us = 0_u64,
+                        rgba_us = 0_u64,
+                        decoder_thread_mode = OPENH264_DECODER_THREAD_MODE,
+                        total_us = elapsed_micros(total_started),
+                        emitted = false,
+                        failed = true,
+                        error = %err,
+                        "video stage complete"
+                    );
+                }
+                return Err(err.into());
+            }
+        };
         let (width, height) = openh264::formats::YUVSource::dimensions(&yuv);
         let pixels = checked_pixels(width, height)?;
         let data_len = pixels.checked_mul(4).ok_or(VideoError::FrameSizeOverflow)?;
         let rgba_started = timing_enabled.then(Instant::now);
+        let rgba_alloc_started = timing_enabled.then(Instant::now);
         let mut data = vec![0u8; data_len];
+        let rgba_alloc_us = rgba_alloc_started.map(elapsed_micros).unwrap_or_default();
+        let yuv_to_rgba_started = timing_enabled.then(Instant::now);
         yuv.write_rgba8(&mut data);
+        let yuv_to_rgba_us = yuv_to_rgba_started.map(elapsed_micros).unwrap_or_default();
+        let conversion_path = if width % 8 == 0 && height >= 2 {
+            "f32x8 SIMD"
+        } else {
+            "scalar"
+        };
         let frame = VideoFrame::new(width as u32, height as u32, PixelData::Rgba8(data));
         if let Some(total_started) = total_started {
             tracing::trace!(
                 target: "video_timing",
                 stage = "h264.decode",
+                decoder_id = self.decoder_id,
                 frame_id,
                 access_unit_bytes = access_unit.len(),
                 width,
                 height,
                 output_bytes = data_len,
                 codec_us,
+                rgba_alloc_us,
+                yuv_to_rgba_us,
                 rgba_us = rgba_started.map(elapsed_micros).unwrap_or_default(),
+                conversion_path,
+                decoder_thread_mode = OPENH264_DECODER_THREAD_MODE,
                 total_us = elapsed_micros(total_started),
                 emitted = true,
+                failed = false,
                 "video stage complete"
             );
         }

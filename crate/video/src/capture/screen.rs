@@ -1,17 +1,117 @@
+use crate::{FrameScaler, PixelData, VideoError, VideoFrame, VideoFrameTiming};
 use scap::{
     Target,
-    capturer::{Area, Capturer, Options, Point, Resolution as ScapResolution, Size},
+    capturer::{
+        Area, CapturerBuildError, Options, Point, Resolution as ScapResolution, Size,
+        engine::{ChannelItem, Engine},
+    },
     frame::{Frame, FrameType},
 };
-use simple_video::{FrameScaler, PixelData, VideoError, VideoFrame, VideoFrameTiming};
 use std::simd::{simd_swizzle, u8x8, u8x16};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     any::Any,
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::mpsc::{self, Receiver, RecvError},
     time::Instant,
 };
 
-use crate::{CaptureError, CaptureResult, FrameCapture, capture::elapsed_micros};
+use super::{CaptureError, CaptureResult, FrameCapture, elapsed_micros};
+
+#[cfg(target_os = "linux")]
+static SCREEN_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+const MAX_NATIVE_DRAIN_ITEMS: usize = 256;
+
+struct ScreenCaptureReservation;
+
+impl ScreenCaptureReservation {
+    fn acquire() -> CaptureResult<Self> {
+        #[cfg(target_os = "linux")]
+        SCREEN_CAPTURE_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| CaptureError::ScreenCaptureAlreadyActive)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ScreenCaptureReservation {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        SCREEN_CAPTURE_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+/// Small `scap` adapter which discards queued raw frames before normalization.
+///
+/// `scap` 0.0.8 uses an unbounded native frame channel. Consuming only its
+/// oldest frame lets slow conversion build an indefinite multi-megabyte
+/// backlog. Bounded draining here keeps normal capture current without letting
+/// a continuously producing backend starve caller-side cancellation. The
+/// upstream transport remains unbounded during pathological native stalls.
+struct LatestCapturer {
+    engine: Engine,
+    frames: Receiver<ChannelItem>,
+    queued: Vec<ChannelItem>,
+}
+
+impl LatestCapturer {
+    fn build(options: Options) -> Result<Self, CapturerBuildError> {
+        if !scap::is_supported() {
+            return Err(CapturerBuildError::NotSupported);
+        }
+        if !scap::has_permission() {
+            return Err(CapturerBuildError::PermissionNotGranted);
+        }
+        let (sender, frames) = mpsc::channel();
+        Ok(Self {
+            engine: Engine::new(&options, sender),
+            frames,
+            queued: Vec::with_capacity(MAX_NATIVE_DRAIN_ITEMS),
+        })
+    }
+
+    fn start_capture(&mut self) {
+        self.engine.start();
+    }
+
+    fn stop_capture(&mut self) {
+        self.engine.stop();
+    }
+
+    fn get_next_frame(&mut self) -> Result<Frame, RecvError> {
+        loop {
+            receive_native_batch(&self.frames, &mut self.queued)?;
+            if let Some(frame) = newest_usable(&mut self.queued, |item| {
+                self.engine.process_channel_item(item)
+            }) {
+                return Ok(frame);
+            }
+        }
+    }
+}
+
+fn receive_native_batch<T>(receiver: &Receiver<T>, items: &mut Vec<T>) -> Result<(), RecvError> {
+    items.clear();
+    items.push(receiver.recv()?);
+    for _ in 1..MAX_NATIVE_DRAIN_ITEMS {
+        let Ok(item) = receiver.try_recv() else {
+            break;
+        };
+        items.push(item);
+    }
+    Ok(())
+}
+
+fn newest_usable<T, U>(items: &mut Vec<T>, mut process: impl FnMut(T) -> Option<U>) -> Option<U> {
+    while let Some(item) = items.pop() {
+        if let Some(processed) = process(item) {
+            items.clear();
+            return Some(processed);
+        }
+    }
+    None
+}
 
 /// Kind of display-system target represented by [`ScreenSource`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -29,7 +129,6 @@ pub struct ScreenSource {
     kind: ScreenSourceKind,
     id: Option<u32>,
     title: String,
-    target: Option<Target>,
 }
 
 impl ScreenSource {
@@ -46,7 +145,6 @@ impl ScreenSource {
             } else {
                 "Primary display".to_owned()
             },
-            target: None,
         }
     }
 
@@ -65,11 +163,14 @@ impl ScreenSource {
     /// Open and start this screen source using `config`.
     pub fn open(&self, config: ScreenCaptureConfig) -> CaptureResult<ScreenCapture> {
         config.validate()?;
+        // scap 0.0.8 controls Linux capture through process-global state.
+        // Reject a second stream instead of letting either stream stop the other.
+        let reservation = ScreenCaptureReservation::acquire()?;
         let options = Options {
             fps: config.frames_per_second,
             show_cursor: config.show_cursor,
             show_highlight: config.show_highlight,
-            target: self.target.clone(),
+            target: self.resolve_target()?,
             crop_area: config.crop_area.map(CropArea::into_scap),
             output_type: FrameType::BGRAFrame,
             output_resolution: config.resolution.into_scap(),
@@ -79,16 +180,39 @@ impl ScreenSource {
         // Keep that backend detail from terminating applications using this
         // crate's fallible API.
         let capturer = catch_unwind(AssertUnwindSafe(|| {
-            let mut capturer = Capturer::build(options)?;
+            let mut capturer = LatestCapturer::build(options)?;
             capturer.start_capture();
-            Ok::<Capturer, scap::capturer::CapturerBuildError>(capturer)
+            Ok::<LatestCapturer, CapturerBuildError>(capturer)
         }))
         .map_err(|payload| CaptureError::ScreenBackendPanicked(panic_message(payload)))??;
         Ok(ScreenCapture {
             capturer,
             running: true,
             normalizer: RgbFrameNormalizer::default(),
+            reservation: Some(reservation),
         })
+    }
+
+    fn resolve_target(&self) -> CaptureResult<Option<Target>> {
+        if self.kind == ScreenSourceKind::Default {
+            return Ok(None);
+        }
+
+        let id = self.id.ok_or(CaptureError::InvalidConfiguration(
+            "non-default screen sources must contain an identifier",
+        ))?;
+        scap::get_all_targets()
+            .into_iter()
+            .find(|target| match (self.kind, target) {
+                (ScreenSourceKind::Display, Target::Display(display)) => display.id == id,
+                (ScreenSourceKind::Window, Target::Window(window)) => window.id == id,
+                _ => false,
+            })
+            .map(Some)
+            .ok_or(CaptureError::ScreenSourceUnavailable {
+                kind: self.kind,
+                id,
+            })
     }
 }
 
@@ -234,7 +358,6 @@ pub fn screen_sources() -> Vec<ScreenSource> {
             kind,
             id: Some(id),
             title,
-            target: Some(target),
         }
     }));
     sources
@@ -242,9 +365,10 @@ pub fn screen_sources() -> Vec<ScreenSource> {
 
 /// Active `scap` screen stream producing decoded RGB8 frames.
 pub struct ScreenCapture {
-    capturer: Capturer,
+    capturer: LatestCapturer,
     running: bool,
     normalizer: RgbFrameNormalizer,
+    reservation: Option<ScreenCaptureReservation>,
 }
 
 impl ScreenCapture {
@@ -360,8 +484,11 @@ impl ScreenCapture {
     /// Stop native screen stream. Safe to call more than once.
     pub fn stop(&mut self) {
         if self.running {
-            self.capturer.stop_capture();
+            // Mark first so a backend panic cannot trigger a second stop while
+            // unwinding through `Drop`.
             self.running = false;
+            self.capturer.stop_capture();
+            self.reservation.take();
         }
     }
 }
@@ -782,5 +909,34 @@ mod tests {
             config.validate(),
             Err(CaptureError::InvalidConfiguration(_))
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn serializes_process_global_screen_backend() {
+        let first = ScreenCaptureReservation::acquire().unwrap();
+        assert!(matches!(
+            ScreenCaptureReservation::acquire(),
+            Err(CaptureError::ScreenCaptureAlreadyActive)
+        ));
+        drop(first);
+        assert!(ScreenCaptureReservation::acquire().is_ok());
+    }
+
+    #[test]
+    fn drains_native_queue_to_latest_item() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(1).unwrap();
+        sender.send(2).unwrap();
+        sender.send(3).unwrap();
+        let mut items = Vec::new();
+        receive_native_batch(&receiver, &mut items).unwrap();
+        assert_eq!(newest_usable(&mut items, Some), Some(3));
+    }
+
+    #[test]
+    fn keeps_usable_frame_before_unusable_tail() {
+        let mut items = vec![Some(7), None];
+        assert_eq!(newest_usable(&mut items, |item| item), Some(7));
     }
 }

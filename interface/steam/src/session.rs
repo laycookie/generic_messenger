@@ -1,10 +1,5 @@
-//! The live, logged-in Steam session and the update streams it drives.
-//!
-//! [`Connected`] owns the `steam_vent` [`Connection`] plus the friend/persona
-//! caches that its [`SteamStreams`] keep populated. Queries and the live
-//! [`Text`](messenger_interface::interface::Text) stream both poll the same
-//! session; [`Connected::alive`] latches death so the next
-//! [`SteamMessenger::connected`](crate::SteamMessenger::connected) re-establishes.
+//! Logged-in Steam connection, caches, and update streams.
+//! Queries and text events share [`Connected`]; latched death triggers reconnect.
 
 use std::{
     collections::VecDeque,
@@ -58,13 +53,7 @@ use crate::api_types::{
 };
 use crate::downloaders::steam_user_identifier;
 
-// `EClientPersonaStateFlag` bits requested when asking Steam for friend
-// persona data. The proto has no avatar-specific request bit, so ask for the
-// complete known persona-state mask and cache whatever profile fields Steam
-// includes in the resulting `CMsgClientPersonaState` packets. `0x20` is not a
-// defined flag in steam-vent-proto 0.5.2, so it is intentionally left undeclared
-// below; `PersonaStateFlags::all()` is then exactly the intended `0x7FFF & !0x20`
-// mask (the union of the declared flags).
+// Request every declared persona field; proto bit 0x20 is undefined.
 bitflags! {
     struct PersonaStateFlags: u32 {
         const STATUS = 1;
@@ -84,22 +73,15 @@ bitflags! {
     }
 }
 const PERSONA_STATE_FLAGS: u32 = PersonaStateFlags::all().bits();
-// Machine-check the mask the comment promises: adding or removing a flag above
-// must not silently change what we request, and `0x20` must stay excluded.
+// Keep declared mask stable and exclude undefined bit.
 const _: () = assert!(PERSONA_STATE_FLAGS == 0x7FFF & !0x20);
 
-/// Cheap heuristic: a Steam refresh token is a JWT — three dot-separated
-/// base64url segments, never containing `:` — whereas a password might contain
-/// neither. Distinguishes a reusable saved session from a password.
+/// Distinguishes three-segment JWT session token from password.
 fn looks_like_jwt(secret: &str) -> bool {
     !secret.contains(':') && secret.split('.').count() == 3
 }
 
-/// Voice **signaling capture** toggle (`STEAM_VOICE_CAPTURE=1`). Off by default
-/// so it has zero effect on normal runs. When on, [`drain_voice_capture`] dumps
-/// every CM message `steam-vent` couldn't route — the hunt for the proprietary
-/// GNS P2P rendezvous carrier (see [`crate::gns`] and the capture notes). Read
-/// once and cached.
+/// Enables cached GNS rendezvous logging with `STEAM_VOICE_CAPTURE=1`.
 fn voice_capture_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -108,17 +90,10 @@ fn voice_capture_enabled() -> bool {
     })
 }
 
-/// Log (at `info`, target `steam::session`) every unrouted CM message with its
-/// EMsg + protobuf flag + hex body. The rendezvous carrier lands here when it's
-/// a classic EMsg; service-method-notification carriers are dropped by
-/// `steam-vent` before this point and instead show by name under
-/// `RUST_LOG=steam_vent=debug`. Draining is otherwise a no-op (nothing reads the
-/// unprocessed ring after login), so this is safe to call every poll.
+/// Logs unrouted CM payloads; service notifications require steam-vent debug log.
 fn drain_voice_capture(conn: &Connection) {
     for raw in conn.take_unprocessed() {
-        // Decisive: if this is a media rendezvous, classify ICE (reachable) vs
-        // SDR (closed relay) — this is the answer to whether voice media can be
-        // implemented at all. See `gns::signaling::classify_rendezvous`.
+        // Classify candidate rendezvous as reachable ICE or closed SDR.
         if let Some(classification) = crate::gns::signaling::classify_rendezvous(&raw.data) {
             warn!(
                 emsg = raw.kind.value(),
@@ -353,13 +328,7 @@ impl SteamStreams {
                 .map(SteamUpdate::Persona)
                 .boxed(),
         );
-        // Friend DMs arrive *only* via this service notification — the sole
-        // path the modern Steam protocol uses (see steam-vent's `chat.rs`).
-        // Do NOT also subscribe to the legacy `CMsgClientFriendMsgIncoming`:
-        // it carries no `ordinal`, forcing a synthetic local counter whose
-        // message IDs can never match the real server ordinals returned by
-        // `GetRecentMessages` — so the same message gets two different IDs
-        // live vs. on history reload, defeating the UI's by-ID dedup.
+        // Use modern notification only; legacy lacks ordinal needed for dedup.
         updates.push(
             conn.on_notification::<CFriendMessages_IncomingMessage_Notification>()
                 .map(SteamUpdate::Notification)
@@ -387,12 +356,7 @@ impl SteamStreams {
         }
     }
 
-    /// Process one update already removed from `updates`.
-    ///
-    /// Keep receive and processing separate: callers may put a timeout around
-    /// waiting for a raw update, but must never cancel after dequeue. Message
-    /// conversion performs cache-backed asset I/O and can outlive a short poll
-    /// interval; cancelling it would silently consume and lose the message.
+    /// Processes dequeued update without cancellation; conversion may await I/O.
     async fn process_update(
         &mut self,
         update: Option<SteamUpdate>,
@@ -546,19 +510,11 @@ impl Connected {
         let chat_groups: Arc<DashMap<ID, ChatGroupEntry>> = Arc::new(DashMap::new());
         let chat_room_locations: Arc<DashMap<ID, ChatRoomLocation>> = Arc::new(DashMap::new());
 
-        // Register the broadcast subscriptions *before* returning so the
-        // friends-list push Steam sends right after login isn't dropped for
-        // lack of a subscriber. The streams are polled explicitly by queries
-        // and by `ArcStream::next`; no detached tasks are created here.
+        // Register before immediate login pushes; polling stays explicit.
         let streams = SteamStreams::new(&conn);
         let pending_text_events = VecDeque::new();
 
-        // Steam pushes the initial friends list *and* per-friend persona state
-        // (names + avatars) during logon — before the subscriptions above
-        // existed — so they land in the connection's "unprocessed" ring buffer
-        // instead of our streams. Drain both here so first-load contacts have
-        // names and icons; explicit stream polling handles later updates and
-        // the response to the persona request `process_friends_list` sends.
+        // Drain friends/persona pushes queued before subscriptions existed.
         let friends_kind = MsgKind::from(CMsgClientFriendsList::KIND);
         let persona_kind = MsgKind::from(CMsgClientPersonaState::KIND);
         for raw in conn.take_unprocessed() {

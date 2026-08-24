@@ -47,7 +47,42 @@ pub enum Av1EncoderUsage {
 struct Av1EncoderState {
     width: u32,
     height: u32,
+    generation: u64,
     context: Context<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Av1FrameMetadata {
+    timing: Option<VideoFrameTiming>,
+    submitted_sequence: u64,
+    submitted_at: Instant,
+    forced_keyframe: bool,
+    context_generation: u64,
+    context_rebuilt: bool,
+    context_rebuild_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Av1StateSetup {
+    generation: u64,
+    rebuilt: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Av1EncodeObservation {
+    submitted_sequence: u64,
+    context_generation: u64,
+    context_rebuilt: bool,
+    context_rebuild_us: u64,
+    need_more_data_streak: u64,
+    emitted_sequence: Option<u64>,
+    emitted_context_generation: Option<u64>,
+    emitted_context_rebuilt: bool,
+    emitted_context_rebuild_us: u64,
+    emitted_forced_keyframe: bool,
+    lag_frames: Option<u64>,
+    encoder_residence_us: Option<u64>,
 }
 
 /// Stateful low-latency rav1e encoder.
@@ -58,6 +93,9 @@ pub struct Av1Encoder {
     state: Option<Av1EncoderState>,
     force_keyframe: bool,
     frame_index: u64,
+    need_more_data_streak: u64,
+    #[cfg(test)]
+    last_observation: Option<Av1EncodeObservation>,
 }
 
 impl Av1Encoder {
@@ -107,6 +145,9 @@ impl Av1Encoder {
             state: None,
             force_keyframe: false,
             frame_index: 0,
+            need_more_data_streak: 0,
+            #[cfg(test)]
+            last_observation: None,
         })
     }
 
@@ -125,16 +166,29 @@ impl Av1Encoder {
         let encoder_sequence = self.frame_index;
         self.frame_index = self.frame_index.wrapping_add(1);
         let submitted_timing = frame.timing();
+        let metadata_enabled = timing_enabled || submitted_timing.is_some();
         let (width, height) = (frame.width as usize, frame.height as usize);
         checked_pixels(width, height)?;
         frame.validate()?;
 
         let force_keyframe = self.force_keyframe;
-        let yuv_started = timing_enabled.then(Instant::now);
+        let state_setup_started = metadata_enabled.then(Instant::now);
+        let state_setup = self.ensure_state(frame.width, frame.height)?;
+        let state_setup_us = state_setup_started.map(elapsed_micros).unwrap_or_default();
+        let context_rebuild_us = if state_setup.rebuilt {
+            state_setup_us
+        } else {
+            0
+        };
+        let frame_alloc_started = timing_enabled.then(Instant::now);
         let mut input = self
-            .ensure_state(frame.width, frame.height)?
+            .state
+            .as_mut()
+            .expect("AV1 encoder state must exist after ensure_state")
             .context
             .new_frame();
+        let frame_alloc_us = frame_alloc_started.map(elapsed_micros).unwrap_or_default();
+        let yuv_started = timing_enabled.then(Instant::now);
         fill_yuv420(frame, &mut input);
         let rgb_to_yuv_us = yuv_started.map(elapsed_micros).unwrap_or_default();
         let parameters = FrameParameters {
@@ -143,37 +197,65 @@ impl Av1Encoder {
             } else {
                 FrameTypeOverride::No
             },
-            opaque: submitted_timing.map(Opaque::new),
+            opaque: metadata_enabled.then(|| {
+                Opaque::new(Av1FrameMetadata {
+                    timing: submitted_timing,
+                    submitted_sequence: encoder_sequence,
+                    submitted_at: Instant::now(),
+                    forced_keyframe: force_keyframe,
+                    context_generation: state_setup.generation,
+                    context_rebuilt: state_setup.rebuilt,
+                    context_rebuild_us,
+                })
+            }),
             ..FrameParameters::default()
         };
 
-        let codec_started = timing_enabled.then(Instant::now);
-        let receive_result = {
+        let (send_frame_us, receive_packet_us, encoded_loop_count, receive_result) = {
             let state = self
                 .state
                 .as_mut()
                 .expect("AV1 encoder state must exist after ensure_state");
+            let send_started = timing_enabled.then(Instant::now);
             state.context.send_frame((input, parameters))?;
-            loop {
+            let send_frame_us = send_started.map(elapsed_micros).unwrap_or_default();
+            let receive_started = timing_enabled.then(Instant::now);
+            let mut encoded_loop_count = 0_u64;
+            let receive_result = loop {
                 match state.context.receive_packet() {
-                    Err(EncoderStatus::Encoded) => continue,
+                    Err(EncoderStatus::Encoded) => {
+                        encoded_loop_count = encoded_loop_count.saturating_add(1);
+                    }
                     result => break result,
                 }
-            }
+            };
+            (
+                send_frame_us,
+                receive_started.map(elapsed_micros).unwrap_or_default(),
+                encoded_loop_count,
+                receive_result,
+            )
         };
         self.force_keyframe = false;
-        let codec_us = codec_started.map(elapsed_micros).unwrap_or_default();
+        let codec_us = send_frame_us.saturating_add(receive_packet_us);
 
-        let mut packet = match receive_result {
-            Ok(packet) => Some(packet),
-            Err(EncoderStatus::NeedMoreData) => None,
+        let (mut packet, receive_status) = match receive_result {
+            Ok(packet) => {
+                self.need_more_data_streak = 0;
+                (Some(packet), "packet")
+            }
+            Err(EncoderStatus::NeedMoreData) => {
+                self.need_more_data_streak = self.need_more_data_streak.saturating_add(1);
+                (None, "need_more_data")
+            }
             Err(error) => return Err(error.into()),
         };
-        let emitted_timing = packet
+        let emitted_metadata = packet
             .as_mut()
             .and_then(|packet| packet.opaque.take())
-            .and_then(|opaque| opaque.downcast::<VideoFrameTiming>().ok())
-            .map(|timing| *timing);
+            .and_then(|opaque| opaque.downcast::<Av1FrameMetadata>().ok())
+            .map(|metadata| *metadata);
+        let emitted_timing = emitted_metadata.and_then(|metadata| metadata.timing);
         let frame_id = submitted_timing.map_or(encoder_sequence, |timing| timing.id());
         let output_bytes = packet.as_ref().map_or(0, |packet| packet.data.len());
         if output_bytes > MAX_AV1_TEMPORAL_UNIT_BYTES {
@@ -183,6 +265,40 @@ impl Av1Encoder {
             });
         }
         let emitted = packet.is_some();
+        let emitted_sequence = emitted_metadata.map(|metadata| metadata.submitted_sequence);
+        let lag_frames = emitted_sequence.map(|sequence| encoder_sequence.wrapping_sub(sequence));
+        let encoder_residence_us =
+            emitted_metadata.map(|metadata| elapsed_micros(metadata.submitted_at));
+        let emitted_context_generation =
+            emitted_metadata.map(|metadata| metadata.context_generation);
+        let emitted_context_rebuilt =
+            emitted_metadata.is_some_and(|metadata| metadata.context_rebuilt);
+        let emitted_context_rebuild_us =
+            emitted_metadata.map_or(0, |metadata| metadata.context_rebuild_us);
+        let emitted_forced_keyframe =
+            emitted_metadata.is_some_and(|metadata| metadata.forced_keyframe);
+        let emitted_keyframe = packet
+            .as_ref()
+            .is_some_and(|packet| packet.frame_type == FrameType::KEY);
+        let emitted_qp = packet.as_ref().map_or(0, |packet| u64::from(packet.qp));
+        let emitted_input_frameno = packet.as_ref().map_or(0, |packet| packet.input_frameno);
+        #[cfg(test)]
+        {
+            self.last_observation = Some(Av1EncodeObservation {
+                submitted_sequence: encoder_sequence,
+                context_generation: state_setup.generation,
+                context_rebuilt: state_setup.rebuilt,
+                context_rebuild_us,
+                need_more_data_streak: self.need_more_data_streak,
+                emitted_sequence,
+                emitted_context_generation,
+                emitted_context_rebuilt,
+                emitted_context_rebuild_us,
+                emitted_forced_keyframe,
+                lag_frames,
+                encoder_residence_us,
+            });
+        }
         if let Some(total_started) = total_started {
             tracing::trace!(
                 target: "video_timing",
@@ -190,12 +306,35 @@ impl Av1Encoder {
                 frame_id,
                 emitted_frame_id = emitted_timing.map_or(0, |timing| timing.id()),
                 encoder_sequence,
+                submitted_sequence = encoder_sequence,
+                emitted_sequence = emitted_sequence.unwrap_or_default(),
+                emitted_sequence_known = emitted_sequence.is_some(),
+                lag_frames = lag_frames.unwrap_or_default(),
+                encoder_residence_us = encoder_residence_us.unwrap_or_default(),
                 pipeline_elapsed_us = submitted_timing.map_or(0, |timing| timing.elapsed_micros()),
                 width,
                 height,
                 input_bytes = frame.pixel_data.as_bytes().len(),
                 output_bytes,
+                context_generation = state_setup.generation,
+                context_rebuilt = state_setup.rebuilt,
+                context_rebuild_us,
+                emitted_context_generation = emitted_context_generation.unwrap_or_default(),
+                emitted_context_rebuilt,
+                emitted_context_rebuild_us,
+                submitted_forced_keyframe = force_keyframe,
+                emitted_forced_keyframe,
+                emitted_keyframe,
+                emitted_qp,
+                emitted_input_frameno,
+                receive_status,
+                need_more_data_streak = self.need_more_data_streak,
+                encoded_loop_count,
+                state_setup_us,
+                frame_alloc_us,
                 rgb_to_yuv_us,
+                send_frame_us,
+                receive_packet_us,
                 codec_us,
                 total_us = elapsed_micros(total_started),
                 emitted,
@@ -217,22 +356,23 @@ impl Av1Encoder {
         self.force_keyframe = true;
     }
 
-    fn ensure_state(
-        &mut self,
-        width: u32,
-        height: u32,
-    ) -> Result<&mut Av1EncoderState, VideoError> {
+    fn ensure_state(&mut self, width: u32, height: u32) -> Result<Av1StateSetup, VideoError> {
         let needs_rebuild = self
             .state
             .as_ref()
             .is_none_or(|state| state.width != width || state.height != height);
         if needs_rebuild {
+            let generation = self
+                .state
+                .as_ref()
+                .map_or(1, |state| state.generation.saturating_add(1));
             let state = create_encoder_state(
                 self.usage,
                 self.frames_per_second,
                 self.bitrate_bps,
                 width,
                 height,
+                generation,
             )?;
             tracing::debug!(
                 codec = "av1",
@@ -240,14 +380,21 @@ impl Av1Encoder {
                 height,
                 frames_per_second = self.frames_per_second,
                 bitrate_bps = self.bitrate_bps,
+                context_generation = generation,
                 "video encoder configured"
             );
             self.state = Some(state);
+            self.need_more_data_streak = 0;
         }
-        Ok(self
+        let generation = self
             .state
-            .as_mut()
-            .expect("AV1 encoder state must exist after successful construction"))
+            .as_ref()
+            .expect("AV1 encoder state must exist after successful construction")
+            .generation;
+        Ok(Av1StateSetup {
+            generation,
+            rebuilt: needs_rebuild,
+        })
     }
 }
 
@@ -257,6 +404,7 @@ fn create_encoder_state(
     bitrate_bps: u32,
     width: u32,
     height: u32,
+    generation: u64,
 ) -> Result<Av1EncoderState, VideoError> {
     let encoder_threads = std::thread::available_parallelism()
         .map(|parallelism| encoder_thread_count(parallelism.get()))
@@ -310,6 +458,7 @@ fn create_encoder_state(
     Ok(Av1EncoderState {
         width,
         height,
+        generation,
         context,
     })
 }
@@ -501,26 +650,97 @@ mod tests {
     }
 
     #[test]
-    fn delayed_packets_keep_submitted_frame_timing() {
+    fn delayed_packets_keep_submitted_timing_and_provenance() {
         let mut encoder = Av1Encoder::new().unwrap();
         let mut pending = VecDeque::new();
         let mut emitted = 0;
+        let mut saw_need_more_data = false;
+        let mut saw_forced_keyframe = false;
 
-        for value in 0..8 {
+        for value in 0..12 {
+            let forced_keyframe = value == 2;
+            if forced_keyframe {
+                encoder.request_keyframe();
+            }
             let timing = VideoFrameTiming::start();
-            pending.push_back(timing);
             let frame = VideoFrame::with_timing(
                 16,
                 16,
                 PixelData::Rgb8(vec![value; 16 * 16 * 3]),
                 Some(timing),
             );
-            if let Some(encoded) = encoder.encode(&frame).unwrap() {
-                assert_eq!(encoded.timing(), pending.pop_front());
+            let encoded = encoder.encode(&frame).unwrap();
+            let observation = encoder
+                .last_observation
+                .expect("encode must retain test diagnostics");
+            pending.push_back((
+                observation.submitted_sequence,
+                timing,
+                forced_keyframe,
+                observation.context_generation,
+                observation.context_rebuilt,
+                observation.context_rebuild_us,
+            ));
+            saw_need_more_data |= observation.need_more_data_streak > 0;
+
+            if let Some(encoded) = encoded {
+                let (sequence, expected_timing, forced, generation, rebuilt, rebuild_us) =
+                    pending.pop_front().expect("emitted frame must be pending");
+                assert_eq!(encoded.timing(), Some(expected_timing));
+                assert_eq!(observation.emitted_sequence, Some(sequence));
+                assert_eq!(observation.emitted_context_generation, Some(generation));
+                assert_eq!(observation.emitted_context_rebuilt, rebuilt);
+                assert_eq!(observation.emitted_context_rebuild_us, rebuild_us);
+                assert_eq!(observation.emitted_forced_keyframe, forced);
+                assert_eq!(
+                    observation.lag_frames,
+                    Some(observation.submitted_sequence.wrapping_sub(sequence))
+                );
+                assert!(observation.encoder_residence_us.is_some());
+                assert_eq!(observation.need_more_data_streak, 0);
+                if forced {
+                    assert!(encoded.keyframe);
+                    saw_forced_keyframe = true;
+                }
                 emitted += 1;
             }
         }
 
         assert!(emitted > 0);
+        assert!(saw_need_more_data);
+        assert!(saw_forced_keyframe);
+    }
+
+    #[test]
+    fn dimension_rebuild_increments_context_generation() {
+        let mut encoder = Av1Encoder::new().unwrap();
+        let original = VideoFrame::new(16, 16, PixelData::Rgb8(vec![0; 16 * 16 * 3]));
+        let _ = encode_until_packet(&mut encoder, &original);
+
+        let mut emitted_rebuilt_frame = false;
+        for value in 0..8 {
+            let timing = VideoFrameTiming::start();
+            let resized = VideoFrame::with_timing(
+                32,
+                16,
+                PixelData::Rgb8(vec![value; 32 * 16 * 3]),
+                Some(timing),
+            );
+            let encoded = encoder.encode(&resized).unwrap();
+            let observation = encoder
+                .last_observation
+                .expect("encode must retain test diagnostics");
+
+            assert_eq!(observation.context_generation, 2);
+            assert_eq!(observation.context_rebuilt, value == 0);
+            if encoded.is_some() {
+                assert_eq!(observation.emitted_context_generation, Some(2));
+                assert!(observation.emitted_context_rebuilt);
+                emitted_rebuilt_frame = true;
+                break;
+            }
+        }
+
+        assert!(emitted_rebuilt_frame);
     }
 }

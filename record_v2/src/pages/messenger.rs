@@ -3,15 +3,13 @@ use std::{error::Error, path::PathBuf};
 use crate::audio_controls::{AfxTarget, AudioControls, AudioOp};
 use crate::components::divider::Divider;
 use crate::pages::{RemoteVideo, SelectedVideoInput};
-use messenger_unifier::{
-    Call, MessengerData, MessengerId, MessengerInterface, MessengerRegistry, PendingSend,
-};
+use messenger_unifier::{Call, MessengerData, MessengerId, MessengerRegistry, PendingSend};
 use simple_audio_channels::{
     effects::AfxRegistration,
     effects_rack::{EffectsRack, SlotKey},
     params::{ParamKey, ParamSpec, ParamUnit},
 };
-use simple_video_capture::{
+use simple_video::{
     CaptureSource, PixelData, ScreenCaptureConfig, ScreenSource, has_screen_capture_permission,
     request_screen_capture_permission, screen_capture_supported, screen_sources, webcams,
 };
@@ -43,6 +41,10 @@ mod navbar;
 mod sidebar;
 
 pub(super) const PLACEHOLDER_PFP: &str = "./public/imgs/placeholder.jpg";
+
+fn closed_messenger_error() -> Box<dyn Error + Send + Sync> {
+    std::io::Error::new(std::io::ErrorKind::NotConnected, "messenger is closed").into()
+}
 
 #[derive(Clone)]
 pub(crate) enum Main {
@@ -638,7 +640,7 @@ pub enum Action {
         modify: Box<dyn FnOnce(&mut MessengerData) + Send>,
     },
     Call {
-        interface: MessengerInterface,
+        messenger: MessengerId,
         channel: Identifier<Place<Room>>,
     },
     DisconnectFromCall(Call),
@@ -668,18 +670,31 @@ impl Messenger {
     /// Open the inspect modal for `user` and fetch their detail sheet.
     fn start_inspect_user(
         &mut self,
-        interface: MessengerInterface,
+        messenger: MessengerId,
         user: Identifier<User>,
+        messengers: &MessengerRegistry,
     ) -> Action {
+        let title = user.name.clone();
+        let icon = user.icon.clone();
+        let Some(inspect) = messengers.with_interface_async(
+            messenger,
+            async move |interface| {
+                let query = interface.query()?;
+                query.inspect_user(&user).await
+            },
+        ) else {
+            return Action::None;
+        };
         self.inspect = Some(Inspect {
-            title: user.name.clone(),
-            icon: user.icon.clone(),
+            title,
+            icon,
             state: InspectState::Loading,
         });
         Action::Run(
             Task::future(async move {
-                let query = interface.query()?;
-                query.inspect_user(&user).await
+                inspect
+                    .await
+                    .unwrap_or_else(|| Err(closed_messenger_error()))
             })
             .then(|result: Result<Details, Box<dyn Error + Send + Sync>>| {
                 Task::done(Message::InspectLoaded(result.map_err(|e| e.to_string())))
@@ -690,18 +705,31 @@ impl Messenger {
     /// Open the inspect modal for `house` and fetch its detail sheet.
     fn start_inspect_house(
         &mut self,
-        interface: MessengerInterface,
+        messenger: MessengerId,
         house: Identifier<Place<House>>,
+        messengers: &MessengerRegistry,
     ) -> Action {
+        let title = house.name.clone();
+        let icon = house.icon.clone();
+        let Some(inspect) = messengers.with_interface_async(
+            messenger,
+            async move |interface| {
+                let query = interface.query()?;
+                query.inspect_house(&house).await
+            },
+        ) else {
+            return Action::None;
+        };
         self.inspect = Some(Inspect {
-            title: house.name.clone(),
-            icon: house.icon.clone(),
+            title,
+            icon,
             state: InspectState::Loading,
         });
         Action::Run(
             Task::future(async move {
-                let query = interface.query()?;
-                query.inspect_house(&house).await
+                inspect
+                    .await
+                    .unwrap_or_else(|| Err(closed_messenger_error()))
             })
             .then(|result: Result<Details, Box<dyn Error + Send + Sync>>| {
                 Task::done(Message::InspectLoaded(result.map_err(|e| e.to_string())))
@@ -996,25 +1024,20 @@ impl Messenger {
             Message::Chat(msg) => {
                 if let Main::Chat(chat) = &mut self.main {
                     return match msg {
-                        ChatAction::Call { interface, room } => {
-                            let Some(interface) = messengers.interface(interface.id) else {
-                                return Action::None;
-                            };
-                            Action::Call {
-                                interface: interface.clone(),
-                                channel: room,
-                            }
-                        }
-                        ChatAction::Message(message) => match chat.update(message) {
+                        ChatAction::Call { messenger, room } => Action::Call {
+                            messenger,
+                            channel: room,
+                        },
+                        ChatAction::Message(message) => match chat.update(message, messengers) {
                             ChatUpdateResult::Task(task) => {
                                 Action::Run(task.map(|m| Message::Chat(ChatAction::Message(m))))
                             }
                             ChatUpdateResult::Send {
-                                interface,
+                                messenger,
                                 room,
                                 contents,
                             } => {
-                                let id = interface.id;
+                                let id = messenger;
                                 let room_id = *room.id();
                                 let pending_id = self.next_pending_id();
                                 let author =
@@ -1035,6 +1058,32 @@ impl Messenger {
                                     },
                                 );
 
+                                let Some(send) = messengers.with_interface_async(
+                                    id,
+                                    async move |interface| {
+                                        let text = interface.messenger().text().map_err(|e| {
+                                            Box::new(e) as Box<dyn Error + Send + Sync>
+                                        })?;
+                                        let confirmed = text
+                                            .send_message(
+                                                &room,
+                                                InterfaceMessage {
+                                                    content: Revision {
+                                                        at: None,
+                                                        text: contents,
+                                                    },
+                                                    history: Vec::new(),
+                                                    reactions: Vec::new(),
+                                                    author: None,
+                                                },
+                                            )
+                                            .await?;
+                                        Ok(confirmed)
+                                    },
+                                ) else {
+                                    return Action::None;
+                                };
+
                                 Action::Run(
                                     // Add pending message to the chat store immediately
                                     Task::done(Message::PendingMessage {
@@ -1044,28 +1093,9 @@ impl Messenger {
                                     })
                                     .chain(
                                         // Fire the async send and handle result
-                                        Task::future({
-                                            let api = interface.api.clone();
-                                            async move {
-                                                let text = api.text().map_err(|e| {
-                                                    Box::new(e) as Box<dyn Error + Send + Sync>
-                                                })?;
-                                                let confirmed = text
-                                                    .send_message(
-                                                        &room,
-                                                        InterfaceMessage {
-                                                            content: Revision {
-                                                                at: None,
-                                                                text: contents,
-                                                            },
-                                                            history: Vec::new(),
-                                                            reactions: Vec::new(),
-                                                            author: None,
-                                                        },
-                                                    )
-                                                    .await?;
-                                                Ok(confirmed)
-                                            }
+                                        Task::future(async move {
+                                            send.await
+                                                .unwrap_or_else(|| Err(closed_messenger_error()))
                                         })
                                         .then(
                                             move |result: Result<
@@ -1096,19 +1126,26 @@ impl Messenger {
                                 )
                             }
                             ChatUpdateResult::Edit {
-                                interface,
+                                messenger,
                                 room,
                                 message_id,
                                 contents,
                             } => {
-                                let id = interface.id;
-                                let room_id = *room.id();
-                                let Some(edit) = interface.edit else {
-                                    error!("Edit not supported by this messenger");
+                                let id = messenger;
+                                let Some(entry) = messengers.get(id) else {
                                     return Action::None;
                                 };
-                                Action::Run(
-                                    Task::future(async move {
+                                if !entry.interface.edit {
+                                    error!("Edit not supported by this messenger");
+                                    return Action::None;
+                                }
+                                let room_id = *room.id();
+                                let Some(edit) = messengers.with_interface_async(
+                                    id,
+                                    async move |interface| {
+                                        let edit = interface.text_edit().map_err(|error| {
+                                            Box::new(error) as Box<dyn Error + Send + Sync>
+                                        })?;
                                         edit.edit_message(
                                             &room,
                                             &Identifier::new(
@@ -1124,6 +1161,14 @@ impl Messenger {
                                             },
                                         )
                                         .await
+                                    },
+                                ) else {
+                                    return Action::None;
+                                };
+                                Action::Run(
+                                    Task::future(async move {
+                                        edit.await
+                                            .unwrap_or_else(|| Err(closed_messenger_error()))
                                     })
                                     .then(
                                         move |result: Result<_, Box<dyn Error + Send + Sync>>| {
@@ -1143,18 +1188,25 @@ impl Messenger {
                                 )
                             }
                             ChatUpdateResult::Delete {
-                                interface,
+                                messenger,
                                 room,
                                 message_id,
                             } => {
-                                let id = interface.id;
-                                let room_id = *room.id();
-                                let Some(delete) = interface.delete else {
-                                    error!("Delete not supported by this messenger");
+                                let id = messenger;
+                                let Some(entry) = messengers.get(id) else {
                                     return Action::None;
                                 };
-                                Action::Run(
-                                    Task::future(async move {
+                                if !entry.interface.delete {
+                                    error!("Delete not supported by this messenger");
+                                    return Action::None;
+                                }
+                                let room_id = *room.id();
+                                let Some(delete) = messengers.with_interface_async(
+                                    id,
+                                    async move |interface| {
+                                        let delete = interface.text_delete().map_err(|error| {
+                                            Box::new(error) as Box<dyn Error + Send + Sync>
+                                        })?;
                                         delete
                                             .delete_message(
                                                 &room,
@@ -1164,6 +1216,15 @@ impl Messenger {
                                                 ),
                                             )
                                             .await
+                                    },
+                                ) else {
+                                    return Action::None;
+                                };
+                                Action::Run(
+                                    Task::future(async move {
+                                        delete
+                                            .await
+                                            .unwrap_or_else(|| Err(closed_messenger_error()))
                                     })
                                     .then(
                                         move |result: Result<(), Box<dyn Error + Send + Sync>>| {
@@ -1182,22 +1243,34 @@ impl Messenger {
                                     ),
                                 )
                             }
-                            ChatUpdateResult::InspectUser { interface, user } => {
-                                self.start_inspect_user(interface, user)
+                            ChatUpdateResult::InspectUser { messenger, user } => {
+                                self.start_inspect_user(messenger, user, messengers)
                             }
                             ChatUpdateResult::ToggleReaction {
-                                interface,
+                                messenger,
                                 room,
                                 message_id,
                                 emoji,
                                 reacted,
                             } => {
-                                let Some(reactions) = interface.reactions else {
-                                    error!("Reactions not supported by this messenger");
+                                let Some(entry) = messengers.get(messenger) else {
                                     return Action::None;
                                 };
-                                Action::Run(
-                                    Task::future(async move {
+                                if !entry.interface.reactions {
+                                    error!("Reactions not supported by this messenger");
+                                    return Action::None;
+                                }
+                                let Some(update) = messengers.with_interface_async(
+                                    messenger,
+                                    async move |interface| {
+                                        let reactions =
+                                            interface.text_reactions().map_err(|error| {
+                                                Box::new(error) as Box<dyn Error + Send + Sync>
+                                            });
+                                        let Ok(reactions) = reactions else {
+                                            error!("Reactions not supported by this messenger");
+                                            return;
+                                        };
                                         let msg_ident = Identifier::new(
                                             message_id,
                                             InterfaceMessage::default(),
@@ -1211,6 +1284,15 @@ impl Messenger {
                                         };
                                         if let Err(e) = result {
                                             error!("Failed to toggle reaction: {e:#?}");
+                                        }
+                                    },
+                                ) else {
+                                    return Action::None;
+                                };
+                                Action::Run(
+                                    Task::future(async move {
+                                        if update.await.is_none() {
+                                            error!("Messenger closed before reaction update");
                                         }
                                     })
                                     .then(|_| Task::none()),
@@ -1251,9 +1333,9 @@ impl Messenger {
             Message::Navbar(action) => match action {
                 NavbarAction::GetDMs => Action::Run(Task::done(Message::SetSidebarServer(None))),
                 NavbarAction::GetGuild { id, server } => {
-                    let Some(interface) = messengers.interface(id) else {
+                    if messengers.get(id).is_none() {
                         return Action::None;
-                    };
+                    }
 
                     let guild_id = *server.id();
 
@@ -1271,16 +1353,21 @@ impl Messenger {
                     }
 
                     // Fetch rooms and store in registry
-                    let interface = interface.clone();
+                    let Some(rooms) = messengers.with_interface_async(
+                        id,
+                        async move |interface| {
+                            let query = interface.query()?;
+                            let house = query.house_details(server).await?;
+                            Ok((id, guild_id, house.rooms))
+                        },
+                    ) else {
+                        return Action::None;
+                    };
                     Action::Run(
-                        Task::future({
-                            let interface = interface.clone();
-                            let server = server.clone();
-                            async move {
-                                let query = interface.query()?;
-                                let house = query.house_details(server).await?;
-                                Ok((interface.id, guild_id, house.rooms))
-                            }
+                        Task::future(async move {
+                            rooms
+                                .await
+                                .unwrap_or_else(|| Err(closed_messenger_error()))
                         })
                         .then(
                             |result: Result<_, Box<dyn Error + Send + Sync>>| match result {
@@ -1332,12 +1419,12 @@ impl Messenger {
                 }
                 SidebarAction::Call(channel) => {
                     let server = self.sidebar.server_selected.as_ref().unwrap();
-                    let Some(interface) = messengers.interface(server.messenger_id) else {
+                    if messengers.get(server.messenger_id).is_none() {
                         return Action::None;
-                    };
+                    }
 
                     Action::Call {
-                        interface: interface.clone(),
+                        messenger: server.messenger_id,
                         channel,
                     }
                 }
@@ -1346,15 +1433,12 @@ impl Messenger {
                     Action::None
                 }
                 SidebarAction::InspectGuild { id, guild } => {
-                    let Some(interface) = messengers.interface(id) else {
-                        return Action::None;
-                    };
-                    self.start_inspect_house(interface.clone(), guild)
+                    self.start_inspect_house(id, guild, messengers)
                 }
                 SidebarAction::OpenChat { id, conversation } => {
-                    let Some(interface) = messengers.interface(id) else {
+                    if messengers.get(id).is_none() {
                         return Action::None;
-                    };
+                    }
 
                     // Check cache
                     if let Some(data) = messengers.data(id)
@@ -1363,34 +1447,40 @@ impl Messenger {
                             .is_some_and(|room| room.messages.is_some())
                     {
                         return Action::Run(Task::done(Message::ChangeMain(Main::Chat(Box::new(
-                            Chat::new(interface.clone(), conversation),
+                            Chat::new(id, conversation),
                         )))));
                     }
 
                     // Otherwise fetch
+                    let fetch_conversation = conversation.clone();
+                    let Some(messages) = messengers.with_interface_async(
+                        id,
+                        async move |interface| {
+                            let text = interface.messenger().text().map_err(|e| {
+                                Box::new(e) as Box<dyn Error + Send + Sync>
+                            })?;
+                            let msgs = text
+                                .get_messages(
+                                    &fetch_conversation,
+                                    None,
+                                    messenger_interface::interface::Ordering::Time,
+                                )
+                                .await?;
+
+                            Ok((id, fetch_conversation, msgs))
+                        },
+                    ) else {
+                        return Action::None;
+                    };
                     Action::Run(Task::batch([
                         Task::done(Message::ChangeMain(Main::Chat(Box::new(Chat::new(
-                            interface.clone(),
-                            conversation.clone(),
+                            id,
+                            conversation,
                         ))))),
-                        Task::future({
-                            let interface = interface.clone();
-                            async move {
-                                let text = interface
-                                    .api
-                                    .text()
-                                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                                let msgs = text
-                                    .get_messages(
-                                        &conversation,
-                                        None,
-                                        messenger_interface::interface::Ordering::Time,
-                                    )
-                                    .await?;
-                                let id = interface.id;
-
-                                Ok((id, conversation, msgs))
-                            }
+                        Task::future(async move {
+                            messages
+                                .await
+                                .unwrap_or_else(|| Err(closed_messenger_error()))
                         })
                         .then(
                             |t: Result<_, Box<dyn Error + Send + Sync>>| match t {

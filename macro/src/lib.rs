@@ -22,10 +22,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{
-    parse_macro_input, Data, DeriveInput, Field, Fields, Item, ItemEnum, ItemStruct, LitStr, Type,
-    Variant,
-};
+use syn::{parse_macro_input, Data, DeriveInput, Field, Fields, LitStr, Type, Variant};
 
 /// Base64-encode a string literal during macro expansion.
 ///
@@ -36,63 +33,6 @@ pub fn base64_literal(input: TokenStream) -> TokenStream {
     let value = parse_macro_input!(input as LitStr);
     let encoded = LitStr::new(&STANDARD.encode(value.value()), value.span());
     quote!(#encoded).into()
-}
-
-/// Mark a fieldless, zero-sized type as safe for uses requiring a
-/// `unitstruct::UnitStruct`. Marker structs must be unit structs; enums must
-/// be empty, since an enum with even unit variants still stores a discriminant.
-#[proc_macro_attribute]
-pub fn unit_struct(_: TokenStream, item: TokenStream) -> TokenStream {
-    let item = parse_macro_input!(item as Item);
-    expand_unit_struct(item)
-        .unwrap_or_else(syn::Error::into_compile_error)
-        .into()
-}
-
-fn expand_unit_struct(item: Item) -> syn::Result<TokenStream2> {
-    let name = match &item {
-        Item::Struct(ItemStruct {
-            ident,
-            fields: Fields::Unit,
-            generics,
-            ..
-        }) if generics.params.is_empty() => ident,
-        Item::Struct(value) => {
-            return Err(syn::Error::new_spanned(
-                value,
-                "unit_struct requires a non-generic unit struct: `struct Marker;`",
-            ));
-        }
-        Item::Enum(ItemEnum {
-            ident,
-            variants,
-            generics,
-            ..
-        }) if variants.is_empty() && generics.params.is_empty() => ident,
-        Item::Enum(value) => {
-            return Err(syn::Error::new_spanned(
-                value,
-                "unit_struct requires a non-generic empty enum; enum variants carry a discriminant",
-            ));
-        }
-        value => {
-            return Err(syn::Error::new_spanned(
-                value,
-                "unit_struct can only be applied to a struct or enum",
-            ));
-        }
-    };
-
-    Ok(quote! {
-        #item
-
-        const _: () = assert!(
-            ::core::mem::size_of::<#name>() == 0,
-            "unit_struct marker must be zero-sized",
-        );
-
-        unsafe impl ::unitstruct::UnitStruct for #name {}
-    })
 }
 
 #[proc_macro_derive(CredentialSchema, attributes(credential))]

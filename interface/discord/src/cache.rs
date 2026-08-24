@@ -34,6 +34,10 @@ pub(crate) struct DiscordCache {
     pub(crate) guilds: ArcSwapOption<Box<[api::Guild]>>,
     pub(crate) channel_routes: DashMap<SNOWFLAKE, ChannelRoute>,
     pub(crate) guild_channels: DashMap<SNOWFLAKE, Vec<api::Channel>>,
+    /// First REST snapshot fetched for each channel. Gateway events do not
+    /// populate message history, so `Text::get_messages` seeds this cache
+    /// when no snapshot exists yet.
+    pub(crate) messages: DashMap<SNOWFLAKE, Vec<api::Message>>,
     /// Gateway message-create overlay. Discord does not send channel updates
     /// for this field; keeping it separate makes the hot event path O(1)
     /// instead of cloning/scanning channel payload collections.
@@ -53,6 +57,7 @@ impl DiscordCache {
         self.guilds.store(None);
         self.channel_routes.clear();
         self.guild_channels.clear();
+        self.messages.clear();
         self.last_message_ids.clear();
         self.guild_emojis.clear();
         self.guild_stickers.clear();
@@ -129,6 +134,7 @@ impl DiscordCache {
 
         if let Some((_, channels)) = self.guild_channels.remove(&guild_id) {
             for channel in channels {
+                self.messages.remove(&channel.id);
                 self.last_message_ids.remove(&channel.id);
             }
         }
@@ -182,6 +188,7 @@ impl DiscordCache {
             .remove(&channel_id)
             .map(|(_, route)| route);
         self.voice.remove_channel(channel_id);
+        self.messages.remove(&channel_id);
         self.last_message_ids.remove(&channel_id);
         match guild_id.or_else(|| route.and_then(|route| route.guild_id)) {
             Some(guild_id) => {
@@ -206,6 +213,20 @@ impl DiscordCache {
     /// metadata current itself.
     pub(crate) fn note_message_created(&self, channel_id: SNOWFLAKE, message_id: SNOWFLAKE) {
         self.last_message_ids.insert(channel_id, message_id);
+    }
+
+    /// Seed channel message history from REST without replacing state already
+    /// observed by this process. Returns immediately for populated channels.
+    pub(crate) fn populate_messages_if_absent(
+        &self,
+        channel_id: SNOWFLAKE,
+        messages: &[api::Message],
+    ) {
+        use dashmap::mapref::entry::Entry;
+
+        if let Entry::Vacant(entry) = self.messages.entry(channel_id) {
+            entry.insert(messages.to_vec());
+        }
     }
 
     pub(crate) fn last_message_id(&self, channel: &api::Channel) -> Option<SNOWFLAKE> {
@@ -293,5 +314,37 @@ mod tests {
 
         assert!(cache.dm_channels.load_full().unwrap().is_empty());
         assert_eq!(cache.guild_channels.get(&1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rest_messages_seed_cache_only_once() {
+        let cache = DiscordCache::default();
+        let first = api::Message {
+            author: api::User {
+                avatar: None,
+                global_name: None,
+                id: 1,
+                username: "user".to_owned(),
+            },
+            channel_id: 7,
+            content: "first".to_owned(),
+            edited_timestamp: None,
+            id: 11,
+            reactions: None,
+            sticker_items: None,
+            timestamp: "2026-01-01T00:00:00+00:00".to_owned(),
+        };
+        let second = api::Message {
+            content: "second".to_owned(),
+            id: 12,
+            ..first.clone()
+        };
+
+        cache.populate_messages_if_absent(7, std::slice::from_ref(&first));
+        cache.populate_messages_if_absent(7, std::slice::from_ref(&second));
+
+        let messages = cache.messages.get(&7).expect("message snapshot");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, first.id);
     }
 }

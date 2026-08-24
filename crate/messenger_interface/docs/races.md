@@ -13,7 +13,7 @@ REST-only, hybrid) and where these races even apply, see
 ## The fundamental race
 
 The `Query` trait lets the UI call fetch-style methods (`rooms`, `houses`,
-`get_messages`, ...) and also subscribe via `listen()` to an event stream.
+`get_messages`, ...) while feature traits expose deltas through `next_event()`.
 Both eventually surface to the UI as state-mutation calls. They are not
 synchronized with each other.
 
@@ -216,9 +216,10 @@ returned to the UI on every call without ever passing through the cache.
 
 The fetches that **do** require the full reconciliation policy are
 `rest_get_messages` (called on every `Text::get_messages`) and
-`rest_get_contacts` (called on every `Query::contacts`). Those have no
+`rest_get_contacts` (called on every `Query::contacts`). `get_messages` has no
 cache-first path, so the race is open on every invocation, not just at
-cold-start.
+cold-start; its first reconciled REST snapshot is retained as a cache seed and
+later REST responses do not replace that seed.
 
 ## Audit: which fetches are exposed?
 
@@ -229,7 +230,7 @@ cold-start.
 | `rest_get_dms` | yes (cold-start only) | `CHANNEL_DELETE` (DM) | cache reducer handled | cold-start UI window only |
 | `rest_get_guilds` | yes (cold-start only) | `GUILD_DELETE` | cache reducer handled | cold-start UI window only |
 | `rest_get_guild_channels` | yes (cold-start only) | `CHANNEL_DELETE` (guild) | cache reducer handled | cold-start UI window only |
-| `rest_get_messages` | **no, every call HTTP** | `MessageDelete`, `MessageDeleteBulk` | recorded and merged | creation/update/delete/reactions reconciled |
+| `rest_get_messages` | **REST every call; first snapshot cached** | `MessageDelete`, `MessageDeleteBulk` | recorded and merged | creation/update/delete/reactions reconciled |
 
 Cache-first fetches are only at risk during the gateway-connect-to-Ready
 window (typically 1–3 seconds), and only once the corresponding `*_DELETE`

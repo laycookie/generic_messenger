@@ -1,17 +1,16 @@
-use std::{error::Error, sync::Arc, time::Duration};
+use std::{error::Error, time::Duration};
 
 use async_trait::async_trait;
 use futures_timer::Delay;
 use messenger_interface::{
     interface::{Query, QueryEvent},
-    stream::{ArcStream, WeakSocketStream},
+    owner::Retained,
+    stream::EventFuture,
     types::{Details, House, Identifier, Place, Room, RoomCapabilities, User},
 };
-use tracing::warn;
 
 use crate::{
-    BoxError, StreamPollGuard, TelegramMessenger, TelegramPeer, TelegramQueryStream, TelegramRoom,
-    TelegramUser, stable_id, telegram_task,
+    BoxError, TelegramMessenger, TelegramPeer, TelegramRoom, TelegramUser, stable_id, telegram_task,
 };
 
 pub(crate) fn user_identifier(user: &TelegramUser) -> Identifier<User> {
@@ -95,6 +94,27 @@ impl TelegramMessenger {
 
     fn pop_query_event(&self) -> Option<QueryEvent> {
         self.state.lock().unwrap().query_events.pop_front()
+    }
+
+    pub(crate) async fn next_query_event(&self) -> Option<QueryEvent> {
+        loop {
+            if let Some(event) = self.pop_query_event() {
+                return Some(event);
+            }
+
+            let result = {
+                let _poll = self.poll_lock.lock().await;
+                if let Some(event) = self.pop_query_event() {
+                    return Some(event);
+                }
+                self.pump_update().await
+            };
+
+            if let Err(error) = result {
+                tracing::warn!("Telegram update stream failed: {error}");
+                Delay::new(Duration::from_secs(2)).await;
+            }
+        }
     }
 }
 
@@ -182,50 +202,12 @@ impl Query for TelegramMessenger {
         Ok(details)
     }
 
-    async fn listen(
-        self: Arc<Self>,
-    ) -> Result<WeakSocketStream<QueryEvent>, Box<dyn Error + Sync + Send>> {
-        self.ensure_dialogs().await?;
-        let source = Arc::new(TelegramQueryStream {
-            owner: Arc::downgrade(&self),
-        });
-        *self.query_stream.lock().unwrap() = Some(source.clone());
-        Ok(WeakSocketStream::from_arc(source))
+    async fn prepare_listener(&self) -> Result<(), Box<dyn Error + Sync + Send>> {
+        self.ensure_dialogs().await
     }
-}
 
-#[async_trait]
-impl ArcStream for TelegramQueryStream {
-    type Item = QueryEvent;
-
-    async fn next(self: Arc<Self>) -> Option<Self::Item> {
-        let owner = self.owner.upgrade()?;
-        let _stream = StreamPollGuard::new(&owner.active_streams);
-
-        loop {
-            if let Some(event) = owner.pop_query_event() {
-                return Some(event);
-            }
-            if owner.query_owner_dropped() {
-                return None;
-            }
-
-            let result = {
-                let _poll = owner.poll_lock.lock().await;
-                if let Some(event) = owner.pop_query_event() {
-                    return Some(event);
-                }
-                if owner.query_owner_dropped() {
-                    return None;
-                }
-                owner.pump_update().await
-            };
-
-            if let Err(error) = result {
-                warn!("Telegram update stream failed: {error}");
-                Delay::new(Duration::from_secs(2)).await;
-            }
-        }
+    fn next_event(self: Retained<Self>) -> EventFuture<QueryEvent> {
+        Box::pin(async move { self.next_query_event().await })
     }
 }
 

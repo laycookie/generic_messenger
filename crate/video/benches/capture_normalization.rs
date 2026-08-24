@@ -1,18 +1,24 @@
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::hint::black_box;
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use simple_video_capture::bench_internals::{
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use simple_video::bench_internals::{
     bgr_to_rgb_scalar, bgr_to_rgb_simd, packed_4_to_rgb_scalar, packed_4_to_rgb_simd,
 };
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const DIMENSIONS: [(usize, usize); 3] = [(640, 360), (1_280, 720), (1_920, 1_080)];
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn pixels(len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| index.wrapping_mul(131).wrapping_add(17) as u8)
         .collect()
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn packed_4(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("capture normalization/packed 4 to RGB");
     for (width, height) in DIMENSIONS {
@@ -50,6 +56,7 @@ fn packed_4(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn bgr(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("capture normalization/BGR24 to RGB24");
     for (width, height) in DIMENSIONS {
@@ -75,5 +82,10 @@ fn bgr(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 criterion_group!(benches, packed_4, bgr);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 criterion_main!(benches);
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn main() {}

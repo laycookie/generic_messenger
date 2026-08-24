@@ -1,23 +1,26 @@
 use std::{
-    marker::PhantomData,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicU8, Ordering, fence},
-    },
+    future::Future,
+    pin::Pin,
+    sync::atomic::Ordering,
+    task::{Context, Poll},
 };
 
 use bitflags::bitflags;
 use futures::lock::Mutex as AsyncMutex;
 use messenger_interface::{
     interface::Messenger,
-    stream::{ArcStream, WeakSocketStream},
+    owner::{Owner, Retained},
 };
 use secure_string::SecureString;
-use simple_video::VideoCodec;
-use unitstruct::unit_struct;
 
 use crate::{
-    UnitStruct, adapter, cache::DiscordCache, gateways::GatewaySupervisor, rest_api::DiscordApi,
+    adapter,
+    cache::DiscordCache,
+    gateways::{
+        GatewaySupervisor, GatewayTurn, finish_committed_gateway_turn,
+        media::{AtomicDiscordVideoCodec, DiscordVideoCodec},
+    },
+    rest_api::DiscordApi,
 };
 
 pub(crate) const INTERFACE_NAME: &str = "Discord";
@@ -54,164 +57,200 @@ bitflags! {
         const VERSIONED_READ_STATES                  = 1 << 2;
         const VERSIONED_USER_GUILD_SETTINGS          = 1 << 3;
         const DEDUPE_USER_OBJECTS                    = 1 << 4;
-        const PRIORITIZED_READY_PAYLOAD               = 1 << 5;
+        const PRIORITIZED_READY_PAYLOAD              = 1 << 5;
         const MULTIPLE_GUILD_EXPERIMENT_POPULATIONS  = 1 << 6;
-        const NON_CHANNEL_READ_STATES                 = 1 << 7;
-        const AUTH_TOKEN_REFRESH                      = 1 << 8;
-        const USER_SETTINGS_PROTO                     = 1 << 9;
-        const CLIENT_STATE_V2                         = 1 << 10;
-        const PASSIVE_GUILD_UPDATE                    = 1 << 11;
-        const AUTO_CALL_CONNECT                       = 1 << 12;
-        const DEBOUNCE_MESSAGE_REACTIONS              = 1 << 13;
-        const PASSIVE_GUILD_UPDATE_V2                 = 1 << 14;
-        const CHANNEL_OBFUSCATION                     = 1 << 15;
-        const AUTO_LOBBY_CONNECT                      = 1 << 16;
+        const NON_CHANNEL_READ_STATES                = 1 << 7;
+        const AUTH_TOKEN_REFRESH                     = 1 << 8;
+        const USER_SETTINGS_PROTO                    = 1 << 9;
+        const CLIENT_STATE_V2                        = 1 << 10;
+        const PASSIVE_GUILD_UPDATE                   = 1 << 11;
+        const AUTO_CALL_CONNECT                      = 1 << 12;
+        const DEBOUNCE_MESSAGE_REACTIONS             = 1 << 13;
+        const PASSIVE_GUILD_UPDATE_V2                = 1 << 14;
+        const CHANNEL_OBFUSCATION                    = 1 << 15;
+        const AUTO_LOBBY_CONNECT                     = 1 << 16;
     }
 }
 const DEFAULT_CAPABILITIES: Capabilities = Capabilities::CLIENT_STATE_V2;
 
-#[unit_struct]
-pub(crate) struct Owned;
-
-/// Backend-local media resources. Stored inline, not behind another `Arc`, so
-/// grouping them adds no allocation or indirection.
+/// Media resources stored inline in owner allocation.
 #[derive(Default)]
 pub(crate) struct LocalMediaState {
     pub(crate) audio_manager: AsyncMutex<adapter::audio::AudioManager>,
     pub(crate) video_streams: std::sync::Mutex<adapter::video::DiscordVideoStreams>,
-    /// User preference sent in codec priority order. Zero intentionally maps
-    /// to H264 so derived/default application state remains compatible.
-    preferred_video_codec: AtomicU8,
+    /// User preference sent in codec priority order.
+    preferred_video_codec: AtomicDiscordVideoCodec,
 }
 
 impl LocalMediaState {
-    const VIDEO_CODEC_H264: u8 = 0;
-    const VIDEO_CODEC_AV1: u8 = 1;
-
-    pub(crate) fn preferred_video_codec(&self) -> VideoCodec {
-        match self.preferred_video_codec.load(Ordering::Acquire) {
-            Self::VIDEO_CODEC_AV1 => VideoCodec::Av1,
-            Self::VIDEO_CODEC_H264 => VideoCodec::H264,
-            _ => VideoCodec::H264,
-        }
+    pub(crate) fn preferred_video_codec(&self) -> DiscordVideoCodec {
+        self.preferred_video_codec.load(Ordering::Acquire)
     }
 
-    /// Store known codec preference, returning whether value changed. Future
-    /// `VideoCodec` variants remain rejected until Discord support is defined.
-    pub(crate) fn set_preferred_video_codec(&self, codec: VideoCodec) -> Option<bool> {
-        let codec = match codec {
-            VideoCodec::H264 => Self::VIDEO_CODEC_H264,
-            VideoCodec::Av1 => Self::VIDEO_CODEC_AV1,
-            _ => return None,
-        };
-        Some(self.preferred_video_codec.swap(codec, Ordering::AcqRel) != codec)
+    /// Stores codec preference and reports change.
+    pub(crate) fn set_preferred_video_codec(&self, codec: DiscordVideoCodec) -> bool {
+        self.preferred_video_codec.swap(codec, Ordering::AcqRel) != codec
     }
 }
 
-/// Discord state plus capability marker. Each subsystem owns persistent state
-/// exactly once; borrowed operation contexts coordinate fields without copying
-/// them.
-#[repr(C)]
-pub(crate) struct InnerDiscord<T: UnitStruct> {
-    /// HTTP transport and credential only. Never owns or mutates cache state.
-    pub(crate) api: DiscordApi,
-    /// Canonical gateway-derived state plus compact routing indexes.
+/// Runtime state stored inline in [`InnerDiscord`].
+pub(crate) struct DiscordRuntimeState {
     pub(crate) cache: DiscordCache,
-    /// Main gateway connection and stream lifecycle.
     pub(crate) gateway: GatewaySupervisor,
-    /// Microphone and logical video resources shared by media control paths.
     pub(crate) media: LocalMediaState,
-    _marker: PhantomData<T>,
 }
 
-impl<T: UnitStruct> InnerDiscord<T> {
-    /// True when every remaining strong reference is held by in-flight
-    /// `next()` futures themselves — i.e. the app dropped its last
-    /// `Arc<dyn Messenger>` / capability handle and the streams are the
-    /// only thing keeping this alive.
-    ///
-    /// Must be called from inside `next()` (which contributes one counted
-    /// reference) while being polled through `WeakSocketStream` (whose
-    /// transient upgrade contributes the `+ 1`). Counts are maintained so
-    /// they never over-state in-flight futures (see
-    /// [`crate::stream_poll::StreamPollGuard`]),
-    /// so a race can only delay detection to a later poll, never fire it
-    /// while an external owner exists.
-    pub(crate) fn owner_dropped(self: &Arc<Self>) -> bool {
-        let active = self.gateway.active_streams.load(Ordering::SeqCst);
-        // Pairs with the fence in `StreamPollGuard::new`: if `active`
-        // includes a freshly registered future, the strong count read
-        // below includes that future's Arc as well.
-        fence(Ordering::SeqCst);
-        Arc::strong_count(self) == active + 1
-    }
-
-    /// Creates a [`WeakSocketStream`] by reinterpreting this `InnerDiscord<T>`
-    /// as `InnerDiscord<C>` to select the matching [`ArcStream`] implementation.
-    ///
-    /// # Safety
-    /// `InnerDiscord<T>` and `InnerDiscord<C>` have identical `repr(C)` field
-    /// layouts: `T` appears only in `PhantomData<T>`, whose layout is always
-    /// zero-sized with alignment one.
-    pub(crate) async fn listen_as<C, E>(
-        self: Arc<Self>,
-    ) -> Result<WeakSocketStream<E>, Box<dyn std::error::Error + Send + Sync>>
-    where
-        C: UnitStruct + 'static,
-        InnerDiscord<C>: ArcStream<Item = E> + Send + Sync,
-        E: Send + 'static,
-    {
-        self.gateway.ensure(&self.api).await?;
-        let weak = Arc::downgrade(&self);
-        let ptr = Weak::into_raw(weak) as *const InnerDiscord<C>;
-        Ok(WeakSocketStream::new(unsafe { Weak::from_raw(ptr) }))
-    }
-}
-
-impl InnerDiscord<Owned> {
-    /// Shared constructor for both login paths. The token is always known up
-    /// front: a token login passes it straight through, a username/password
-    /// login fetches it from Discord first.
-    pub(crate) fn build(token: SecureString) -> Arc<dyn Messenger> {
-        Arc::new(InnerDiscord {
-            api: DiscordApi::new(token),
+impl DiscordRuntimeState {
+    fn new() -> Self {
+        Self {
             cache: DiscordCache::default(),
             gateway: GatewaySupervisor::new(DEFAULT_INTENTS, DEFAULT_CAPABILITIES),
             media: LocalMediaState::default(),
-            _marker: PhantomData,
+        }
+    }
+}
+
+/// Mandatory work paired with its non-cloneable retained owner access.
+pub(crate) struct Committed<T> {
+    discord: Retained<InnerDiscord>,
+    work: T,
+}
+
+impl<T> Committed<T> {
+    fn new(discord: Retained<InnerDiscord>, work: T) -> Self {
+        Self { discord, work }
+    }
+
+    pub(crate) fn into_parts(self) -> (Retained<InnerDiscord>, T) {
+        (self.discord, self.work)
+    }
+}
+
+/// Detaches unfinished committed work on cancellation.
+struct CompleteOnDrop<T: Send + 'static> {
+    future: Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>,
+}
+
+impl<T: Send + 'static> CompleteOnDrop<T> {
+    fn new(future: impl Future<Output = T> + Send + 'static) -> Self {
+        Self {
+            future: Some(Box::pin(future)),
+        }
+    }
+}
+
+impl<T: Send + 'static> Future for CompleteOnDrop<T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut future = self
+            .future
+            .take()
+            .expect("completed future must not be polled again");
+        match future.as_mut().poll(cx) {
+            Poll::Ready(output) => Poll::Ready(output),
+            Poll::Pending => {
+                self.future = Some(future);
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl<T: Send + 'static> Drop for CompleteOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(future) = self.future.take() {
+            smol::spawn(future).detach();
+        }
+    }
+}
+
+/// Discord backend. Only selected gateway turns retain it past poll cancellation.
+pub(crate) struct InnerDiscord {
+    /// Stateless HTTP transport and credential.
+    pub(crate) api: DiscordApi,
+    runtime: DiscordRuntimeState,
+}
+
+impl InnerDiscord {
+    pub(crate) fn runtime(&self) -> &DiscordRuntimeState {
+        &self.runtime
+    }
+
+    /// Ensure a usable gateway exists.
+    pub(crate) async fn ensure_gateway(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.runtime().gateway.ensure(&self.api).await
+    }
+
+    fn new(token: SecureString) -> Owner<Self> {
+        Owner::new(Self {
+            api: DiscordApi::new(token),
+            runtime: DiscordRuntimeState::new(),
         })
+    }
+
+    /// Builds erased owner after either login path resolves token.
+    pub(crate) fn build(token: SecureString) -> Owner<dyn Messenger> {
+        let owner: Owner<dyn Messenger> = Self::new(token);
+        owner
+    }
+
+    /// Shields selected turn; completion returns guard for same root poll.
+    pub(crate) fn finish_gateway_turn(
+        retained: Retained<Self>,
+        turn: GatewayTurn,
+    ) -> impl Future<Output = Option<Retained<Self>>> + Send + 'static {
+        CompleteOnDrop::new(finish_committed_gateway_turn(Committed::new(
+            retained, turn,
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::task::Poll;
+
+    use futures::{Future as _, channel::oneshot, future::poll_fn};
+
     use super::*;
 
-    #[unitstruct::unit_struct]
-    struct TestMarker;
-
     #[test]
-    fn marker_variants_share_layout() {
-        assert_eq!(
-            std::mem::size_of::<InnerDiscord<Owned>>(),
-            std::mem::size_of::<InnerDiscord<TestMarker>>()
-        );
-        assert_eq!(
-            std::mem::align_of::<InnerDiscord<Owned>>(),
-            std::mem::align_of::<InnerDiscord<TestMarker>>()
-        );
+    fn detached_completion_retains_closed_owner_until_work_finishes() {
+        smol::block_on(async {
+            let owner = InnerDiscord::new(SecureString::from("test-token"));
+            let lifetime = owner.downgrade();
+            let retained = lifetime.retain().expect("owner must be active");
+            let (release, released) = oneshot::channel();
+            let (complete, completed) = oneshot::channel();
+            let mut shield = Box::pin(CompleteOnDrop::new(async move {
+                released.await.expect("test must release committed work");
+                assert!(retained.get().runtime().gateway.current.load().is_none());
+                complete.send(()).expect("test must await completion");
+            }));
+
+            poll_fn(|cx| {
+                assert!(shield.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(shield);
+            drop(owner);
+            assert!(!lifetime.is_active());
+
+            release.send(()).expect("committed work must be detached");
+            completed.await.expect("detached work must complete");
+        });
     }
 
     #[test]
     fn media_codec_preference_defaults_to_h264_and_switches() {
         let media = LocalMediaState::default();
 
-        assert_eq!(media.preferred_video_codec(), VideoCodec::H264);
-        assert_eq!(media.set_preferred_video_codec(VideoCodec::Av1), Some(true));
-        assert_eq!(media.preferred_video_codec(), VideoCodec::Av1);
-        assert_eq!(
-            media.set_preferred_video_codec(VideoCodec::Av1),
-            Some(false)
-        );
+        assert_eq!(media.preferred_video_codec(), DiscordVideoCodec::H264);
+        assert!(media.set_preferred_video_codec(DiscordVideoCodec::Av1));
+        assert_eq!(media.preferred_video_codec(), DiscordVideoCodec::Av1);
+        assert!(!media.set_preferred_video_codec(DiscordVideoCodec::Av1));
     }
 }

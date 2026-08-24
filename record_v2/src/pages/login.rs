@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    future::Future,
-    pin::Pin,
-    sync::{Arc, LazyLock},
-};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::LazyLock};
 
 use discord::Discord;
 use iced::{
@@ -14,7 +9,8 @@ use iced::{
 };
 use messenger_interface::{
     auth::{AuthMethod, Credential, CredentialField, InteractiveAuthMethod, InteractiveAuthPrompt},
-    interface::Messenger as NeoMessenger,
+    interface::Messenger,
+    owner::Owner,
 };
 #[cfg(feature = "slack")]
 use slack::Slack;
@@ -27,7 +23,7 @@ use telegram::Telegram;
 /// registry can hold heterogeneous backends behind one fn pointer.
 type CreateFuture = Pin<
     Box<
-        dyn Future<Output = Result<Arc<dyn NeoMessenger>, Box<dyn std::error::Error + Send + Sync>>>
+        dyn Future<Output = Result<Owner<dyn Messenger>, Box<dyn std::error::Error + Send + Sync>>>
             + Send,
     >,
 >;

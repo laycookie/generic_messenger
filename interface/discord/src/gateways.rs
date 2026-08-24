@@ -21,7 +21,7 @@ where
 }
 
 pub(crate) use frame::{GatewayFrame, GatewayFrameConversionError, GatewayPayload};
-pub(crate) use polling::GatewayTurn;
+pub(crate) use polling::{GatewayTurn, finish_committed_gateway_turn};
 pub(crate) use state::{GatewayState, Handshake, Handshaking, Heartbeat, expect_hello};
 pub(crate) use supervisor::GatewaySupervisor;
 pub(crate) use transport::{GatewayStreamExt, Websocket};

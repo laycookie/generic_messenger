@@ -1,10 +1,11 @@
 use std::{
     io,
     sync::{Arc, atomic::Ordering},
+    time::Instant,
 };
 
 use facet_pretty::FacetPretty as _;
-use messenger_interface::{interface::VoiceEvent, types::Identifier};
+use messenger_interface::{interface::VoiceEvent, stream::WeakStreamSource, types::Identifier};
 use smol::net::UdpSocket;
 use tracing::{debug, error, trace, warn};
 
@@ -21,8 +22,8 @@ use super::{
         SessionUpdateEvent, SpeakingPayload, VideoPayload, supported_codecs,
     },
 };
+use crate::DiscordRuntimeState;
 use crate::gateways::{Gateway, GatewayFrame};
-use crate::{InnerDiscord, UnitStruct, adapter::audio::AudioDiscord};
 
 // Local types for IP discovery packet layout.
 // Only used in the VoiceOpcode::Ready handler below.
@@ -117,9 +118,9 @@ impl GatewayFrame<VoiceOpcode> {
     /// `role` selects the two behaviours that diverge (see [`ConnectionRole`]).
     ///
     /// <https://docs.discord.food/topics/voice-connections#voice-opcodes>
-    pub async fn exec<T: UnitStruct>(
+    pub async fn exec(
         self,
-        discord: &Arc<InnerDiscord<T>>,
+        discord: &DiscordRuntimeState,
         voice_gateway: &Arc<Gateway<Media>>,
         role: ConnectionRole,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -183,16 +184,13 @@ impl GatewayFrame<VoiceOpcode> {
                 // call connection creates media event stream.
                 if first_description && role == ConnectionRole::Call {
                     // Runs while holding both receiver locks.
-                    trace!("SessionDescription: creating audio stream (listen_as)");
-                    let stream = discord
-                        .clone()
-                        .listen_as::<AudioDiscord, _>()
-                        .await
-                        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-                    if let Some(gateway) = discord.gateway.current.load().as_ref() {
+                    trace!("SessionDescription: creating audio stream");
+                    if let Some(gateway) = discord.gateway.current.load().as_ref()
+                        && let Some(audio) = gateway.voice.open_audio_source_for(voice_gateway)
+                    {
                         gateway.events.submit_voice(VoiceEvent::CallStreamReady {
                             room: Identifier::new(voice_gateway.channel_id, ()),
-                            stream,
+                            source: WeakStreamSource::from_arc(&audio),
                         });
                     }
                     trace!("SessionDescription: CallStreamReady emitted");
@@ -462,6 +460,16 @@ impl GatewayFrame<VoiceOpcode> {
                 voice_gateway
                     .dave_pending_transitions
                     .insert(transition_id, dave_session.protocol_version());
+                tracing::trace!(
+                    target: "video_timing",
+                    stage = "outgoing.control",
+                    kind = "DAVE",
+                    action = "dave_transition_prepared",
+                    transition_id,
+                    protocol_version = u64::from(dave_session.protocol_version().get()),
+                    pending_transitions = voice_gateway.dave_pending_transitions.len(),
+                    "DAVE transition prepared"
+                );
 
                 if transition_id == 0 {
                     execute_pending_transition(
@@ -521,20 +529,22 @@ impl GatewayFrame<VoiceOpcode> {
                 };
             }
             VoiceOpcode::MLSProposals => {
-                let mut dave_session = voice_gateway.require_dave_session().await?;
                 let bytes = payload.binary()?;
                 let proposals = MlsProposalsPayload::try_from(bytes)?;
 
-                let commit_welcome = match dave_session.process_proposals(
-                    proposals.operation_type,
-                    proposals.data,
-                    // TODO: Add this for security purposes, should be received from CLIENTS_CONNECT
-                    None,
-                ) {
-                    Ok(welcome_message) => welcome_message,
-                    Err(err) => {
-                        error!("{err:?}");
-                        return Err(err.into());
+                let commit_welcome = {
+                    let mut dave_session = voice_gateway.require_dave_session().await?;
+                    match dave_session.process_proposals(
+                        proposals.operation_type,
+                        proposals.data,
+                        // TODO: Add this for security purposes, should be received from CLIENTS_CONNECT
+                        None,
+                    ) {
+                        Ok(welcome_message) => welcome_message,
+                        Err(err) => {
+                            error!("{err:?}");
+                            return Err(err.into());
+                        }
                     }
                 };
 
@@ -550,37 +560,116 @@ impl GatewayFrame<VoiceOpcode> {
                 }
             }
             VoiceOpcode::MLSAnnounceCommitTransition => {
-                let mut dave_session = voice_gateway.require_dave_session().await?;
                 let bytes = payload.binary()?;
                 let payload = MlsTransitionPayload::try_from(bytes)?;
 
-                let result = dave_session.process_commit(payload.data);
+                let process_started = Instant::now();
+                let (protocol_version, result) = {
+                    let mut dave_session = voice_gateway.require_dave_session().await?;
+                    let protocol_version = dave_session.protocol_version();
+                    if payload.transition_id != 0 {
+                        // davey installs both receive and send ratchets during
+                        // commit processing. Gate outbound media until Discord
+                        // explicitly executes this transition (opcode 22).
+                        voice_gateway
+                            .dave_pending_transitions
+                            .insert(payload.transition_id, protocol_version);
+                    }
+                    tracing::trace!(
+                        target: "video_timing",
+                        stage = "outgoing.control",
+                        kind = "DAVE",
+                        action = "dave_commit_processing",
+                        transition_id = payload.transition_id,
+                        protocol_version = u64::from(protocol_version.get()),
+                        pending_transitions = voice_gateway.dave_pending_transitions.len(),
+                        "DAVE transition processing"
+                    );
+                    let result = dave_session.process_commit(payload.data);
+                    (protocol_version, result)
+                };
+                let succeeded = result.is_ok();
                 respond_to_mls_transition(
                     &voice_gateway.websocket,
                     &voice_gateway.dave_pending_transitions,
-                    dave_session.protocol_version(),
+                    protocol_version,
                     payload.transition_id,
                     result,
                 )
                 .await?;
+                tracing::trace!(
+                    target: "video_timing",
+                    stage = "outgoing.control",
+                    kind = "DAVE",
+                    action = if succeeded {
+                        "dave_commit_ready"
+                    } else {
+                        "dave_commit_rejected"
+                    },
+                    transition_id = payload.transition_id,
+                    protocol_version = u64::from(protocol_version.get()),
+                    elapsed_us = u64::try_from(process_started.elapsed().as_micros())
+                        .unwrap_or(u64::MAX),
+                    pending_transitions = voice_gateway.dave_pending_transitions.len(),
+                    failed = !succeeded,
+                    "DAVE transition processed"
+                );
             }
             VoiceOpcode::MLSWelcome => {
-                let mut dave_session = voice_gateway.require_dave_session().await?;
                 let bytes = payload.binary()?;
                 let payload = MlsTransitionPayload::try_from(bytes)?;
 
-                let result = dave_session.process_welcome(payload.data);
-                if result.is_ok() {
-                    debug!("{:?}", dave_session.get_user_ids());
-                }
+                let process_started = Instant::now();
+                let (protocol_version, result) = {
+                    let mut dave_session = voice_gateway.require_dave_session().await?;
+                    let protocol_version = dave_session.protocol_version();
+                    if payload.transition_id != 0 {
+                        voice_gateway
+                            .dave_pending_transitions
+                            .insert(payload.transition_id, protocol_version);
+                    }
+                    tracing::trace!(
+                        target: "video_timing",
+                        stage = "outgoing.control",
+                        kind = "DAVE",
+                        action = "dave_welcome_processing",
+                        transition_id = payload.transition_id,
+                        protocol_version = u64::from(protocol_version.get()),
+                        pending_transitions = voice_gateway.dave_pending_transitions.len(),
+                        "DAVE transition processing"
+                    );
+                    let result = dave_session.process_welcome(payload.data);
+                    if result.is_ok() {
+                        debug!("{:?}", dave_session.get_user_ids());
+                    }
+                    (protocol_version, result)
+                };
+                let succeeded = result.is_ok();
                 respond_to_mls_transition(
                     &voice_gateway.websocket,
                     &voice_gateway.dave_pending_transitions,
-                    dave_session.protocol_version(),
+                    protocol_version,
                     payload.transition_id,
                     result,
                 )
                 .await?;
+                tracing::trace!(
+                    target: "video_timing",
+                    stage = "outgoing.control",
+                    kind = "DAVE",
+                    action = if succeeded {
+                        "dave_welcome_ready"
+                    } else {
+                        "dave_welcome_rejected"
+                    },
+                    transition_id = payload.transition_id,
+                    protocol_version = u64::from(protocol_version.get()),
+                    elapsed_us = u64::try_from(process_started.elapsed().as_micros())
+                        .unwrap_or(u64::MAX),
+                    pending_transitions = voice_gateway.dave_pending_transitions.len(),
+                    failed = !succeeded,
+                    "DAVE transition processed"
+                );
             }
             VoiceOpcode::MediaSinkWants => {
                 let media_sink_wants = payload.decode::<MediaSinkWantsPayload>()?;

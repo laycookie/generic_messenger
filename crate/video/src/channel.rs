@@ -3,7 +3,7 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
-    task::Poll,
+    task::{Context, Poll},
     time::Instant,
 };
 
@@ -134,42 +134,43 @@ pub struct FrameConsumer(Arc<FrameChannel>);
 impl FrameConsumer {
     /// Await next frame; `None` once producer is gone.
     pub async fn pop(&mut self) -> Option<VideoFrame> {
-        poll_fn(|cx| {
-            let timing_enabled = tracing::enabled!(target: "video_timing", tracing::Level::TRACE);
-            let stage_started = timing_enabled.then(Instant::now);
-            let lock_started = timing_enabled.then(Instant::now);
-            let mut state = self.0.state();
-            let lock_wait_us = lock_started.map(elapsed_micros).unwrap_or_default();
-            if let Some(queued) = state.frame.take() {
-                drop(state);
-                if timing_enabled {
-                    let frame_timing = queued.frame.timing();
-                    tracing::trace!(
-                        target: "video_timing",
-                        stage = "channel.consume",
-                        channel_id = self.0.id,
-                        frame_id = frame_timing.map_or(0, |timing| timing.id()),
-                        channel_sequence = queued.sequence,
-                        pipeline_elapsed_us = frame_timing
-                            .map_or(0, |timing| timing.elapsed_micros()),
-                        queue_age_us = queued
-                            .published_at
-                            .map(elapsed_micros)
-                            .unwrap_or_default(),
-                        lock_wait_us,
-                        elapsed_us = stage_started.map(elapsed_micros).unwrap_or_default(),
-                        "video stage complete"
-                    );
-                }
-                return Poll::Ready(Some(queued.frame));
+        poll_fn(|cx| self.poll_pop(cx)).await
+    }
+
+    pub(crate) fn poll_pop(&mut self, cx: &mut Context<'_>) -> Poll<Option<VideoFrame>> {
+        let timing_enabled = tracing::enabled!(target: "video_timing", tracing::Level::TRACE);
+        let stage_started = timing_enabled.then(Instant::now);
+        let lock_started = timing_enabled.then(Instant::now);
+        let mut state = self.0.state();
+        let lock_wait_us = lock_started.map(elapsed_micros).unwrap_or_default();
+        if let Some(queued) = state.frame.take() {
+            drop(state);
+            if timing_enabled {
+                let frame_timing = queued.frame.timing();
+                tracing::trace!(
+                    target: "video_timing",
+                    stage = "channel.consume",
+                    channel_id = self.0.id,
+                    frame_id = frame_timing.map_or(0, |timing| timing.id()),
+                    channel_sequence = queued.sequence,
+                    pipeline_elapsed_us = frame_timing
+                        .map_or(0, |timing| timing.elapsed_micros()),
+                    queue_age_us = queued
+                        .published_at
+                        .map(elapsed_micros)
+                        .unwrap_or_default(),
+                    lock_wait_us,
+                    elapsed_us = stage_started.map(elapsed_micros).unwrap_or_default(),
+                    "video stage complete"
+                );
             }
-            if !state.producer_alive {
-                return Poll::Ready(None);
-            }
-            self.0.consumer_waker.register(cx.waker());
-            Poll::Pending
-        })
-        .await
+            return Poll::Ready(Some(queued.frame));
+        }
+        if !state.producer_alive {
+            return Poll::Ready(None);
+        }
+        self.0.consumer_waker.register(cx.waker());
+        Poll::Pending
     }
 
     /// Take ready frame; `None` when empty or ended.

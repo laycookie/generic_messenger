@@ -40,7 +40,7 @@ pnet_macros_support = "0.35.0"
 simple-audio-channels = { path = "../../crate/audio", version = "0.0.1" }
 opus = "0.3.1"
 # Video
-simple-video = { path = "../../crate/video", version = "0.0.1", features = ["h264", "av1"] }
+simple-video = { path = "../../crate/video", version = "0.0.1", default-features = false, features = ["h264", "av1"] }
 # Security
 secure-string = "0.3.0"
 libsodium-rs = "0.2.4"
@@ -59,7 +59,6 @@ num_enum = "0.7.6"
 # Bitflags
 bitflags = { workspace = true }
 credential_macro = { path = "../../macro" }
-unitstruct = { path = "../../crate/unitstruct" }
 
 [dev-dependencies]
 openmls = "0.8.1"

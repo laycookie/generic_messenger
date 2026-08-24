@@ -1,14 +1,13 @@
 //! Adapters from Discord-specific state and protocols to `messenger_interface`.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use messenger_interface::{
     auth::{AuthMethod, Credential, InteractiveAuthMethod},
     interface::Messenger,
+    owner::Owner,
 };
 
-use crate::{INTERFACE_NAME, InnerDiscord, Owned, auth};
+use crate::{INTERFACE_NAME, InnerDiscord, auth};
 
 pub(crate) mod audio;
 pub(crate) mod query;
@@ -16,12 +15,12 @@ pub(crate) mod text;
 pub(crate) mod video;
 
 #[async_trait]
-impl Messenger for InnerDiscord<Owned> {
+impl Messenger for InnerDiscord {
     /// A `Token` builds immediately; a `Password` performs the username/password
     /// (+ optional MFA) exchange and builds from the resolved token.
     async fn create_messenger(
         cred: Credential,
-    ) -> Result<Arc<dyn Messenger>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Owner<dyn Messenger>, Box<dyn std::error::Error + Send + Sync>> {
         let credential = auth::login_with_credentials(cred).await?;
         let auth::DiscordAuth::Token { token } = auth::DiscordAuth::try_from(credential)? else {
             unreachable!("credential resolution always returns a token")

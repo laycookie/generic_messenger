@@ -1,0 +1,12 @@
+[package]
+name = "messenger_stream"
+version = "0.0.1"
+edition = "2024"
+description = "Owner-lifetime and owner-bound stream primitives"
+license = "GPL-2.0-only"
+repository = "https://github.com/laycookie/generic_messenger"
+
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }

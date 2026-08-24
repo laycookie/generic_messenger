@@ -1,23 +1,8 @@
-//! One Steam voice call's runtime: the two streams the UI consumes.
+//! Steam voice event source and per-call media session.
 //!
-//! - [`VoiceEventStream`] — the `listen()` stream. Carries call-lifecycle
-//!   [`VoiceEvent`]s (today: `CallStreamReady`) from `connect` to the UI.
-//! - [`SteamAudioSession`] — the per-call `AddAudioInput`/`AddAudioSource` +
-//!   media pump, surfaced as the `AudioEvent` stream inside `CallStreamReady`.
-//!
-//! The audio session mirrors Discord's `gateways/voice/audio.rs`, adapted to the
-//! [`VoiceTransport`] seam. Acquiring a mixer channel uses the same **two-phase
-//! "yield"**: to attach the mic (or a peer's playback), the session queues an
-//! [`AudioEvent`] carrying a oneshot, returns so `ArcStream::next` hands it to the
-//! UI, then adopts the fulfilled channel on a later poll. Awaiting the oneshot
-//! inside a single `next` would deadlock — the very `next` that must deliver the
-//! request would be blocked on its answer.
-//!
-//! The bridge itself (Opus at 48 kHz, cancel-safe mic framing) is
-//! [`super::audio`]; the transport under it is [`super::transport`]. With a
-//! [`LoopbackTransport`](super::transport::LoopbackTransport) this whole path
-//! runs for real (mic → Opus → transport → Opus → playback) — the loopback voice
-//! demo — so the media plane is exercisable before the GNS transport exists.
+//! Mixer attachment is two-phase: emit oneshot request, return it to UI, then
+//! adopt response on later poll. Waiting in same poll would deadlock delivery.
+//! [`super::audio`] handles Opus framing over [`super::transport`].
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
@@ -48,13 +33,10 @@ use super::transport::{VoiceFrame, VoiceTransport};
 /// Give up acquiring the mic after this many declined requests and run the call
 /// receive-only.
 const MAX_MIC_RETRIES: u8 = 3;
-/// Idle wake-up so a silent call still notices `disconnect` (the kill flag)
-/// promptly, without any cross-task signal.
+/// Bounds disconnect latency because atomic kill flag cannot wake stream.
 const HEARTBEAT: Duration = Duration::from_secs(1);
 
-/// The `listen()` stream: call-lifecycle events pushed by `connect`.
-///
-/// Backed by an unbounded channel — ends when the messenger drops the sender.
+/// Voice events pushed by `connect`; ends when sender drops.
 pub(crate) struct VoiceEventStream {
     events: AsyncMutex<mpsc::UnboundedReceiver<VoiceEvent>>,
 }
@@ -89,9 +71,7 @@ enum Step {
     Closed,
 }
 
-/// Running state for one call's audio, behind an async mutex (only the single
-/// stream poller touches it, but `ArcStream::next` takes `Arc<Self>` so it needs
-/// interior mutability across awaits).
+/// Call media state behind async mutex for shared poll receiver.
 struct SessionState {
     encoder: Encoder,
     /// Per-speaker decoders — Opus carries inter-frame state, so speakers can't
@@ -146,8 +126,7 @@ impl SteamAudioSession {
         }))
     }
 
-    /// End the call: the audio stream returns `None` on its next poll (within
-    /// [`HEARTBEAT`] even during silence), which drops the mixer channels.
+    /// Ends stream by next heartbeat and drops mixer channels.
     pub(crate) fn kill(&self) {
         self.killed.store(true, Ordering::Release);
     }
@@ -160,23 +139,20 @@ impl SteamAudioSession {
         self.outbox.lock().unwrap().pop_front()
     }
 
-    /// One unit of progress. Either queues a channel request (and returns so
-    /// `next` delivers it) or runs one media step. `Break` ends the stream.
+    /// Queues attachment or runs one media step; `Break` ends stream.
     async fn poll_audio(&self) -> ControlFlow<()> {
         let mut state = self.state.lock().await;
 
         adopt_ready_producers(&mut state);
 
-        // Acquire the mic (two-phase); `Pending` means a request was queued or is
-        // being awaited — return so `next` can deliver it / re-enter.
+        // Return between attachment request and adoption.
         if let MicStep::Pending = self.ensure_mic(&mut state).await {
             return ControlFlow::Continue(());
         }
 
         let mut outgoing_frame = None;
         let step = {
-            // Borrow only `state.mic` here (via the outgoing future); the rest of
-            // `state` stays free for the processing below.
+            // Limit outgoing borrow to microphone field.
             let mic = &mut state.mic;
             let mut outgoing = pin!(
                 async move {

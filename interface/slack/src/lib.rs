@@ -4,17 +4,13 @@
 //! and sending plain text via Slack Web API. Realtime events, edit/delete,
 //! reactions, files, blocks, and calls are intentionally left out for now.
 
-use std::{
-    collections::HashMap,
-    error::Error,
-    hash::Hasher as _,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashMap, error::Error, hash::Hasher as _, sync::Mutex};
 
 use async_trait::async_trait;
 use messenger_interface::{
     auth::{AuthMethod, Credential, CredentialField, CredentialSchema},
     interface::Messenger,
+    owner::Owner,
     types::ID,
 };
 use secure_string::SecureString;
@@ -33,7 +29,7 @@ pub struct Slack;
 impl Slack {
     pub async fn create_messenger(
         cred: Credential,
-    ) -> Result<Arc<dyn Messenger>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<Owner<dyn Messenger>, Box<dyn Error + Send + Sync>> {
         <SlackMessenger as Messenger>::create_messenger(cred).await
     }
 
@@ -51,14 +47,15 @@ pub(crate) struct SlackMessenger {
 }
 
 impl SlackMessenger {
-    fn build(token: SecureString) -> Arc<dyn Messenger> {
-        Arc::new(Self {
+    fn build(token: SecureString) -> Owner<dyn Messenger> {
+        let owner: Owner<dyn Messenger> = Owner::new(Self {
             token,
             auth_cache: Mutex::new(None),
             users: Mutex::new(HashMap::new()),
             channel_ids: Mutex::new(HashMap::new()),
             message_ts: Mutex::new(HashMap::new()),
-        })
+        });
+        owner
     }
 
     pub(crate) fn auth_header(&self) -> Vec<(&'static str, String)> {
@@ -150,7 +147,7 @@ enum SlackAuth {
 impl Messenger for SlackMessenger {
     async fn create_messenger(
         cred: Credential,
-    ) -> Result<Arc<dyn Messenger>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<Owner<dyn Messenger>, Box<dyn Error + Send + Sync>> {
         match SlackAuth::try_from(cred)? {
             SlackAuth::Token { token } => Ok(Self::build(token)),
         }

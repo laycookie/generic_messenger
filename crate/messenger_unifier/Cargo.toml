@@ -6,3 +6,7 @@ publish = false
 
 [dependencies]
 messenger_interface = { path = "../messenger_interface" }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }

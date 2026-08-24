@@ -1,0 +1,33 @@
+name: Miri
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  messenger-stream:
+    name: messenger_stream
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust with Miri
+        run: rustup toolchain install nightly-2026-04-17 --profile minimal --component miri
+
+      - name: Prepare Miri
+        run: cargo +nightly-2026-04-17 miri setup
+
+      - name: Test owner and stream primitives
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+        run: cargo +nightly-2026-04-17 miri test -p messenger_stream
+
+      - name: Exercise cross-thread close schedules
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-many-seeds=0..16
+        run: >-
+          cargo +nightly-2026-04-17 miri test -p messenger_stream
+          owner::tests::registered_closed_can_be_closed_from_another_thread -- --exact

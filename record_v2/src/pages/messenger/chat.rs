@@ -9,7 +9,7 @@ use messenger_interface::types::{
 use tracing::debug;
 
 use crate::components::message_text::message_text;
-use messenger_unifier::{MessengerInterface, MessengerRegistry};
+use messenger_unifier::{MessengerId, MessengerRegistry};
 
 /// Cap on emoji shown at once in the picker grid; the full Unicode set is
 /// large enough to make layout expensive. Search narrows the result set.
@@ -74,7 +74,7 @@ impl Picker {
 
 #[derive(Clone)]
 pub struct Chat {
-    pub interface: MessengerInterface,
+    pub messenger: MessengerId,
     pub room: Identifier<Place<Room>>,
     msg_box: String,
     /// When set, the compose box is editing this message.
@@ -140,7 +140,7 @@ pub enum Message {
 #[derive(Clone)]
 pub enum Action {
     Call {
-        interface: MessengerInterface,
+        messenger: MessengerId,
         room: Identifier<Place<Room>>,
     },
     Message(Message),
@@ -150,26 +150,26 @@ pub enum UpdateResult {
     Task(Task<Message>),
     /// User wants to send a message. The parent handles optimistic insert + async send.
     Send {
-        interface: MessengerInterface,
+        messenger: MessengerId,
         room: Identifier<Place<Room>>,
         contents: RichText,
     },
     /// User confirmed an edit; the parent fires the async edit.
     Edit {
-        interface: MessengerInterface,
+        messenger: MessengerId,
         room: Identifier<Place<Room>>,
         message_id: ID,
         contents: RichText,
     },
     /// User wants a message gone; the parent fires the async delete.
     Delete {
-        interface: MessengerInterface,
+        messenger: MessengerId,
         room: Identifier<Place<Room>>,
         message_id: ID,
     },
     /// User clicked a reaction button; toggle it on the server.
     ToggleReaction {
-        interface: MessengerInterface,
+        messenger: MessengerId,
         room: Identifier<Place<Room>>,
         message_id: ID,
         emoji: String,
@@ -177,7 +177,7 @@ pub enum UpdateResult {
     },
     /// User clicked a message author; open the inspect sheet.
     InspectUser {
-        interface: MessengerInterface,
+        messenger: MessengerId,
         user: Identifier<User>,
     },
 }
@@ -237,9 +237,9 @@ fn resolve_compose(text: &str, palette: &[Emoji]) -> RichText {
 }
 
 impl Chat {
-    pub fn new(interface: MessengerInterface, room: Identifier<Place<Room>>) -> Self {
+    pub fn new(messenger: MessengerId, room: Identifier<Place<Room>>) -> Self {
         Self {
-            interface,
+            messenger,
             room,
             msg_box: String::new(),
             editing: None,
@@ -251,14 +251,16 @@ impl Chat {
     }
 
     /// Fetch this room's custom emoji and stickers from the backend.
-    fn load_palette(&self) -> Task<Message> {
-        let api = self.interface.api.clone();
+    fn load_palette(&self, messengers: &MessengerRegistry) -> Task<Message> {
         let room = self.room.clone();
-        Task::future(async move {
-            let (emojis, stickers) = match api.text() {
+        let Some(palette) = messengers.with_interface_async(
+            self.messenger,
+            async move |interface| match interface.messenger().text() {
                 Ok(text) => {
-                    let (emojis, stickers) =
-                        futures::join!(text.pickable_emojis(&room), text.pickable_stickers(&room));
+                    let (emojis, stickers) = futures::join!(
+                        text.pickable_emojis(&room),
+                        text.pickable_stickers(&room)
+                    );
                     (
                         emojis.unwrap_or_else(|e| {
                             debug!("No custom emoji palette: {e}");
@@ -271,7 +273,12 @@ impl Chat {
                     )
                 }
                 Err(_) => (Vec::new(), Vec::new()),
-            };
+            },
+        ) else {
+            return Task::none();
+        };
+        Task::future(async move {
+            let (emojis, stickers) = palette.await.unwrap_or_default();
             Message::PaletteLoaded { emojis, stickers }
         })
     }
@@ -437,7 +444,7 @@ impl Chat {
             .contains(RoomCapabilities::Voice)
         {
             channel_info = channel_info.push(Button::new("CALL").on_press(Action::Call {
-                interface: self.interface.clone(),
+                messenger: self.messenger,
                 room: self.room.clone(),
             }));
         }
@@ -448,7 +455,8 @@ impl Chat {
             );
         }
 
-        let data = messengers.data(self.interface.id);
+        let entry = messengers.get(self.messenger);
+        let data = entry.map(|entry| &entry.data);
         let room_id = *self.room.id();
         let messages = data
             .and_then(|d| d.room(*self.room.id()))
@@ -458,9 +466,9 @@ impl Chat {
         let client_id = data.and_then(|d| d.profile.as_ref()).map(|p| *p.id());
         let pending_sends = data.map(|data| data.pending_sends.as_slice());
 
-        let can_edit = self.interface.edit.is_some();
-        let can_delete = self.interface.delete.is_some();
-        let can_react = self.interface.reactions.is_some();
+        let can_edit = entry.is_some_and(|entry| entry.interface.edit);
+        let can_delete = entry.is_some_and(|entry| entry.interface.delete);
+        let can_react = entry.is_some_and(|entry| entry.interface.reactions);
 
         let chat = Scrollable::new(match messages {
             Some(messages) => {
@@ -581,7 +589,11 @@ impl Chat {
         column![channel_info, chat, composer].into()
     }
 
-    pub fn update(&mut self, message: Message) -> UpdateResult {
+    pub fn update(
+        &mut self,
+        message: Message,
+        messengers: &MessengerRegistry,
+    ) -> UpdateResult {
         match message {
             Message::MsgInput(change) => {
                 self.msg_box = change;
@@ -596,13 +608,13 @@ impl Chat {
                     resolve_compose(&contents, self.custom_emojis.as_deref().unwrap_or(&[]));
                 match self.editing.take() {
                     Some(message_id) => UpdateResult::Edit {
-                        interface: self.interface.clone(),
+                        messenger: self.messenger,
                         room: self.room.clone(),
                         message_id,
                         contents,
                     },
                     None => UpdateResult::Send {
-                        interface: self.interface.clone(),
+                        messenger: self.messenger,
                         room: self.room.clone(),
                         contents,
                     },
@@ -622,12 +634,12 @@ impl Chat {
                 UpdateResult::Task(Task::none())
             }
             Message::Delete { message_id } => UpdateResult::Delete {
-                interface: self.interface.clone(),
+                messenger: self.messenger,
                 room: self.room.clone(),
                 message_id,
             },
             Message::InspectUser(user) => UpdateResult::InspectUser {
-                interface: self.interface.clone(),
+                messenger: self.messenger,
                 user,
             },
             Message::ToggleReaction {
@@ -635,7 +647,7 @@ impl Chat {
                 emoji,
                 reacted,
             } => UpdateResult::ToggleReaction {
-                interface: self.interface.clone(),
+                messenger: self.messenger,
                 room: self.room.clone(),
                 message_id,
                 emoji,
@@ -651,7 +663,7 @@ impl Chat {
                 } else {
                     self.picker = Some(Picker::default());
                     if self.custom_emojis.is_none() {
-                        return UpdateResult::Task(self.load_palette());
+                        return UpdateResult::Task(self.load_palette(messengers));
                     }
                 }
                 UpdateResult::Task(Task::none())
@@ -666,7 +678,7 @@ impl Chat {
                 } else {
                     self.picker = Some(Picker::reacting_to(message_id));
                     if self.custom_emojis.is_none() {
-                        return UpdateResult::Task(self.load_palette());
+                        return UpdateResult::Task(self.load_palette(messengers));
                     }
                 }
                 UpdateResult::Task(Task::none())
@@ -703,7 +715,7 @@ impl Chat {
                     PickerTarget::React(message_id) => {
                         self.picker = None;
                         UpdateResult::ToggleReaction {
-                            interface: self.interface.clone(),
+                            messenger: self.messenger,
                             room: self.room.clone(),
                             message_id,
                             emoji,
@@ -715,7 +727,7 @@ impl Chat {
             Message::SendSticker(sticker) => {
                 self.picker = None;
                 UpdateResult::Send {
-                    interface: self.interface.clone(),
+                    messenger: self.messenger,
                     room: self.room.clone(),
                     contents: RichText {
                         spans: vec![Span::Sticker(sticker)],

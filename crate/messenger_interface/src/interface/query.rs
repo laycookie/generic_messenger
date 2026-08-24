@@ -1,16 +1,13 @@
 //! Read-only state fetching ([`Query`]) and its realtime [`QueryEvent`]s.
 
-use std::{error::Error, sync::Arc};
+use std::error::Error;
 
 use async_trait::async_trait;
 
 use super::MessengerError;
-use crate::stream::WeakSocketStream;
 use crate::types::{Details, House, ID, Identifier, Place, Room, User, UserStatus};
 
-/// Query-only API for fetching state from a messenger.
-///
-/// This is intentionally read-only; mutations belong in more specialized traits.
+/// Read-only messenger state API.
 #[async_trait]
 pub trait Query: Send + Sync {
     /// Fetch the current "client user" (the authenticated account / profile).
@@ -44,16 +41,14 @@ pub trait Query: Send + Sync {
     ) -> Result<House, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
     }
-    /// Fetch a backend-specific detail sheet about a user, for an
-    /// inspection UI.
+    /// Fetch backend-specific user details.
     async fn inspect_user(
         &self,
         _user: &Identifier<User>,
     ) -> Result<Details, Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
     }
-    /// Fetch a backend-specific detail sheet about a house/server/guild,
-    /// for an inspection UI.
+    /// Fetch backend-specific house details.
     async fn inspect_house(
         &self,
         _house: &Identifier<Place<House>>,
@@ -61,17 +56,14 @@ pub trait Query: Send + Sync {
         Err(Box::new(MessengerError::NotImplemented))
     }
 
-    /// Subscribe to realtime state changes that invalidate or extend query
-    /// results, such as newly-created rooms and presence updates.
-    ///
-    /// Intended for one long-lived consumer per backend. The returned weak
-    /// stream does not keep the backend alive. REST-only implementations may
-    /// synthesize these events with polling. The default reports
-    /// [`MessengerError::NotImplemented`].
-    async fn listen(
-        self: Arc<Self>,
-    ) -> Result<WeakSocketStream<QueryEvent>, Box<dyn Error + Sync + Send>> {
+    /// Prepare this backend's query event source.
+    async fn prepare_listener(&self) -> Result<(), Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
+    }
+
+    /// Polls next prepared event.
+    fn next_event(self: crate::owner::Retained<Self>) -> crate::stream::EventFuture<QueryEvent> {
+        Box::pin(async { None })
     }
 }
 
@@ -79,11 +71,9 @@ pub enum QueryEvent {
     /// A channel/room was created (optionally within a server/place).
     ChannelCreated {
         r#where: Option<Identifier<()>>,
-        // r#where: Option<Identifier<Place<House>>>,
         room: Identifier<Place<Room>>,
     },
-    /// A channel/room disappeared. `where` identifies its former house when
-    /// known; consumers may remove by `room_id` globally within this backend.
+    /// A room disappeared; `where` carries its former house when known.
     ChannelDeleted {
         r#where: Option<Identifier<()>>,
         room_id: ID,

@@ -17,6 +17,7 @@ use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
     error::Error,
     io,
+    num::NonZeroU16,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -43,6 +44,7 @@ use simple_video::{
     MAX_H264_ACCESS_UNIT_BYTES, VideoCodec, VideoError, VideoFrameTiming,
 };
 
+use super::DiscordVideoCodec;
 use crate::api::SNOWFLAKE;
 use rtp::{
     AV1_PAYLOAD_TYPE, AV1_RTX_PAYLOAD_TYPE, H264_PAYLOAD_TYPE, H264_RTX_PAYLOAD_TYPE,
@@ -77,18 +79,17 @@ const VIDEO_CODEC_VALUE_MASK: u64 = u8::MAX as u64;
 const VIDEO_CODEC_GENERATION_INCREMENT: u64 = VIDEO_CODEC_VALUE_MASK + 1;
 const DEFAULT_VIDEO_KEYFRAME_INTERVAL_MS: u32 = 2_000;
 
-const fn video_codec_value(codec: VideoCodec) -> u8 {
+const fn video_codec_value(codec: DiscordVideoCodec) -> u8 {
     match codec {
-        VideoCodec::H264 => VIDEO_CODEC_H264,
-        VideoCodec::Av1 => VIDEO_CODEC_AV1,
-        _ => VIDEO_CODEC_UNKNOWN,
+        DiscordVideoCodec::H264 => VIDEO_CODEC_H264,
+        DiscordVideoCodec::Av1 => VIDEO_CODEC_AV1,
     }
 }
 
-const fn video_codec_from_state(state: u64) -> Option<VideoCodec> {
+const fn video_codec_from_state(state: u64) -> Option<DiscordVideoCodec> {
     match (state & VIDEO_CODEC_VALUE_MASK) as u8 {
-        VIDEO_CODEC_H264 => Some(VideoCodec::H264),
-        VIDEO_CODEC_AV1 => Some(VideoCodec::Av1),
+        VIDEO_CODEC_H264 => Some(DiscordVideoCodec::H264),
+        VIDEO_CODEC_AV1 => Some(DiscordVideoCodec::Av1),
         _ => None,
     }
 }
@@ -786,6 +787,8 @@ impl RecvTransport<'_> {
                 .assembly_age
                 .map(duration_micros)
                 .unwrap_or_default();
+            let frame_started =
+                (timing_enabled && outcome.access_unit.is_some()).then(Instant::now);
 
             // Missing snapshots repeat while reorder waits. Retry at a short,
             // bounded interval instead of emitting one NACK per received RTP
@@ -819,11 +822,15 @@ impl RecvTransport<'_> {
             let Some(access_unit) = outcome.access_unit else {
                 return Ok(UdpPacket::Consumed);
             };
-            let frame_started = timing_enabled.then(Instant::now);
             let video_recv = codec
                 .video
                 .get_mut(&ssrc)
                 .expect("video receive state remains present");
+            let decoder_id = video_recv.decoder_timing_id();
+            let cadence = frame_started
+                .map(|arrived_at| video_recv.observe_access_unit(timestamp, arrived_at))
+                .unwrap_or_default();
+            let receive_bookkeeping_us = frame_started.map(elapsed_micros).unwrap_or_default();
 
             // DAVE decrypts whole video frames — the sender encrypted the
             // frame before packetizing — so unlike audio (one packet = one
@@ -833,6 +840,8 @@ impl RecvTransport<'_> {
             let mut dave_lock_contended = false;
             let dave_lock_wait_us;
             let dave_decrypt_us;
+            let dave_decrypt_transform_us;
+            let dave_decrypt_attempts;
             let dave_decrypted = {
                 let mut dave_session = match self.dave_session.try_lock() {
                     Some(guard) => guard,
@@ -843,7 +852,6 @@ impl RecvTransport<'_> {
                     }
                 };
                 dave_lock_wait_us = dave_lock_started.map(elapsed_micros).unwrap_or_default();
-                let decrypt_started = timing_enabled.then(Instant::now);
                 match dave_session.as_mut() {
                     Some(dave_session) => {
                         let Some(user_id) =
@@ -856,12 +864,41 @@ impl RecvTransport<'_> {
                             )
                             .into());
                         };
-                        match dave_session.decrypt(user_id, MediaType::VIDEO, &access_unit) {
-                            Ok(decrypted) => {
-                                dave_decrypt_us =
-                                    decrypt_started.map(elapsed_micros).unwrap_or_default();
-                                Some(decrypted)
-                            }
+                        let stats_before = if timing_enabled {
+                            dave_session
+                                .get_decryption_stats(user_id, MediaType::VIDEO)
+                                .ok()
+                                .flatten()
+                                .map(|stats| (stats.attempts, stats.duration))
+                        } else {
+                            None
+                        };
+                        let decrypt_started = timing_enabled.then(Instant::now);
+                        let decrypt_result =
+                            dave_session.decrypt(user_id, MediaType::VIDEO, &access_unit);
+                        dave_decrypt_us = decrypt_started.map(elapsed_micros).unwrap_or_default();
+                        let stats_after = if timing_enabled {
+                            dave_session
+                                .get_decryption_stats(user_id, MediaType::VIDEO)
+                                .ok()
+                                .flatten()
+                                .map(|stats| (stats.attempts, stats.duration))
+                        } else {
+                            None
+                        };
+                        (dave_decrypt_attempts, dave_decrypt_transform_us) =
+                            match (stats_before, stats_after) {
+                                (
+                                    Some((attempts_before, duration_before)),
+                                    Some((attempts, duration)),
+                                ) => (
+                                    u64::from(attempts.wrapping_sub(attempts_before)),
+                                    u64::from(duration.wrapping_sub(duration_before)),
+                                ),
+                                _ => (0, 0),
+                            };
+                        match decrypt_result {
+                            Ok(decrypted) => Some(decrypted),
                             Err(err) => {
                                 video_recv.assembler.recycle(access_unit);
                                 return Err(err.into());
@@ -869,11 +906,15 @@ impl RecvTransport<'_> {
                         }
                     }
                     None => {
-                        dave_decrypt_us = decrypt_started.map(elapsed_micros).unwrap_or_default();
+                        dave_decrypt_us = 0;
+                        dave_decrypt_transform_us = 0;
+                        dave_decrypt_attempts = 0;
                         None
                     }
                 }
             };
+            let dave_decrypt_preflight_us =
+                dave_decrypt_us.saturating_sub(dave_decrypt_transform_us);
             let decode_started = timing_enabled.then(Instant::now);
             let decode_span = tracing::trace_span!(
                 target: "video_timing",
@@ -885,6 +926,13 @@ impl RecvTransport<'_> {
                 video_recv.decode_frame(dave_decrypted.as_deref().unwrap_or(access_unit.as_slice()))
             });
             let decode_us = decode_started.map(elapsed_micros).unwrap_or_default();
+            let output_gap_us = if matches!(&decode_result, Ok(Some(_))) {
+                frame_started
+                    .map(|_| video_recv.observe_output(Instant::now()))
+                    .unwrap_or_default()
+            } else {
+                0
+            };
             if let Some(frame_started) = frame_started {
                 let (width, height) = match &decode_result {
                     Ok(Some(frame)) => (frame.width, frame.height),
@@ -894,16 +942,26 @@ impl RecvTransport<'_> {
                     target: "video_timing",
                     stage = "incoming.receive",
                     ssrc,
+                    decoder_id,
                     rtp_timestamp = timestamp,
+                    stream_frame_index = cadence.stream_frame_index,
+                    rtp_delta_ticks = cadence.rtp_delta_ticks,
+                    source_interval_us = cadence.source_interval_us,
+                    access_unit_gap_us = cadence.access_unit_gap_us,
+                    output_gap_us,
                     access_unit_bytes = access_unit.len(),
                     decrypted_bytes = dave_decrypted.as_ref().map_or(0, Vec::len),
                     width,
                     height,
+                    receive_bookkeeping_us,
                     packet_assemble_us,
                     assembly_age_us,
                     dave_lock_contended,
                     dave_lock_wait_us,
                     dave_decrypt_us,
+                    dave_decrypt_preflight_us,
+                    dave_decrypt_transform_us,
+                    dave_decrypt_attempts,
                     decode_us,
                     total_us = elapsed_micros(frame_started),
                     emitted = matches!(&decode_result, Ok(Some(_))),
@@ -1089,6 +1147,8 @@ struct VideoSendState {
     packet_count: u32,
     octet_count: u32,
     last_sender_report: Option<Instant>,
+    /// Completion time of previous fully transmitted primary-video frame.
+    last_frame_sent_at: Option<Instant>,
     history: VecDeque<SentVideoPacket>,
 }
 
@@ -1375,6 +1435,10 @@ pub struct VideoSendTransport<'a> {
     udp: &'a UdpSocket,
     description: &'a ArcSwapOption<SessionDescription>,
     dave_session: &'a AsyncMutex<Option<DaveSession>>,
+    /// Non-empty between MLS commit/welcome processing and Discord's execute
+    /// opcode. davey installs the new outbound ratchet during processing, so
+    /// sending must pause until the server executes the transition.
+    dave_pending_transitions: Option<&'a DashMap<u16, NonZeroU16>>,
     video_send_state: &'a Mutex<VideoSendState>,
     selected_video_codec_state: &'a AtomicU64,
     /// Shared with the audio send so AEAD nonces never collide.
@@ -1384,6 +1448,21 @@ pub struct VideoSendTransport<'a> {
 }
 
 impl VideoSendTransport<'_> {
+    fn dave_transition_pending(&self) -> bool {
+        self.dave_pending_transitions
+            .is_some_and(|transitions| !transitions.is_empty())
+    }
+
+    /// Whether DAVE can encrypt immediately without blocking realtime video.
+    /// A missing DAVE session means transport-only encryption is active.
+    pub(crate) fn is_dave_ready(&self) -> bool {
+        !self.dave_transition_pending()
+            && self
+                .dave_session
+                .try_lock()
+                .is_some_and(|session| session.as_ref().is_none_or(DaveSession::is_ready))
+    }
+
     async fn send_sender_report(
         &self,
         secret_key: &[u8],
@@ -1487,12 +1566,14 @@ impl VideoSendTransport<'_> {
         let timing_enabled = tracing::enabled!(target: "video_timing", tracing::Level::TRACE);
         let total_started = timing_enabled.then(Instant::now);
         let codec_state = self.selected_video_codec_state.load(Ordering::Acquire);
-        let selected_codec = video_codec_from_state(codec_state).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                "server has not selected an outbound video codec",
-            )
-        })?;
+        let selected_codec = video_codec_from_state(codec_state)
+            .map(VideoCodec::from)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "server has not selected an outbound video codec",
+                )
+            })?;
         if selected_codec != encoded_frame.codec {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1543,30 +1624,79 @@ impl VideoSendTransport<'_> {
         let mut dave_lock_contended = false;
         let dave_lock_wait_us;
         let dave_encrypt_us;
+        let dave_transform_us;
+        let dave_encrypt_attempts;
         let access_unit: &[u8] = {
+            if self.dave_transition_pending() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "DAVE epoch transition is pending execution",
+                )
+                .into());
+            }
             let mut dave_session = match self.dave_session.try_lock() {
                 Some(guard) => guard,
                 None => {
                     dave_lock_contended = true;
-                    trace!("send_video_frame: waiting for dave_session lock");
                     self.dave_session.lock().await
                 }
             };
+            // Transition processing inserts the gate while holding this same
+            // mutex. Recheck after a contended acquisition so a frame encoded
+            // during that race cannot use the new ratchet before opcode 22.
+            if self.dave_transition_pending() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "DAVE epoch transition is pending execution",
+                )
+                .into());
+            }
             dave_lock_wait_us = dave_lock_started.map(elapsed_micros).unwrap_or_default();
-            let encrypt_started = timing_enabled.then(Instant::now);
             match dave_session.as_mut() {
                 Some(dave_session) => {
+                    if !dave_session.is_ready() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "DAVE video send state is not ready",
+                        )
+                        .into());
+                    }
+                    let stats_before = if timing_enabled {
+                        dave_session
+                            .get_encryption_stats(Some(MediaType::VIDEO))
+                            .map(|stats| (stats.attempts, stats.duration))
+                    } else {
+                        None
+                    };
+                    let encrypt_started = timing_enabled.then(Instant::now);
                     dave_encrypted =
                         dave_session.encrypt(MediaType::VIDEO, dave_codec, access_unit)?;
                     dave_encrypt_us = encrypt_started.map(elapsed_micros).unwrap_or_default();
+                    let stats_after = if timing_enabled {
+                        dave_session
+                            .get_encryption_stats(Some(MediaType::VIDEO))
+                            .map(|stats| (stats.attempts, stats.duration))
+                    } else {
+                        None
+                    };
+                    (dave_encrypt_attempts, dave_transform_us) = match (stats_before, stats_after) {
+                        (Some((attempts_before, duration_before)), Some((attempts, duration))) => (
+                            u64::from(attempts.wrapping_sub(attempts_before)),
+                            u64::from(duration.wrapping_sub(duration_before)),
+                        ),
+                        _ => (0, 0),
+                    };
                     &dave_encrypted
                 }
                 None => {
-                    dave_encrypt_us = encrypt_started.map(elapsed_micros).unwrap_or_default();
+                    dave_encrypt_us = 0;
+                    dave_transform_us = 0;
+                    dave_encrypt_attempts = 0;
                     access_unit
                 }
             }
         };
+        let dave_preflight_us = dave_encrypt_us.saturating_sub(dave_transform_us);
         if access_unit.len() > MAX_H264_ACCESS_UNIT_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1594,7 +1724,11 @@ impl VideoSendTransport<'_> {
         }
         let packetize_us = packetize_started.map(elapsed_micros).unwrap_or_default();
         if payloads.is_empty() {
-            return Ok(false);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "encoded video frame produced no RTP payloads",
+            )
+            .into());
         }
         let pacing = FramePacing::for_frame(payloads.len(), access_unit.len(), bitrate_bps);
 
@@ -1706,6 +1840,17 @@ impl VideoSendTransport<'_> {
             }
         }
 
+        if packets_sent != payloads.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "sent only {packets_sent}/{} packets for encoded video frame",
+                    payloads.len()
+                ),
+            )
+            .into());
+        }
+
         // Discord uses sender reports for stream clock/health. Send one after
         // first frame, then approximately every five seconds.
         if self.selected_video_codec_state.load(Ordering::Acquire) != codec_state {
@@ -1717,6 +1862,13 @@ impl VideoSendTransport<'_> {
         }
         let report = {
             let mut state = self.video_send_state.lock().unwrap();
+            let sent_at = Instant::now();
+            let output_gap_us = state
+                .last_frame_sent_at
+                .replace(sent_at)
+                .map_or(0, |previous| {
+                    duration_micros(sent_at.saturating_duration_since(previous))
+                });
             state.packet_count = state.packet_count.wrapping_add(payloads.len() as u32);
             state.octet_count = state.octet_count.wrapping_add(
                 payloads
@@ -1727,12 +1879,14 @@ impl VideoSendTransport<'_> {
             let due = state
                 .last_sender_report
                 .is_none_or(|last| last.elapsed() >= VIDEO_RTCP_SENDER_REPORT_INTERVAL);
-            due.then(|| {
+            let report = due.then(|| {
                 state.last_sender_report = Some(Instant::now());
                 (state.packet_count, state.octet_count)
-            })
+            });
+            (report, output_gap_us)
         };
         let sender_report_started = timing_enabled.then(Instant::now);
+        let (report, output_gap_us) = report;
         let sent_sender_report = report.is_some();
         if let Some((packet_count, octet_count)) = report {
             self.send_sender_report(secret_key, timestamp, packet_count, octet_count)
@@ -1773,11 +1927,15 @@ impl VideoSendTransport<'_> {
                 dave_lock_contended,
                 dave_lock_wait_us,
                 dave_encrypt_us,
+                dave_preflight_us,
+                dave_transform_us,
+                dave_encrypt_attempts,
                 packetize_us,
                 history_us,
                 aead_us,
                 udp_send_us,
                 pacing_us,
+                output_gap_us,
                 sender_report_us = sender_report_started.map(elapsed_micros).unwrap_or_default(),
                 sent_sender_report,
                 total_us = elapsed_micros(total_started),
@@ -1978,12 +2136,22 @@ impl Connection {
             udp: &self.udp,
             description: &self.description,
             dave_session,
+            dave_pending_transitions: None,
             video_send_state: &self.video_send_state,
             selected_video_codec_state: &self.selected_video_codec_state,
             nonce: &self.nonce,
             video_ssrc: self.video_ssrc,
             rtx_ssrc: self.rtx_ssrc,
         }
+    }
+    pub(crate) fn video_send_transport_with_transition_gate<'a>(
+        &'a self,
+        dave_session: &'a AsyncMutex<Option<DaveSession>>,
+        dave_pending_transitions: &'a DashMap<u16, NonZeroU16>,
+    ) -> VideoSendTransport<'a> {
+        let mut transport = self.video_send_transport(dave_session);
+        transport.dave_pending_transitions = Some(dave_pending_transitions);
+        transport
     }
     pub fn recv_transport<'a>(
         &'a self,
@@ -2039,6 +2207,7 @@ impl Connection {
                 packet_count: 0,
                 octet_count: 0,
                 last_sender_report: None,
+                last_frame_sent_at: None,
                 history: VecDeque::new(),
             }),
             nonce: AtomicU64::new(0),
@@ -2062,13 +2231,7 @@ impl Connection {
     /// Update server-confirmed outbound codec after Session Description or
     /// Session Update. Returns whether codec changed.
     pub(crate) fn set_video_codec_name(&self, name: &str) -> Result<bool, io::Error> {
-        let codec = if name.eq_ignore_ascii_case("H264") {
-            Some(VideoCodec::H264)
-        } else if name.eq_ignore_ascii_case("AV1") {
-            Some(VideoCodec::Av1)
-        } else {
-            None
-        };
+        let codec = DiscordVideoCodec::from_wire_name(name);
         let codec_value = codec.map_or(VIDEO_CODEC_UNKNOWN, video_codec_value);
         // Serialize generation change with history reservation. Old send jobs
         // either finish reserving before switch or observe new generation and
@@ -2103,6 +2266,7 @@ impl Connection {
 
     pub(crate) fn video_codec(&self) -> Option<VideoCodec> {
         video_codec_from_state(self.selected_video_codec_state.load(Ordering::Acquire))
+            .map(VideoCodec::from)
     }
 
     /// Update fixed keyframe cadence from Session Description/Update.
@@ -2235,6 +2399,24 @@ mod tests {
             );
             assert_eq!(connection.nonce.load(Ordering::Relaxed), 0);
             assert_eq!(u16::from(connection.send_state.lock().unwrap().sequence), 0);
+        });
+    }
+
+    #[test]
+    fn video_send_gate_waits_for_dave_execute_transition() {
+        smol::block_on(async {
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let connection = Connection::new(udp, 1000, 1001, 1002);
+            let dave_session = AsyncMutex::new(None);
+            let pending = DashMap::new();
+            pending.insert(17, NonZeroU16::new(1).unwrap());
+
+            let transport =
+                connection.video_send_transport_with_transition_gate(&dave_session, &pending);
+            assert!(!transport.is_dave_ready());
+
+            pending.remove(&17);
+            assert!(transport.is_dave_ready());
         });
     }
 

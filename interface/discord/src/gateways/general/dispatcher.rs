@@ -25,7 +25,7 @@ use super::{
     recording::RecordedEvent,
 };
 use crate::{
-    Discord, InnerDiscord, UnitStruct,
+    DiscordRuntimeState,
     api::{self, Message},
     downloaders::CdnImage,
     gateways::{
@@ -38,9 +38,9 @@ impl GatewayFrame<Opcode> {
     /// Dispatch Discord Gateway events into interface caches and event queues.
     ///
     /// <https://docs.discord.food/gateway/gateway-events#receive-events>
-    pub(in crate::gateways) async fn exec<T: UnitStruct>(
+    pub(in crate::gateways) async fn exec(
         self,
-        discord: &InnerDiscord<T>,
+        discord: &DiscordRuntimeState,
         gateway: &crate::gateways::Gateway<super::General>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let payload = self.payload()?;
@@ -65,7 +65,7 @@ impl GatewayFrame<Opcode> {
                 match event_name {
                     GatewayEvent::Ready => {
                         let ready = payload.decode::<ReadyPayload>()?;
-                        // Reconnects reuse `InnerDiscord`. Clear every
+                        // Reconnects reuse runtime state. Clear every
                         // session-scoped cache before publishing this Ready,
                         // including empty collections, so deleted entities do
                         // not survive reconnect.
@@ -725,14 +725,13 @@ impl GatewayFrame<Opcode> {
                         let channel = payload.decode::<api::Channel>()?;
 
                         let place_room = channel.to_room_data().await;
-                        let room = Discord::identifier_generator(channel.id, place_room);
+                        let room = Identifier::new(channel.id, place_room);
                         let guild_id = channel.guild_id;
 
                         discord.cache.upsert_channel(channel);
 
                         gateway.events.submit_query(QueryEvent::ChannelCreated {
-                            r#where: guild_id
-                                .map(|guild_id| Discord::identifier_generator(guild_id, ())),
+                            r#where: guild_id.map(|guild_id| Identifier::new(guild_id, ())),
                             room,
                         });
                     }
@@ -747,7 +746,7 @@ impl GatewayFrame<Opcode> {
                         gateway.events.submit_query(QueryEvent::ChannelDeleted {
                             r#where: deleted
                                 .guild_id
-                                .map(|guild_id| Discord::identifier_generator(guild_id, ())),
+                                .map(|guild_id| Identifier::new(guild_id, ())),
                             room_id: deleted.id,
                         });
                     }
@@ -842,7 +841,7 @@ impl GatewayFrame<Opcode> {
             Opcode::Reconnect | Opcode::InvalidSession => {
                 // The server wants this connection gone (and we don't
                 // implement RESUME). Tear the gateway down: the event
-                // streams end, and a later `listen()` establishes a
+                // streams end, and a later listener setup establishes a
                 // fresh connection with a fresh `Ready` snapshot.
                 warn!(
                     "Server requested reconnect / invalidated the session; tearing down the gateway"

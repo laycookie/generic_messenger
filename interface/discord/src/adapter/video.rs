@@ -1,42 +1,25 @@
-//! High-level video adapter.
+//! Discord video adapter.
 //!
-//! Implements the `Video` trait from `messenger_interface`. Discord carries
-//! camera video over the *same* RTC connection as the voice call, so the
-//! connection methods resolve to ("merge with") the audio call's session
-//! rather than opening anything of their own; `start_video`/`stop_video`
-//! drive the opcode-4 `self_video` flag. The companion `ArcStream` impl
-//! drains the buffered `VideoEvent` queue, which is fed from two sides: the
-//! voice websocket (op-12 stream lifecycle, in `gateways::media::events`)
-//! and shared media coordinator (per-frame delivery in `gateways::media::coordinator`).
-//!
-//! Remote camera receive is automatic on the call connection: its first
-//! decoded frame emits `AddVideoStream` directly. Go Live is request-driven:
-//! voice-state announcements emit `VideoStreamAvailable`, and
-//! `subscribe_video` sends opcode 20 Stream Watch.
-//!
-//! Screen share ("Go Live") is a *separate* voice connection keyed by the
-//! main-gateway Stream* opcodes: `start_video(Screen)` sends opcode 18
-//! (StreamCreate) and `stop_video(Screen)` opcode 19 (StreamDelete); the
-//! connection itself is opened from the STREAM_CREATE / STREAM_SERVER_UPDATE
-//! dispatches in `gateways::general` and its frames are encoded and sent from
-//! the shared media coordinator, exactly like the camera path but on the broadcast
-//! connection.
+//! Camera shares voice RTC and arrives automatically. Go Live uses a separate
+//! voice connection: opcode 18 starts, 19 stops, and 20 watches; main-gateway
+//! `STREAM_*` dispatches establish transport. Media coordinator handles frames.
 //!
 //! <https://docs.discord.food/gateway/gateway-events#update-voice-state>
 //! <https://docs.discord.food/gateway/gateway-events#create-stream>
 //! <https://docs.discord.food/gateway/gateway-events#watch-stream>
 //! <https://docs.discord.food/gateway/gateway-events#delete-stream>
 
-use std::{collections::HashMap, error::Error, io, pin::pin, sync::Arc};
+use std::{collections::HashMap, error::Error, io, pin::pin};
 
 use async_trait::async_trait;
-use futures::FutureExt as _;
+use futures::{FutureExt as _, future::Either};
 use messenger_interface::{
     interface::{
         Audio as AudioTrait, CallStatus, Video as VideoTrait, VideoBroadcastKind, VideoEvent,
         VideoStreamId, VideoStreamMetadata,
     },
-    stream::{ArcStream, WeakSocketStream},
+    owner::Retained,
+    stream::EventFuture,
     types::{Identifier, Place, Room},
 };
 use simple_video::VideoCodec;
@@ -44,25 +27,17 @@ use surf::http::convert::json;
 use tracing::debug;
 
 use crate::{
-    InnerDiscord, LocalMediaState, Owned, UnitStruct,
+    DiscordRuntimeState, InnerDiscord, LocalMediaState,
     api::SNOWFLAKE,
     cache::DiscordCache,
     gateways::{
         GatewaySupervisor,
         general::{Opcode, SelfVoiceFlags, VoiceCommand},
-        media::{StreamKey, coordinator::MediaDrive},
+        media::{DiscordVideoCodec, StreamKey, coordinator::MediaDrive},
     },
-    stream_poll::StreamPollGuard,
 };
 
-#[unitstruct::unit_struct]
-pub(crate) struct VideoDiscord;
-
-/// Discord-private active-stream registry. Stream lifecycle traffic is tiny,
-/// so one lock and linear metadata lookup keep allocation/removal atomic
-/// without maintaining synchronized forward and reverse indexes. SSRC routing
-/// remains in the voice gateway's opcode-12 maps; this registry contains only
-/// app-facing logical streams.
+/// App-facing stream registry; SSRC routing remains in voice gateway.
 pub(crate) struct DiscordVideoStreams {
     next_id: u64,
     active: HashMap<VideoStreamId, VideoStreamMetadata>,
@@ -144,8 +119,7 @@ impl LocalMediaState {
     }
 }
 
-/// Borrowed control-plane dependencies for logical video operations. Owns no
-/// state and adds no allocation or synchronization.
+/// Borrowed video control-plane dependencies.
 pub(crate) struct VideoControls<'a> {
     cache: &'a DiscordCache,
     gateway: &'a GatewaySupervisor,
@@ -153,7 +127,7 @@ pub(crate) struct VideoControls<'a> {
 }
 
 impl<'a> VideoControls<'a> {
-    pub(crate) fn new<T: UnitStruct>(discord: &'a InnerDiscord<T>) -> Self {
+    pub(crate) fn new(discord: &'a DiscordRuntimeState) -> Self {
         Self {
             cache: &discord.cache,
             gateway: &discord.gateway,
@@ -185,12 +159,7 @@ impl<'a> VideoControls<'a> {
             .unwrap_or(false)
     }
 
-    /// Flip our own `self_video` flag via opcode 4, preserving the live
-    /// mute/deafen flags. Targets the channel Discord already has us in (an
-    /// opcode-4 naming another channel is a move request), so this requires
-    /// an active call.
-    ///
-    /// <https://docs.discord.food/gateway/gateway-events#update-voice-state>
+    /// Updates opcode-4 `self_video` without changing mute/deafen or channel.
     async fn set_self_video(&self, enabled: bool) -> Result<(), Box<dyn Error + Sync + Send>> {
         let gateway =
             self.gateway.current.load_full().ok_or_else(|| {
@@ -221,13 +190,7 @@ impl<'a> VideoControls<'a> {
         Ok(())
     }
 
-    /// Start a "Go Live" screen-share broadcast: send opcode 18 (StreamCreate)
-    /// for the channel we are in. The server answers with the STREAM_CREATE /
-    /// STREAM_SERVER_UPDATE dispatches that open the broadcast's own voice
-    /// connection (see `gateways::general::events`); the media loop then
-    /// encodes and sends frames on it once it is up. Requires an active call.
-    ///
-    /// <https://docs.discord.food/gateway/gateway-events#create-stream>
+    /// Starts Go Live on current call with opcode 18.
     async fn start_go_live(&self) -> Result<(), Box<dyn Error + Sync + Send>> {
         let gateway =
             self.gateway.current.load_full().ok_or_else(|| {
@@ -251,13 +214,8 @@ impl<'a> VideoControls<'a> {
             return Ok(());
         }
 
-        // The stream key is deterministic (same shape the watch path builds),
-        // so prime the broadcast slot with it now: the STREAM_* dispatches key
-        // their connection details by it, and the media loop reads it back to
-        // unpause/tear down. Raise the send flag before op-18 so the loop is
-        // already watching for the connection when it appears.
-        // Clear any stale local connection left by an interrupted previous
-        // start before beginning a fresh handshake generation.
+        // Prime deterministic key before opcode 18 dispatches arrive.
+        // Clear stale connection before new handshake generation.
         gateway.voice.broadcast.disconnect().await;
         gateway.voice.broadcast.set_send_enabled(true);
         let stream_key = StreamKey::for_broadcaster(guild_id, channel_id, profile_id);
@@ -289,12 +247,7 @@ impl<'a> VideoControls<'a> {
         }
     }
 
-    /// Stop our Go Live broadcast: lower the send flag (so the media loop stops
-    /// encoding and retracts its op-12 announce) and send opcode 19
-    /// (StreamDelete). The echoed STREAM_DELETE tears the broadcast connection
-    /// down. Best-effort and idempotent — a no-op when nothing is broadcasting.
-    ///
-    /// <https://docs.discord.food/gateway/gateway-events#delete-stream>
+    /// Idempotently stops Go Live with opcode 19 and local teardown.
     pub(crate) async fn stop_go_live(&self) -> Result<(), Box<dyn Error + Sync + Send>> {
         let Some(gateway) = self.gateway.current.load_full() else {
             return Ok(());
@@ -310,15 +263,12 @@ impl<'a> VideoControls<'a> {
         });
         debug!("Sending opcode 19 (StreamDelete): {payload}");
         let result = gateway.send(payload.to_string().into()).await;
-        // Server echo may arrive later; exact-key routing ignores it after this
-        // local slot has gone idle. Local media must stop even if echo never
-        // arrives or signaling failed.
+        // Stop locally even if signaling or server echo fails.
         gateway.voice.broadcast.disconnect().await;
         result.map_err(Into::into)
     }
 
-    /// Capture/input ended without an explicit UI stop. Converge desired and
-    /// server state instead of immediately requesting another input forever.
+    /// Converges server state when capture ends implicitly.
     pub(crate) async fn video_input_ended(&self, kind: VideoBroadcastKind) {
         match kind {
             VideoBroadcastKind::Camera => {
@@ -337,21 +287,22 @@ impl<'a> VideoControls<'a> {
 }
 
 #[async_trait]
-impl VideoTrait for InnerDiscord<Owned> {
+impl VideoTrait for InnerDiscord {
     async fn set_preferred_codec(
         &self,
         codec: VideoCodec,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        self.media.set_preferred_video_codec(codec).ok_or_else(|| {
+        let codec = DiscordVideoCodec::try_from(codec).map_err(|_| {
             Box::new(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Discord does not support requested video codec",
             )) as Box<dyn Error + Sync + Send>
         })?;
+        let runtime = self.runtime();
+        runtime.media.set_preferred_video_codec(codec);
 
-        let Some(gateway) = self.gateway.current.load_full() else {
-            // Preference is consumed by Select Protocol when next media
-            // connection opens.
+        let Some(gateway) = runtime.gateway.current.load_full() else {
+            // Next Select Protocol consumes preference.
             return Ok(());
         };
         let media_gateways = [
@@ -373,10 +324,7 @@ impl VideoTrait for InnerDiscord<Owned> {
         }
     }
 
-    /// Camera video rides the voice call's RTC connection, so connecting
-    /// video *is* connecting the call. Idempotent when the call is already
-    /// up: an opcode-4 for the channel we are in only refreshes flags and
-    /// Discord does not restart the media handshake.
+    /// Reuses voice RTC; already-connected calls remain idempotent.
     async fn connect(
         &self,
         location: &Identifier<Place<Room>>,
@@ -384,17 +332,14 @@ impl VideoTrait for InnerDiscord<Owned> {
         AudioTrait::connect(self, location).await
     }
 
-    /// Ends only the video side of the shared connection: clears our own
-    /// broadcast flag and leaves the audio call running. Incoming streams
-    /// stop with their frame channels when the app drops its consumers.
+    /// Ends video while preserving shared audio call.
     async fn disconnect(&self, _location: &Identifier<Place<Room>>) {
-        let controls = VideoControls::new(self);
+        let controls = VideoControls::new(self.runtime());
         controls.set_camera_send_enabled(false);
         if let Err(err) = controls.set_self_video(false).await {
             debug!("Video disconnect without an active broadcast: {err}");
         }
-        // Also end a screen share if one is live, so leaving video doesn't
-        // strand the Go Live broadcast on its own connection.
+        // Also close separate Go Live connection.
         if let Err(err) = controls.stop_go_live().await {
             debug!("Video disconnect without an active screen share: {err}");
         }
@@ -405,19 +350,17 @@ impl VideoTrait for InnerDiscord<Owned> {
         _location: &Identifier<Place<Room>>,
         kind: VideoBroadcastKind,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let controls = VideoControls::new(self);
+        let runtime = self.runtime();
+        let controls = VideoControls::new(runtime);
         match kind {
             VideoBroadcastKind::Camera => {
-                let gateway = self.gateway.current.load_full().ok_or_else(|| {
+                let gateway = runtime.gateway.current.load_full().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotConnected, "gateway not connected")
                 })?;
                 if gateway.voice.set_camera_send_enabled(true) {
                     return Ok(());
                 }
-                // Order matters: raise the send flag first so the audio media
-                // loop starts acquiring the frame source and encoding, then
-                // tell Discord our camera is on. The loop sends the opcode-12
-                // Video announce before the first RTP frame.
+                // Enable sender before announcing camera to Discord.
                 match controls.set_self_video(true).await {
                     Ok(()) => Ok(()),
                     Err(err) => {
@@ -427,9 +370,7 @@ impl VideoTrait for InnerDiscord<Owned> {
                 }
             }
             VideoBroadcastKind::Screen => {
-                // Go Live: open a second voice connection via opcode 18. The
-                // media loop starts sending once the STREAM_* dispatches bring
-                // that connection up.
+                // Opcode 18 opens separate Go Live connection.
                 controls.start_go_live().await
             }
         }
@@ -440,11 +381,10 @@ impl VideoTrait for InnerDiscord<Owned> {
         _location: &Identifier<Place<Room>>,
         kind: VideoBroadcastKind,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let controls = VideoControls::new(self);
+        let controls = VideoControls::new(self.runtime());
         match kind {
             VideoBroadcastKind::Camera => {
-                // Lower the flag so the media loop retracts the opcode-12
-                // announce and stops encoding, then clear the gateway flag.
+                // Stop encoder before clearing gateway video flag.
                 controls.set_camera_send_enabled(false);
                 controls.set_self_video(false).await
             }
@@ -456,15 +396,14 @@ impl VideoTrait for InnerDiscord<Owned> {
         &self,
         stream: VideoStreamId,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let metadata = self.media.video_stream_metadata(stream).ok_or_else(|| {
+        let runtime = self.runtime();
+        let metadata = runtime.media.video_stream_metadata(stream).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 "Discord video stream is no longer active",
             )
         })?;
-        // <https://docs.discord.food/gateway/gateway-events#watch-stream>
-        // Cameras arrive on the existing voice connection. They never produce
-        // VideoStreamAvailable, so a conforming UI has nothing to subscribe.
+        // Cameras arrive automatically and need no subscription.
         if metadata.kind == VideoBroadcastKind::Camera {
             return Ok(());
         }
@@ -475,7 +414,7 @@ impl VideoTrait for InnerDiscord<Owned> {
                 "Discord video stream has no user",
             )
         })?;
-        if self
+        if runtime
             .cache
             .profile
             .load()
@@ -489,7 +428,7 @@ impl VideoTrait for InnerDiscord<Owned> {
             .into());
         }
 
-        let source_state = self.cache.voice.state(user_id).ok_or_else(|| {
+        let source_state = runtime.cache.voice.state(user_id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 "video stream is no longer in a call",
@@ -516,16 +455,16 @@ impl VideoTrait for InnerDiscord<Owned> {
             .into());
         }
 
-        let gateway_load = self.gateway.current.load();
+        let gateway_load = runtime.gateway.current.load();
         let gateway = gateway_load
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "gateway not connected"))?;
-        let own_channel = self
+        let own_channel = runtime
             .cache
             .profile
             .load()
             .as_ref()
-            .and_then(|profile| self.cache.voice.state(profile.id))
+            .and_then(|profile| runtime.cache.voice.state(profile.id))
             .map(|state| state.channel_id);
         if own_channel != Some(channel_id) {
             return Err(io::Error::new(
@@ -537,7 +476,7 @@ impl VideoTrait for InnerDiscord<Owned> {
 
         let stream_key = StreamKey::for_broadcaster(guild_id, channel_id, user_id);
 
-        if self.media.video_stream_metadata(stream) != Some(metadata) {
+        if runtime.media.video_stream_metadata(stream) != Some(metadata) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "Discord video stream ended while subscription was starting",
@@ -551,20 +490,20 @@ impl VideoTrait for InnerDiscord<Owned> {
         if !inserted {
             return Ok(());
         }
-        let source_is_current = self
+        let source_is_current = runtime
             .cache
             .voice
             .state(user_id)
             .is_some_and(|state| state.channel_id == channel_id && state.self_stream);
-        let own_channel_is_current = self
+        let own_channel_is_current = runtime
             .cache
             .profile
             .load()
             .as_ref()
-            .and_then(|profile| self.cache.voice.state(profile.id))
+            .and_then(|profile| runtime.cache.voice.state(profile.id))
             .map(|state| state.channel_id)
             == Some(channel_id);
-        if self.media.video_stream_metadata(stream) != Some(metadata)
+        if runtime.media.video_stream_metadata(stream) != Some(metadata)
             || !source_is_current
             || !own_channel_is_current
         {
@@ -595,10 +534,11 @@ impl VideoTrait for InnerDiscord<Owned> {
         &self,
         stream: VideoStreamId,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let Some(metadata) = self.media.video_stream_metadata(stream) else {
+        let runtime = self.runtime();
+        let Some(metadata) = runtime.media.video_stream_metadata(stream) else {
             return Ok(());
         };
-        // Automatic cameras have no backend subscription to release.
+        // Automatic cameras have no subscription.
         if metadata.kind == VideoBroadcastKind::Camera {
             return Ok(());
         }
@@ -606,7 +546,7 @@ impl VideoTrait for InnerDiscord<Owned> {
         let Some(user_id) = metadata.user else {
             return Ok(());
         };
-        let gateway_load = self.gateway.current.load();
+        let gateway_load = runtime.gateway.current.load();
         let Some(gateway) = gateway_load.as_ref() else {
             return Ok(());
         };
@@ -623,42 +563,36 @@ impl VideoTrait for InnerDiscord<Owned> {
         Ok(())
     }
 
-    async fn listen(
-        self: Arc<Self>,
-    ) -> Result<WeakSocketStream<VideoEvent>, Box<dyn Error + Sync + Send>> {
-        self.listen_as::<VideoDiscord, _>().await
+    async fn prepare_listener(&self) -> Result<(), Box<dyn Error + Sync + Send>> {
+        self.ensure_gateway().await
     }
-}
 
-#[async_trait]
-impl ArcStream for InnerDiscord<VideoDiscord> {
-    type Item = VideoEvent;
-    /// Await the next item. Works with shared ownership via `Arc`.
-    async fn next(self: Arc<Self>) -> Option<<Self as ArcStream>::Item> {
-        let _guard = StreamPollGuard::new(&self.gateway.active_streams);
-        loop {
-            if self
-                .gateway
-                .killed
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return None;
+    fn next_event(self: Retained<Self>) -> EventFuture<VideoEvent> {
+        Box::pin(async move {
+            let mut retained = self;
+            loop {
+                if !retained.is_active() {
+                    return None;
+                }
+                let selected = {
+                    let runtime = retained.get().runtime();
+                    let gateway = runtime.gateway.current.load_full()?;
+                    let mut event = pin!(gateway.events.next_video().fuse());
+                    let mut drive = pin!(runtime.drive_media().fuse());
+                    futures::select! {
+                        event = event => Either::Left(event),
+                        result = drive => Either::Right(result),
+                    }
+                };
+                match selected {
+                    Either::Left(event) => return Some(event),
+                    Either::Right(MediaDrive::Complete(result)) => result?,
+                    Either::Right(MediaDrive::Gateway(turn)) => {
+                        retained = InnerDiscord::finish_gateway_turn(retained, turn).await?;
+                    }
+                }
             }
-            if self.owner_dropped() {
-                self.gateway.kill();
-                return None;
-            }
-            let gateway = self.gateway.current.load_full()?;
-            let mut event = pin!(gateway.events.next_video().fuse());
-            let mut drive = pin!(self.drive_media().fuse());
-            futures::select! {
-                event = event => return Some(event),
-                result = drive => match result {
-                    MediaDrive::Complete(result) => result?,
-                    MediaDrive::Gateway(turn) => self.execute_gateway_turn(turn).await?,
-                },
-            }
-        }
+        })
     }
 }
 

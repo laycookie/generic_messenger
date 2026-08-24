@@ -11,18 +11,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use async_tungstenite::tungstenite::Message as WebsocketMessage;
 use futures::{FutureExt as _, channel::oneshot, future, select};
 use futures_timer::Delay;
-use messenger_interface::{
-    interface::{
-        AudioEvent, FrameConsumer, VideoBroadcastKind, VideoEvent, VideoFrame, VideoInput,
-        VideoResolution,
-    },
-    stream::ArcStream,
+use messenger_interface::interface::{
+    AudioEvent, FrameConsumer, VideoBroadcastKind, VideoEvent, VideoFrame, VideoInput,
+    VideoResolution,
 };
-use simple_video::FrameScaler;
+use simple_video::{FrameScaler, VideoCodec};
 use surf::http::convert::json;
 use tracing::{debug, error, trace, warn};
 
@@ -33,10 +29,9 @@ use super::{
     gateway::MediaConnection,
 };
 use crate::{
-    InnerDiscord, LocalMediaState, UnitStruct,
-    adapter::{audio::AudioDiscord, video::VideoControls},
+    DiscordRuntimeState, LocalMediaState,
+    adapter::video::VideoControls,
     gateways::{Gateway, GatewaySupervisor, GatewayTurn},
-    stream_poll::StreamPollGuard,
 };
 
 /// Build voice opcode 5 Speaking.
@@ -201,21 +196,20 @@ pub(crate) struct WatchedMedia<'a> {
     pub(crate) source: MediaSource,
 }
 
-enum MediaTurn<'a> {
+enum MediaTurn {
     Packet(PolledMedia),
     Audio(AudioWork),
     Video(VideoWork),
-    Gateway(Option<GatewayTurn<'a>>),
+    Gateway(Option<GatewayTurn>),
     Heartbeat,
-    Killed,
 }
 
 /// Result of one media-coordinator selection. Gateway turns remain separate so
 /// capability streams can stop racing their execution against newly emitted
 /// interface events after a websocket frame has already been consumed.
-pub(crate) enum MediaDrive<'a> {
+pub(crate) enum MediaDrive {
     Complete(Option<()>),
-    Gateway(GatewayTurn<'a>),
+    Gateway(GatewayTurn),
 }
 
 #[derive(Default)]
@@ -239,6 +233,32 @@ struct VideoSendCompletion {
     codec: Option<VideoSendCodec>,
     scaler: FrameScaler,
     result: VideoSendResult,
+    submitted_frame_id: u64,
+    emitted_frame_id: u64,
+    forced_keyframe: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KeyframeCompletionAction {
+    Complete,
+    Pending,
+    Retry,
+}
+
+fn keyframe_completion_action(
+    codec: VideoCodec,
+    outcome: VideoSendOutcome,
+) -> KeyframeCompletionAction {
+    if outcome.keyframe {
+        KeyframeCompletionAction::Complete
+    } else if codec == VideoCodec::Av1 {
+        // rav1e emits an older input while a newly forced frame remains in
+        // its lookahead queue. Reissuing here forces every intervening input
+        // and later creates a burst of consecutive keyframes.
+        KeyframeCompletionAction::Pending
+    } else {
+        KeyframeCompletionAction::Retry
+    }
 }
 
 enum VideoJobCompletion {
@@ -246,6 +266,7 @@ enum VideoJobCompletion {
     Retransmit {
         requested: usize,
         result: Result<usize, Box<dyn Error + Send + Sync>>,
+        elapsed_us: u64,
     },
 }
 
@@ -320,8 +341,8 @@ impl MediaReceiver {
 
 /// Owned encode/announce state for one outgoing video stream. Camera and Go
 /// Live screen share run the identical lazy acquire → announce → send →
-/// teardown cycle ([`InnerDiscord::video_lifecycle`] and
-/// [`InnerDiscord::pump_video_send`]); they differ only in which connection
+/// teardown cycle (`MediaCoordinator::video_lifecycle` and
+/// `MediaCoordinator::pump_video_send`); they differ only in which connection
 /// carries them and which app input feeds them.
 struct OutgoingVideo {
     /// Connection this state belongs to. Reconnects require a fresh opcode-12
@@ -370,6 +391,9 @@ struct OutgoingVideo {
     keyframe_armed: bool,
     /// PLI/FIR requested an IDR which has not yet been emitted.
     keyframe_requested: bool,
+    /// MLS commit/welcome activated a new davey sender ratchet; outgoing video
+    /// stays paused until Discord executes that transition.
+    dave_transition_blocked: bool,
     /// Last successfully emitted forced IDR. Periodic fallback uses this
     /// instead of request time so skipped or failed frames do not count.
     last_keyframe: Option<Instant>,
@@ -401,6 +425,7 @@ impl Default for OutgoingVideo {
             announce_dirty: false,
             keyframe_armed: false,
             keyframe_requested: false,
+            dave_transition_blocked: false,
             last_keyframe: None,
             next_frame_at: None,
             next_frame_id: 0,
@@ -516,14 +541,14 @@ async fn task_or_idle<T>(task: Option<&mut smol::Task<T>>) -> T {
 
 /// Borrowed dependencies for one media-coordination turn. References only;
 /// no backend state, allocation, or synchronization is duplicated.
-struct MediaCoordinator<'a, T: UnitStruct> {
-    discord: &'a Arc<InnerDiscord<T>>,
+struct MediaCoordinator<'a> {
+    discord: &'a DiscordRuntimeState,
     gateway: &'a GatewaySupervisor,
     media: &'a LocalMediaState,
 }
 
-impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
-    fn new(discord: &'a Arc<InnerDiscord<T>>) -> Self {
+impl<'a> MediaCoordinator<'a> {
+    fn new(discord: &'a DiscordRuntimeState) -> Self {
         Self {
             discord,
             gateway: &discord.gateway,
@@ -532,11 +557,8 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
     }
 
     /// Drive one shared media turn. Runtime lock is released after one selected
-    /// UDP packet, output item, gateway event, heartbeat, or kill signal.
-    async fn drive_media(&self) -> MediaDrive<'a> {
-        if self.gateway.killed.load(Ordering::Acquire) {
-            return MediaDrive::Complete(None);
-        }
+    /// UDP packet, output item, gateway event, or heartbeat.
+    async fn drive_media(&self) -> MediaDrive {
         let Some(gateway) = self.gateway.current.load_full() else {
             return MediaDrive::Complete(None);
         };
@@ -586,15 +608,13 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
         let Some(session) = runtime.session.as_deref_mut() else {
             let mut gateway_turn = pin!(self.discord.wait_for_gateway_turn().fuse());
             let mut heartbeat = pin!(Delay::new(HEARTBEAT).fuse());
-            let mut killed = pin!(self.gateway.killed_signal().fuse());
             let turn = select! {
                 turn = gateway_turn => MediaTurn::Gateway(turn),
                 _ = heartbeat => MediaTurn::Heartbeat,
-                _ = killed => MediaTurn::Killed,
             };
             return match turn {
                 MediaTurn::Gateway(Some(turn)) => MediaDrive::Gateway(turn),
-                MediaTurn::Gateway(None) | MediaTurn::Killed => MediaDrive::Complete(None),
+                MediaTurn::Gateway(None) => MediaDrive::Complete(None),
                 MediaTurn::Heartbeat => MediaDrive::Complete(Some(())),
                 MediaTurn::Packet(_) | MediaTurn::Audio(_) | MediaTurn::Video(_) => {
                     unreachable!("idle media selection cannot produce media work")
@@ -720,14 +740,12 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
             );
             let mut gateway_turn = pin!(self.discord.wait_for_gateway_turn().fuse());
             let mut heartbeat = pin!(Delay::new(HEARTBEAT).fuse());
-            let mut killed = pin!(self.gateway.killed_signal().fuse());
             select! {
                 packet = media => MediaTurn::Packet(packet),
                 work = audio_output => MediaTurn::Audio(work),
                 work = video_output => MediaTurn::Video(work),
                 turn = gateway_turn => MediaTurn::Gateway(turn),
                 _ = heartbeat => MediaTurn::Heartbeat,
-                _ = killed => MediaTurn::Killed,
             }
         };
         match turn {
@@ -753,7 +771,7 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                 kind,
             }) => {
                 if let Some(connection) = self.resolve_media_source(source) {
-                    connection.dispatch_incoming_video(self.discord.as_ref(), ssrc, frame, kind);
+                    connection.dispatch_incoming_video(self.discord, ssrc, frame, kind);
                 }
             }
             MediaTurn::Packet(PolledMedia::VideoFeedback {
@@ -779,10 +797,6 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                     return MediaDrive::Complete(None);
                 };
                 return MediaDrive::Gateway(turn);
-            }
-            MediaTurn::Killed => {
-                self.release_session(&mut runtime).await;
-                return MediaDrive::Complete(None);
             }
         }
         MediaDrive::Complete(Some(()))
@@ -822,13 +836,15 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
         }
         let Some(mut receiver) = manager.microphone_recv.take() else {
             let (sender, receiver) = oneshot::channel();
-            if let Some(gateway) = self.gateway.current.load().as_ref() {
-                gateway
-                    .events
-                    .submit_audio(AudioEvent::AddAudioInput(sender));
+            if let Some(gateway) = self.gateway.current.load().as_ref()
+                && gateway
+                    .voice
+                    .submit_audio(AudioEvent::AddAudioInput(sender))
+            {
+                manager.microphone_recv = Some(receiver);
+                return true;
             }
-            manager.microphone_recv = Some(receiver);
-            return true;
+            return false;
         };
         match receiver.try_recv() {
             Ok(Some(microphone)) => {
@@ -999,7 +1015,13 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                 let Some(gateway) = gateway.as_ref() else {
                     return;
                 };
-                live.dispatch_incoming_audio(&gateway.events, ssrc, &samples);
+                live.dispatch_incoming_audio(
+                    |event| {
+                        gateway.voice.submit_audio(event);
+                    },
+                    ssrc,
+                    &samples,
+                );
             }
             AudioWork::SendMic => {
                 let Some(live_gateway) = self.load_gateway_for(live, VideoBroadcastKind::Camera)
@@ -1007,7 +1029,7 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                     return;
                 };
                 let send_t = live.send_transport(&live_gateway.dave_session);
-                if !send_t.is_dave_ready() {
+                if !live_gateway.dave_pending_transitions.is_empty() || !send_t.is_dave_ready() {
                     if !audio.waiting_for_dave {
                         debug!("Deferring voice audio until DAVE send state is ready");
                         audio.waiting_for_dave = true;
@@ -1151,36 +1173,87 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                                 .await;
                             return;
                         }
+                        let codec_kind = state
+                            .codec
+                            .as_ref()
+                            .expect("video codec checked above")
+                            .codec();
                         match completion.result {
-                            Ok(outcome) if state.keyframe_armed && outcome.keyframe => {
-                                state.keyframe_armed = false;
-                                state.last_keyframe = Some(Instant::now());
-                                debug!("{kind:?} keyframe emitted");
-                            }
-                            Ok(_) if state.keyframe_armed => {
-                                // Delayed encoders may emit an older inter
-                                // frame after accepting forced-key input.
-                                state.keyframe_armed = false;
-                                state.keyframe_requested = true;
+                            Ok(outcome) if state.keyframe_armed => {
+                                let action = keyframe_completion_action(codec_kind, outcome);
+                                tracing::trace!(
+                                    target: "video_timing",
+                                    stage = "outgoing.control",
+                                    ?kind,
+                                    codec = ?codec_kind,
+                                    action = ?action,
+                                    submitted_frame_id = completion.submitted_frame_id,
+                                    emitted_frame_id = completion.emitted_frame_id,
+                                    forced_keyframe = completion.forced_keyframe,
+                                    emitted = outcome.emitted,
+                                    keyframe = outcome.keyframe,
+                                    "video keyframe state changed"
+                                );
+                                match action {
+                                    KeyframeCompletionAction::Complete => {
+                                        state.keyframe_armed = false;
+                                        state.last_keyframe = Some(Instant::now());
+                                        debug!("{kind:?} keyframe emitted");
+                                    }
+                                    KeyframeCompletionAction::Pending => {}
+                                    KeyframeCompletionAction::Retry => {
+                                        state.keyframe_armed = false;
+                                        state.keyframe_requested = true;
+                                    }
+                                }
                             }
                             Ok(_) => {}
                             Err(err) => {
-                                if state.keyframe_armed {
-                                    // Encoder may have consumed forced IDR
-                                    // before transport failed. Request another.
-                                    state.keyframe_armed = false;
-                                    state.keyframe_requested = true;
-                                }
+                                // Any encoded-but-unsent frame may be a future
+                                // AV1/H264 reference. Recover even when this
+                                // failed frame was not itself a forced IDR.
+                                state.keyframe_armed = false;
+                                state.keyframe_requested = true;
+                                tracing::trace!(
+                                    target: "video_timing",
+                                    stage = "outgoing.control",
+                                    ?kind,
+                                    codec = ?codec_kind,
+                                    action = "send_failed_recovery_requested",
+                                    submitted_frame_id = completion.submitted_frame_id,
+                                    emitted_frame_id = completion.emitted_frame_id,
+                                    forced_keyframe = completion.forced_keyframe,
+                                    error = %err,
+                                    "video keyframe state changed"
+                                );
                                 warn!("Failed to send {kind:?} video frame: {err}");
                             }
                         }
                     }
-                    VideoJobCompletion::Retransmit { requested, result } => match result {
-                        Ok(sent) => {
-                            trace!("Retransmitted {sent}/{requested} {kind:?} video packets")
+                    VideoJobCompletion::Retransmit {
+                        requested,
+                        result,
+                        elapsed_us,
+                    } => {
+                        tracing::trace!(
+                            target: "video_timing",
+                            stage = "outgoing.control",
+                            ?kind,
+                            action = "rtx_complete",
+                            requested,
+                            sent = result.as_ref().copied().unwrap_or_default(),
+                            elapsed_us,
+                            failed = result.is_err(),
+                            error = ?result.as_ref().err(),
+                            "video retransmit completed"
+                        );
+                        match result {
+                            Ok(sent) => {
+                                trace!("Retransmitted {sent}/{requested} {kind:?} video packets")
+                            }
+                            Err(err) => warn!("Failed to retransmit {kind:?} video packets: {err}"),
                         }
-                        Err(err) => warn!("Failed to retransmit {kind:?} video packets: {err}"),
-                    },
+                    }
                 }
             }
             VideoWork::RequestVideoKeyframe(kind) => {
@@ -1189,6 +1262,13 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                     VideoBroadcastKind::Screen => &mut video.screen,
                 };
                 state.keyframe_requested = true;
+                tracing::trace!(
+                    target: "video_timing",
+                    stage = "outgoing.control",
+                    ?kind,
+                    action = "receiver_keyframe_requested",
+                    "video keyframe state changed"
+                );
             }
             VideoWork::RetransmitVideo(kind, sequences) => {
                 let state = match kind {
@@ -1217,6 +1297,7 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                 };
                 let requested = sequences.len();
                 state.send_task = Some(smol::spawn(async move {
+                    let started = Instant::now();
                     let result = smol::unblock(move || {
                         smol::block_on(async move {
                             let video_t = target.video_send_transport(&gateway.dave_session);
@@ -1224,7 +1305,11 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                         })
                     })
                     .await;
-                    VideoJobCompletion::Retransmit { requested, result }
+                    VideoJobCompletion::Retransmit {
+                        requested,
+                        result,
+                        elapsed_us: elapsed_micros(started),
+                    }
                 }));
             }
             VideoWork::VideoLossReport(kind, fraction_lost) => {
@@ -1232,7 +1317,20 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                     VideoBroadcastKind::Camera => &mut video.camera,
                     VideoBroadcastKind::Screen => &mut video.screen,
                 };
+                let previous_quality = state.network_quality;
                 state.observe_loss(fraction_lost);
+                if previous_quality != state.network_quality {
+                    tracing::trace!(
+                        target: "video_timing",
+                        stage = "outgoing.control",
+                        ?kind,
+                        action = "network_quality_changed",
+                        fraction_lost,
+                        previous_quality,
+                        network_quality = state.network_quality,
+                        "video profile state changed"
+                    );
+                }
             }
             VideoWork::Yield => {}
         }
@@ -1322,6 +1420,18 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                     )
                 });
                 if desired.is_none() {
+                    if !state.sink_paused {
+                        tracing::trace!(
+                            target: "video_timing",
+                            stage = "outgoing.control",
+                            ?kind,
+                            codec = ?desired_codec,
+                            action = "sink_paused",
+                            sink_quality,
+                            network_quality = state.network_quality,
+                            "video profile state changed"
+                        );
+                    }
                     if state.announced {
                         if let Err(err) = self.announce_video(target, kind, false, None, None).await
                         {
@@ -1358,6 +1468,19 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                 if state.profile == Some(desired) && !codec_changed {
                     return;
                 }
+                tracing::trace!(
+                    target: "video_timing",
+                    stage = "outgoing.control",
+                    ?kind,
+                    codec = ?desired_codec,
+                    action = "codec_profile_rebuild_requested",
+                    sink_quality,
+                    network_quality = state.network_quality,
+                    previous_profile = ?state.profile,
+                    desired_profile = ?desired,
+                    codec_changed,
+                    "video profile state changed"
+                );
                 state.rebuild_codec = true;
                 state.profile = Some(desired);
                 state.announce_dirty = state.announced;
@@ -1457,6 +1580,55 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
             "video stage complete"
         );
 
+        let Some(gateway) = self.load_gateway_for(target, kind) else {
+            warn!("{kind:?} gateway changed before video send");
+            return;
+        };
+        let Some(codec_kind) = target.video_codec() else {
+            trace!("Waiting for server-selected {kind:?} video codec");
+            return;
+        };
+        let dave_transition_pending = !gateway.dave_pending_transitions.is_empty();
+        let dave_ready = target
+            .video_send_transport_with_transition_gate(
+                &gateway.dave_session,
+                &gateway.dave_pending_transitions,
+            )
+            .is_dave_ready();
+        if dave_transition_pending || !dave_ready {
+            state.dave_transition_blocked |= dave_transition_pending;
+            tracing::trace!(
+                target: "video_timing",
+                stage = "outgoing.control",
+                ?kind,
+                codec = ?codec_kind,
+                action = if dave_transition_pending {
+                    "dave_transition_frame_deferred"
+                } else {
+                    "dave_busy_or_not_ready_frame_deferred"
+                },
+                frame_id,
+                pending_transitions = gateway.dave_pending_transitions.len(),
+                "video send deferred"
+            );
+            return;
+        }
+        if std::mem::take(&mut state.dave_transition_blocked) {
+            if !state.keyframe_armed {
+                state.keyframe_requested = true;
+            }
+            tracing::trace!(
+                target: "video_timing",
+                stage = "outgoing.control",
+                ?kind,
+                codec = ?codec_kind,
+                action = "dave_transition_video_resumed",
+                frame_id,
+                keyframe_already_armed = state.keyframe_armed,
+                "video send resumed"
+            );
+        }
+
         // The first Video payload must precede any video RTP — and a Speaking
         // payload must precede *any* media from this connection ("You must send
         // at least one Speaking payload before sending or receiving data"). The
@@ -1498,13 +1670,10 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
         let arm_keyframe = !state.keyframe_armed
             && (state.keyframe_requested
                 || video_keyframe_due(state.last_keyframe, now, target.video_keyframe_interval()));
-        let Some(gateway) = self.load_gateway_for(target, kind) else {
-            warn!("{kind:?} gateway changed before video send");
-            return;
-        };
-        let Some(codec_kind) = target.video_codec() else {
-            trace!("Waiting for server-selected {kind:?} video codec");
-            return;
+        let keyframe_reason = if state.keyframe_requested {
+            "requested"
+        } else {
+            "periodic"
         };
         let codec = state.codec.take();
         let rebuild_codec = std::mem::take(&mut state.rebuild_codec)
@@ -1516,6 +1685,16 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
             // sets it again and is not erased by this task's completion.
             state.keyframe_armed = true;
             state.keyframe_requested = false;
+            tracing::trace!(
+                target: "video_timing",
+                stage = "outgoing.control",
+                ?kind,
+                codec = ?codec_kind,
+                action = "keyframe_armed",
+                reason = keyframe_reason,
+                frame_id,
+                "video keyframe state changed"
+            );
         }
 
         let mut scaler = std::mem::take(&mut state.scaler);
@@ -1594,6 +1773,8 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                         worker_queue_us,
                         elapsed_us = elapsed_micros(worker_started),
                         encoded_bytes,
+                        codec_rebuilt = rebuild_codec,
+                        forced_keyframe = arm_keyframe,
                         emitted,
                         failed = result.is_err(),
                         "video stage complete"
@@ -1633,7 +1814,10 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                             // interleave async UDP sends. Local block_on keeps
                             // whole bounded transport stage off media executor.
                             smol::block_on(async move {
-                                let video_t = target.video_send_transport(&gateway.dave_session);
+                                let video_t = target.video_send_transport_with_transition_gate(
+                                    &gateway.dave_session,
+                                    &gateway.dave_pending_transitions,
+                                );
                                 video_t
                                     .send_encoded_video_frame_for_timed(
                                         &encoded,
@@ -1665,6 +1849,8 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                     stage = "outgoing.complete",
                     ?kind,
                     frame_id = completed_frame_id,
+                    submitted_frame_id = frame_id,
+                    emitted_frame_id = completed_frame_id,
                     signaling_us,
                     announce_settle_us,
                     transport_us = elapsed_micros(transport_started),
@@ -1673,8 +1859,14 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                     pipeline_elapsed_us,
                     frame_budget_us,
                     over_budget = discord_us > frame_budget_us,
+                    codec_rebuilt = rebuild_codec,
+                    forced_keyframe = arm_keyframe,
+                    keyframe = result
+                        .as_ref()
+                        .is_ok_and(|outcome| outcome.keyframe),
                     emitted = result.as_ref().is_ok_and(|outcome| outcome.emitted),
                     failed = result.is_err(),
+                    error = ?result.as_ref().err(),
                     "video frame complete"
                 );
             });
@@ -1682,6 +1874,9 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
                 codec,
                 scaler,
                 result,
+                submitted_frame_id: frame_id,
+                emitted_frame_id: completed_frame_id,
+                forced_keyframe: arm_keyframe,
             })
         }));
     }
@@ -1841,44 +2036,11 @@ impl<'a, T: UnitStruct> MediaCoordinator<'a, T> {
     }
 }
 
-impl<T: UnitStruct> InnerDiscord<T> {
-    /// Thin facade for stream implementations. Coordination helpers live on
-    /// [`MediaCoordinator`], keeping `InnerDiscord` method surface to one
-    /// media entry point.
-    pub(crate) async fn drive_media(self: &Arc<Self>) -> MediaDrive<'_> {
+impl DiscordRuntimeState {
+    /// Thin runtime facade for capability listeners. Coordination helpers live
+    /// on [`MediaCoordinator`].
+    pub(crate) async fn drive_media(&self) -> MediaDrive {
         MediaCoordinator::new(self).drive_media().await
-    }
-}
-
-#[async_trait]
-impl ArcStream for InnerDiscord<AudioDiscord> {
-    type Item = AudioEvent;
-    /// Await the next item. Works with shared ownership via `Arc`.
-    async fn next(self: Arc<Self>) -> Option<<Self as ArcStream>::Item> {
-        let _guard = StreamPollGuard::new(&self.gateway.active_streams);
-        loop {
-            if self
-                .gateway
-                .killed
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return None;
-            }
-            if self.owner_dropped() {
-                self.gateway.kill();
-                return None;
-            }
-            let gateway = self.gateway.current.load_full()?;
-            let mut event = pin!(gateway.events.next_audio().fuse());
-            let mut drive = pin!(self.drive_media().fuse());
-            select! {
-                event = event => return Some(event),
-                result = drive => match result {
-                    MediaDrive::Complete(result) => result?,
-                    MediaDrive::Gateway(turn) => self.execute_gateway_turn(turn).await?,
-                },
-            }
-        }
     }
 }
 
@@ -2018,5 +2180,31 @@ mod tests {
             now,
             interval
         ));
+    }
+
+    #[test]
+    fn delayed_av1_output_does_not_reissue_pending_keyframe() {
+        let older_inter = VideoSendOutcome {
+            emitted: true,
+            keyframe: false,
+        };
+        assert_eq!(
+            keyframe_completion_action(VideoCodec::Av1, older_inter),
+            KeyframeCompletionAction::Pending
+        );
+        assert_eq!(
+            keyframe_completion_action(VideoCodec::H264, older_inter),
+            KeyframeCompletionAction::Retry
+        );
+        assert_eq!(
+            keyframe_completion_action(
+                VideoCodec::Av1,
+                VideoSendOutcome {
+                    emitted: true,
+                    keyframe: true,
+                },
+            ),
+            KeyframeCompletionAction::Complete
+        );
     }
 }

@@ -21,7 +21,7 @@ use simple_audio_channels::{
     effects::{Gain, Gate, Mute},
     effects_rack::EffectsRack,
 };
-use simple_video_capture::{CaptureLimits, capture_to_channel_bounded};
+use simple_video::CaptureLimits;
 use tracing::{debug, trace, warn};
 
 use crate::audio_controls::AudioControls;
@@ -300,7 +300,13 @@ pub fn process_voice_event(
                 call.set_state(CallState::Pending(status));
             }
         }
-        VoiceEvent::CallStreamReady { room, stream } => {
+        VoiceEvent::CallStreamReady { room, source } => {
+            let Some(stream) = messengers
+                .get(id)
+                .map(|entry| entry.interface.bind_stream(source))
+            else {
+                return Task::none();
+            };
             if let Some(data) = messengers.data_mut(id)
                 && let Some(call) = data.calls.iter_mut().find(|call| call.id() == *room.id())
             {
@@ -523,21 +529,9 @@ pub fn process_video_event(
             };
             let frames_per_second = input.frames_per_second.clamp(1, 30);
             let resolution = input.resolution;
+            let bitrate_bps = input.bitrate_bps;
             let generation = input.generation;
             let input_key = (id, kind);
-            let (producer, consumer) = frame_channel();
-            if channel
-                .send(InterfaceVideoInput::new(
-                    consumer,
-                    frames_per_second,
-                    resolution,
-                    input.bitrate_bps,
-                ))
-                .is_err()
-            {
-                warn!("Couldn't send video input channel to the adapter");
-                return Task::none();
-            }
 
             match input.source {
                 VideoInputSource::CyanTestPattern => {
@@ -560,6 +554,19 @@ pub fn process_video_event(
                             )),
                         });
                     };
+                    let (producer, consumer) = frame_channel();
+                    if channel
+                        .send(InterfaceVideoInput::new(
+                            consumer,
+                            frames_per_second,
+                            resolution,
+                            bitrate_bps,
+                        ))
+                        .is_err()
+                    {
+                        warn!("Couldn't send video input channel to the adapter");
+                        return Task::none();
+                    }
                     Task::future(async move {
                         let mut producer = producer;
                         let (width, height) = (resolution.width, resolution.height);
@@ -579,57 +586,57 @@ pub fn process_video_event(
                         AppMessage::VideoCaptureResult {
                             key: input_key,
                             generation,
-                            result: Err("Video backend stopped consuming test input".to_owned()),
+                            result: Ok(()),
                         }
                     })
                 }
                 VideoInputSource::Capture(source) => {
                     let source_name = source.name().to_owned();
-                    let thread_name = format!("video-input-{kind:?}").to_lowercase();
                     let limits = capture_limits(resolution, frames_per_second);
                     debug!("Opening {kind:?} video input: {source_name}");
-                    let (completed, completion) = futures::channel::oneshot::channel();
-                    let spawn = std::thread::Builder::new()
-                        .name(thread_name)
-                        .spawn(move || {
-                            let open_started = Instant::now();
-                            let result =
-                                match source.open_bounded(limits) {
-                                    Ok(capture) => {
-                                        trace!(
-                                            target: "video_timing",
-                                            stage = "capture.open",
-                                            ?kind,
-                                            source = %source_name,
-                                            elapsed_us = elapsed_micros(open_started),
-                                            "video stage complete"
-                                        );
-                                        capture_to_channel_bounded(capture, producer, limits)
-                                    .map_err(|error| {
-                                        format!("Video capture failed for {source_name}: {error}")
-                                    })
-                                    .and_then(|()| {
-                                        Err(format!(
-                                            "Video backend stopped consuming {source_name}"
-                                        ))
-                                    })
-                                    }
-                                    Err(error) => Err(format!(
+                    Task::future(async move {
+                        let open_started = Instant::now();
+                        let stream = match source.stream_with_limits(limits).await {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                return AppMessage::VideoCaptureResult {
+                                    key: input_key,
+                                    generation,
+                                    result: Err(format!(
                                         "Couldn't open video input {source_name}: {error}"
                                     )),
                                 };
-                            let _ = completed.send(result);
-                        });
-                    if let Err(error) = spawn {
-                        return Task::done(AppMessage::VideoCaptureResult {
-                            key: input_key,
-                            generation,
-                            result: Err(format!("Couldn't start video capture thread: {error}")),
-                        });
-                    }
-                    Task::future(async move {
-                        let result = completion.await.unwrap_or_else(|_| {
-                            Err("Video capture thread exited without a result".to_owned())
+                            }
+                        };
+                        trace!(
+                            target: "video_timing",
+                            stage = "capture.open",
+                            ?kind,
+                            source = %source_name,
+                            elapsed_us = elapsed_micros(open_started),
+                            "video stage complete"
+                        );
+                        let (consumer, completion) = stream.into_parts();
+                        if channel
+                            .send(InterfaceVideoInput::new(
+                                consumer,
+                                frames_per_second,
+                                resolution,
+                                bitrate_bps,
+                            ))
+                            .is_err()
+                        {
+                            debug!(
+                                "Video input request was cancelled while opening: {source_name}"
+                            );
+                            return AppMessage::VideoCaptureResult {
+                                key: input_key,
+                                generation,
+                                result: Ok(()),
+                            };
+                        }
+                        let result = completion.wait().await.map_err(|error| {
+                            format!("Video capture failed for {source_name}: {error}")
                         });
                         AppMessage::VideoCaptureResult {
                             key: input_key,

@@ -15,6 +15,7 @@ use tracing_subscriber::{
 };
 
 const MAX_PENDING_FRAMES: usize = 512;
+const HEALTHY_REPORT_SAMPLE_INTERVAL: u64 = 30;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -74,6 +75,19 @@ impl TimingFields {
             })
     }
 
+    fn optional_debug_text(&self, name: &str) -> Option<&str> {
+        let value = self.text(name)?;
+        if value == "None" {
+            return None;
+        }
+        Some(
+            value
+                .strip_prefix("Some(")
+                .and_then(|value| value.strip_suffix(')'))
+                .unwrap_or(value),
+        )
+    }
+
     fn stage(&self) -> &str {
         self.text("stage").unwrap_or("video.event")
     }
@@ -105,20 +119,39 @@ impl Visit for TimingFields {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct FrameReport {
     frame_id: u64,
     stages: Vec<TimingFields>,
 }
 
 impl FrameReport {
-    fn record(&mut self, fields: TimingFields) {
+    fn record(&mut self, mut fields: TimingFields) {
+        let is_av1 = fields.stage() == "av1.encode";
         let stage = fields.stage();
         if let Some(current) = self
             .stages
             .iter_mut()
             .find(|current| current.stage() == stage)
         {
+            // A delayed AV1 packet is correlated back to its emitted input and
+            // replaces that input's earlier NeedMoreData event. Preserve peak
+            // buffering and rebuild evidence before replacing stage details.
+            if is_av1 {
+                let buffered_streak = current
+                    .u64("need_more_data_streak")
+                    .unwrap_or_default()
+                    .max(fields.u64("need_more_data_streak").unwrap_or_default());
+                fields.insert("need_more_data_streak", FieldValue::U64(buffered_streak));
+                if current.bool("context_rebuilt") == Some(true) {
+                    fields.insert("context_rebuilt", FieldValue::Bool(true));
+                    let rebuild_us = current
+                        .u64("context_rebuild_us")
+                        .unwrap_or_default()
+                        .max(fields.u64("context_rebuild_us").unwrap_or_default());
+                    fields.insert("context_rebuild_us", FieldValue::U64(rebuild_us));
+                }
+            }
             *current = fields;
         } else {
             self.stages.push(fields);
@@ -133,10 +166,23 @@ impl FrameReport {
         self.stages.iter().rev().find_map(|stage| stage.text(name))
     }
 
-    fn final_stage(&self) -> Option<&TimingFields> {
+    fn bool(&self, name: &str) -> Option<bool> {
+        self.stages.iter().rev().find_map(|stage| stage.bool(name))
+    }
+
+    fn error(&self) -> Option<&str> {
         self.stages
             .iter()
-            .find(|stage| stage.stage() == "outgoing.complete")
+            .rev()
+            .find_map(|stage| stage.optional_debug_text("error"))
+    }
+
+    fn stage(&self, name: &str) -> Option<&TimingFields> {
+        self.stages.iter().find(|stage| stage.stage() == name)
+    }
+
+    fn final_stage(&self) -> Option<&TimingFields> {
+        self.stage("outgoing.complete")
     }
 }
 
@@ -145,6 +191,7 @@ struct ReportState {
     frames: HashMap<u64, FrameReport>,
     insertion_order: VecDeque<u64>,
     stale_replacements: u64,
+    healthy_reports: u64,
 }
 
 impl ReportState {
@@ -174,6 +221,18 @@ impl ReportState {
         {
             self.insertion_order.pop_front();
         }
+    }
+
+    fn should_render(&mut self, report: &FrameReport, stale_replacements: u64) -> bool {
+        if report_is_anomalous(report, stale_replacements) {
+            return true;
+        }
+
+        self.healthy_reports = self.healthy_reports.saturating_add(1);
+        self.healthy_reports == 1
+            || self
+                .healthy_reports
+                .is_multiple_of(HEALTHY_REPORT_SAMPLE_INTERVAL)
     }
 }
 
@@ -223,7 +282,7 @@ where
         let is_complete = fields.stage() == "outgoing.complete"
             && (fields.bool("emitted") == Some(true) || fields.bool("failed") == Some(true));
 
-        let (report, stale_replacements) = {
+        let (report, stale_replacements, should_render) = {
             let mut state = self
                 .state
                 .lock()
@@ -235,13 +294,16 @@ where
             if is_complete {
                 let report = state.frames.remove(&frame_id);
                 let stale_replacements = std::mem::take(&mut state.stale_replacements);
-                (report, stale_replacements)
+                let should_render = report
+                    .as_ref()
+                    .is_some_and(|report| state.should_render(report, stale_replacements));
+                (report, stale_replacements, should_render)
             } else {
                 return Ok(());
             }
         };
 
-        if let Some(mut report) = report {
+        if should_render && let Some(mut report) = report {
             report.stages.sort_by_key(|stage| stage_rank(stage.stage()));
             render_report(
                 &report,
@@ -328,7 +390,7 @@ const H264_COMPONENTS: &[Component] = &[
     },
     Component {
         field: "codec_us",
-        label: "H264 codec",
+        label: "OpenH264 encode core",
         actionable: true,
     },
     Component {
@@ -339,38 +401,53 @@ const H264_COMPONENTS: &[Component] = &[
 ];
 const AV1_COMPONENTS: &[Component] = &[
     Component {
+        field: "state_setup_us",
+        label: "encoder state setup",
+        actionable: true,
+    },
+    Component {
+        field: "frame_alloc_us",
+        label: "rav1e frame allocation",
+        actionable: true,
+    },
+    Component {
         field: "rgb_to_yuv_us",
         label: "RGB → YUV conversion",
         actionable: true,
     },
     Component {
-        field: "codec_us",
-        label: "AV1 codec",
+        field: "send_frame_us",
+        label: "rav1e frame submission",
+        actionable: true,
+    },
+    Component {
+        field: "receive_packet_us",
+        label: "rav1e packet production",
         actionable: true,
     },
 ];
 const H264_DECODE_COMPONENTS: &[Component] = &[
     Component {
         field: "codec_us",
-        label: "H264 codec decode",
+        label: "OpenH264 decode",
         actionable: true,
     },
     Component {
-        field: "rgba_us",
+        field: "rgba_alloc_us",
+        label: "RGBA allocation + zero-fill",
+        actionable: true,
+    },
+    Component {
+        field: "yuv_to_rgba_us",
         label: "YUV → RGBA conversion",
         actionable: true,
     },
 ];
 const INCOMING_COMPONENTS: &[Component] = &[
     Component {
-        field: "packet_assemble_us",
-        label: "RTP frame assembly CPU",
+        field: "receive_bookkeeping_us",
+        label: "receive bookkeeping/NACK",
         actionable: true,
-    },
-    Component {
-        field: "assembly_age_us",
-        label: "first → last RTP packet",
-        actionable: false,
     },
     Component {
         field: "dave_lock_wait_us",
@@ -378,8 +455,13 @@ const INCOMING_COMPONENTS: &[Component] = &[
         actionable: true,
     },
     Component {
-        field: "dave_decrypt_us",
-        label: "DAVE frame decryption",
+        field: "dave_decrypt_preflight_us",
+        label: "DAVE decrypt allocation/preflight",
+        actionable: true,
+    },
+    Component {
+        field: "dave_decrypt_transform_us",
+        label: "DAVE decrypt transform",
         actionable: true,
     },
     Component {
@@ -412,8 +494,13 @@ const TRANSPORT_COMPONENTS: &[Component] = &[
         actionable: true,
     },
     Component {
-        field: "dave_encrypt_us",
-        label: "DAVE frame encryption",
+        field: "dave_preflight_us",
+        label: "DAVE allocation + preflight",
+        actionable: true,
+    },
+    Component {
+        field: "dave_transform_us",
+        label: "DAVE transform + AES-GCM",
         actionable: true,
     },
     Component {
@@ -578,6 +665,30 @@ fn correlated_frame_id(fields: &TimingFields) -> Option<u64> {
         .or_else(|| fields.u64("frame_id").filter(|frame_id| *frame_id != 0))
 }
 
+fn report_is_anomalous(report: &FrameReport, stale_replacements: u64) -> bool {
+    let final_stage = report.final_stage();
+    let budget_us = final_stage
+        .and_then(|stage| stage.u64("frame_budget_us"))
+        .unwrap_or_default();
+    let discord_us = final_stage
+        .and_then(|stage| stage.u64("discord_us"))
+        .unwrap_or_default();
+    let over_budget = final_stage
+        .and_then(|stage| stage.bool("over_budget"))
+        .unwrap_or(budget_us > 0 && discord_us > budget_us);
+    let output_gap_us = report.field("output_gap_us").unwrap_or_default();
+
+    stale_replacements > 0
+        || final_stage.and_then(|stage| stage.bool("failed")) == Some(true)
+        || report.error().is_some()
+        || over_budget
+        || (budget_us > 0 && output_gap_us > budget_us.saturating_mul(2))
+        || report.bool("keyframe") == Some(true)
+        || report.bool("context_rebuilt") == Some(true)
+        || report.bool("emitted_context_rebuilt") == Some(true)
+        || report.field("need_more_data_streak").unwrap_or_default() > 0
+}
+
 fn hottest_component(report: &FrameReport) -> Option<(&'static str, u64)> {
     report
         .stages
@@ -610,12 +721,17 @@ fn render_report(
     let budget_us = final_stage
         .and_then(|stage| stage.u64("frame_budget_us"))
         .unwrap_or_default();
+    let frame_work_us = final_stage
+        .and_then(|stage| stage.u64("discord_us"))
+        .unwrap_or(pipeline_us);
     let kind = final_stage
         .and_then(|stage| stage.text("kind"))
         .or_else(|| report.text("kind"))
         .unwrap_or("Video");
-    let ratio = (budget_us > 0).then(|| pipeline_us as f64 / budget_us as f64);
-    let over_budget = ratio.is_some_and(|ratio| ratio > 1.0);
+    let ratio = (budget_us > 0).then(|| frame_work_us as f64 / budget_us as f64);
+    let over_budget = final_stage
+        .and_then(|stage| stage.bool("over_budget"))
+        .unwrap_or_else(|| ratio.is_some_and(|ratio| ratio > 1.0));
 
     let style = Styles::new(ansi);
     writeln!(output)?;
@@ -635,29 +751,56 @@ fn render_report(
     )?;
     write!(
         output,
-        "{}│{}  {}END TO END{:>22.3} ms{}",
+        "{}│{}  {}CAPTURE CALL → SEND{:>14.3} ms{}",
         style.dim,
         style.reset,
         style.bold,
         micros_to_ms(pipeline_us),
         style.reset,
     )?;
+    writeln!(output)?;
+    write!(
+        output,
+        "{}│{}  {}DISCORD FRAME WORK{:>15.3} ms{}",
+        style.dim,
+        style.reset,
+        style.bold,
+        micros_to_ms(frame_work_us),
+        style.reset,
+    )?;
     if let Some(ratio) = ratio {
         let budget_color = if over_budget { style.red } else { style.green };
         write!(
             output,
-            "   {budget_color}{ratio:.1}× {} BUDGET{}",
+            "   {budget_color}{ratio:.1}× {} BUDGET{} {}({:.1} FPS · {:.3} ms){}",
             if over_budget { "OVER" } else { "OF" },
+            style.reset,
+            style.dim,
+            frames_per_second(budget_us),
+            micros_to_ms(budget_us),
             style.reset,
         )?;
     }
     writeln!(output)?;
 
-    if let Some((label, duration_us)) = hottest_component(report) {
-        let percent = percentage(duration_us, pipeline_us);
+    render_output_diagnostics(report, budget_us, &style, output)?;
+
+    if final_stage.and_then(|stage| stage.bool("failed")) == Some(true) {
         writeln!(
             output,
-            "{}│{}  {}BOTTLENECK{}  {:<25} {}{:>9.3} ms{}  ({percent:>5.1}% of pipeline)",
+            "{}│{}  {}FAILED{}  {}",
+            style.dim,
+            style.reset,
+            style.red,
+            style.reset,
+            report.error().unwrap_or("unknown video send error"),
+        )?;
+    }
+
+    if let Some((label, duration_us)) = hottest_component(report) {
+        writeln!(
+            output,
+            "{}│{}  {}HOTTEST ACTIONABLE STEP{}  {:<25} {}{:>9.3} ms{}",
             style.dim,
             style.reset,
             style.red,
@@ -704,6 +847,119 @@ fn render_report(
     )
 }
 
+fn render_output_diagnostics(
+    report: &FrameReport,
+    budget_us: u64,
+    style: &Styles<'_>,
+    output: &mut impl fmt::Write,
+) -> fmt::Result {
+    if let Some(output_gap_us) = report.field("output_gap_us") {
+        if output_gap_us == 0 {
+            writeln!(
+                output,
+                "{}│{}  {}WIRE OUTPUT GAP{}  n/a (first emitted frame)",
+                style.dim, style.reset, style.bold, style.reset,
+            )?;
+        } else {
+            let gap_color = if budget_us > 0 && output_gap_us > budget_us.saturating_mul(2) {
+                style.red
+            } else {
+                style.green
+            };
+            writeln!(
+                output,
+                "{}│{}  {}WIRE OUTPUT GAP{}  {gap_color}{:>9.3} ms{} · observed {:.1} FPS",
+                style.dim,
+                style.reset,
+                style.bold,
+                style.reset,
+                micros_to_ms(output_gap_us),
+                style.reset,
+                frames_per_second(output_gap_us),
+            )?;
+        }
+    }
+
+    let Some(av1) = report.stage("av1.encode") else {
+        return Ok(());
+    };
+    let lag_frames = av1
+        .u64("encoder_lag_frames")
+        .or_else(|| av1.u64("lag_frames"))
+        .unwrap_or_default();
+    let submitted_force_keyframe = av1
+        .bool("submitted_force_keyframe")
+        .or_else(|| av1.bool("submitted_forced_keyframe"))
+        .unwrap_or(false);
+    let emitted_force_keyframe = av1
+        .bool("emitted_force_keyframe")
+        .or_else(|| av1.bool("emitted_forced_keyframe"))
+        .unwrap_or(false);
+    let keyframe = av1
+        .bool("keyframe")
+        .or_else(|| av1.bool("emitted_keyframe"))
+        .unwrap_or(false);
+    write!(
+        output,
+        "{}│{}  {}AV1 PROVENANCE{}  submit ",
+        style.dim, style.reset, style.bold, style.reset,
+    )?;
+    match av1.u64("submitted_sequence") {
+        Some(sequence) => write!(output, "#{sequence}")?,
+        None => write!(output, "n/a")?,
+    }
+    write!(output, " → emit ")?;
+    match av1.u64("emitted_sequence") {
+        Some(sequence) => write!(output, "#{sequence}")?,
+        None => write!(output, "n/a")?,
+    }
+    write!(
+        output,
+        " · lag {} frame{} · residence {}",
+        lag_frames,
+        if lag_frames == 1 { "" } else { "s" },
+        duration_or_na(av1.u64("encoder_residence_us").unwrap_or_default()),
+    )?;
+    if keyframe {
+        write!(output, " · {}KEYFRAME{}", style.yellow, style.reset)?;
+    }
+    writeln!(output)?;
+
+    let context_generation = av1
+        .u64("emitted_context_generation")
+        .filter(|generation| *generation != 0)
+        .or_else(|| av1.u64("context_generation"))
+        .unwrap_or_default();
+    let context_rebuilt = av1.bool("emitted_context_rebuilt").unwrap_or(false)
+        || av1.bool("context_rebuilt").unwrap_or(false);
+    let context_rebuild_us = av1
+        .u64("emitted_context_rebuild_us")
+        .filter(|duration| *duration != 0)
+        .or_else(|| av1.u64("context_rebuild_us"))
+        .unwrap_or_default();
+    write!(
+        output,
+        "{}│{}  {}AV1 STATE{}       force current={} emitted={} · context #{context_generation}",
+        style.dim,
+        style.reset,
+        style.bold,
+        style.reset,
+        submitted_force_keyframe,
+        emitted_force_keyframe,
+    )?;
+    if context_rebuilt {
+        write!(output, " rebuilt in {}", duration_or_na(context_rebuild_us),)?;
+    } else {
+        write!(output, " reused")?;
+    }
+    writeln!(
+        output,
+        " · buffered streak {} · encoded loop count {}",
+        av1.u64("need_more_data_streak").unwrap_or_default(),
+        av1.u64("encoded_loop_count").unwrap_or_default(),
+    )
+}
+
 fn render_single_stage(
     fields: &TimingFields,
     uptime_seconds: f64,
@@ -711,6 +967,9 @@ fn render_single_stage(
     output: &mut impl fmt::Write,
 ) -> fmt::Result {
     let style = Styles::new(ansi);
+    if fields.stage() == "outgoing.control" {
+        return render_video_control(fields, uptime_seconds, &style, output);
+    }
     let duration = stage_total_us(fields).unwrap_or_default();
     writeln!(
         output,
@@ -724,7 +983,190 @@ fn render_single_stage(
         style.dim,
         style.reset,
     )?;
-    render_component_rows(fields, duration, "              ", &style, output)
+    render_component_rows(fields, duration, "              ", &style, output)?;
+    render_single_stage_details(fields, &style, output)
+}
+
+fn render_video_control(
+    fields: &TimingFields,
+    uptime_seconds: f64,
+    style: &Styles<'_>,
+    output: &mut impl fmt::Write,
+) -> fmt::Result {
+    write!(
+        output,
+        "{}VIDEO CONTROL{} · {}",
+        style.cyan,
+        style.reset,
+        fields.text("kind").unwrap_or("Video"),
+    )?;
+    if let Some(action) = fields.text("action") {
+        write!(output, " · {action}")?;
+    }
+    if let Some(codec) = fields.text("codec") {
+        write!(output, " · codec {codec}")?;
+    }
+    if let Some(reason) = fields.text("reason") {
+        write!(output, " · reason {reason}")?;
+    }
+    if let Some(transition_id) = fields.u64("transition_id") {
+        write!(output, " · transition #{transition_id}")?;
+    }
+    if let Some(protocol_version) = fields.u64("protocol_version") {
+        write!(output, " · protocol v{protocol_version}")?;
+    }
+    if let Some(pending) = fields.u64("pending_transitions") {
+        write!(output, " · pending {pending}")?;
+    }
+    if let Some(frame_id) = fields.u64("frame_id").filter(|frame_id| *frame_id != 0) {
+        write!(output, " · frame #{frame_id}")?;
+    } else if let Some(submitted_frame_id) = fields
+        .u64("submitted_frame_id")
+        .filter(|frame_id| *frame_id != 0)
+    {
+        write!(output, " · submit #{submitted_frame_id}")?;
+        if let Some(emitted_frame_id) = fields
+            .u64("emitted_frame_id")
+            .filter(|frame_id| *frame_id != 0)
+        {
+            write!(output, " → emit #{emitted_frame_id}")?;
+        }
+    }
+    if let Some(emitted) = fields.bool("emitted") {
+        write!(output, " · emitted {emitted}")?;
+    }
+    if let Some(keyframe) = fields.bool("keyframe") {
+        write!(output, " · keyframe {keyframe}")?;
+    }
+    if let Some(previous_quality) = fields.u64("previous_quality")
+        && let Some(quality) = fields.u64("network_quality")
+    {
+        write!(output, " · quality {previous_quality}→{quality}")?;
+    } else if let Some(quality) = fields.u64("network_quality") {
+        write!(output, " · network quality {quality}")?;
+    }
+    if let Some(sink_quality) = fields.u64("sink_quality") {
+        write!(output, " · sink quality {sink_quality}")?;
+    }
+    if let Some(fraction_lost) = fields.u64("fraction_lost") {
+        write!(output, " · loss {fraction_lost}/256")?;
+    }
+    if let Some(requested) = fields.u64("requested") {
+        write!(
+            output,
+            " · RTX {}/{}",
+            fields.u64("sent").unwrap_or_default(),
+            requested
+        )?;
+    }
+    if let Some(elapsed_us) = fields.u64("elapsed_us") {
+        write!(output, " · {:.3} ms", micros_to_ms(elapsed_us))?;
+    }
+    if fields.bool("failed") == Some(true) {
+        write!(output, " · {}FAILED{}", style.red, style.reset)?;
+    }
+    if let Some(error) = fields.optional_debug_text("error") {
+        write!(output, " · error {error}")?;
+    }
+    writeln!(
+        output,
+        "  {}+{uptime_seconds:.3}s{}",
+        style.dim, style.reset,
+    )
+}
+
+fn render_single_stage_details(
+    fields: &TimingFields,
+    style: &Styles<'_>,
+    output: &mut impl fmt::Write,
+) -> fmt::Result {
+    match fields.stage() {
+        "h264.decode" => {
+            let decoder_thread_mode = fields
+                .text("decoder_thread_mode")
+                .unwrap_or("OpenH264 default");
+            let decoder_id = fields.u64("decoder_id").unwrap_or_default();
+            let frame_id = fields.u64("frame_id").unwrap_or_default();
+            let access_unit_bytes = bytes(fields.u64("access_unit_bytes").unwrap_or_default());
+            if fields.bool("failed") == Some(true) {
+                writeln!(
+                    output,
+                    "{}              ╰─{} decoder #{decoder_id} · input #{frame_id} · {access_unit_bytes} access unit · {decoder_thread_mode} · failed: {}",
+                    style.dim,
+                    style.reset,
+                    fields.text("error").unwrap_or("unknown decoder error"),
+                )
+            } else if fields.bool("emitted") == Some(true) {
+                writeln!(
+                    output,
+                    "{}              ╰─{} decoder #{decoder_id} · input #{frame_id} · {access_unit_bytes} access unit → {}×{} RGBA ({}) · {} · {decoder_thread_mode}",
+                    style.dim,
+                    style.reset,
+                    fields.u64("width").unwrap_or_default(),
+                    fields.u64("height").unwrap_or_default(),
+                    bytes(fields.u64("output_bytes").unwrap_or_default()),
+                    fields
+                        .text("conversion_path")
+                        .unwrap_or("unknown conversion"),
+                )
+            } else {
+                writeln!(
+                    output,
+                    "{}              ╰─{} decoder #{decoder_id} · input #{frame_id} · {access_unit_bytes} access unit · {decoder_thread_mode} · buffered/no picture",
+                    style.dim, style.reset,
+                )
+            }
+        }
+        "incoming.receive" => {
+            let source_interval_us = fields.u64("source_interval_us").unwrap_or_default();
+            let ssrc = fields.u64("ssrc").unwrap_or_default();
+            let decoder_id = fields.u64("decoder_id").unwrap_or_default();
+            let stream_frame_index = fields.u64("stream_frame_index").unwrap_or_default();
+            if source_interval_us == 0 {
+                writeln!(
+                    output,
+                    "{}              ├─{} SSRC {ssrc} · decoder #{decoder_id} · stream frame #{stream_frame_index} · observed RTP AU cadence n/a (first sample)",
+                    style.dim, style.reset,
+                )?;
+            } else {
+                writeln!(
+                    output,
+                    "{}              ├─{} SSRC {ssrc} · decoder #{decoder_id} · stream frame #{stream_frame_index} · RTP Δ {} ticks · observed RTP AU cadence {:.1} FPS",
+                    style.dim,
+                    style.reset,
+                    fields.u64("rtp_delta_ticks").unwrap_or_default(),
+                    frames_per_second(source_interval_us),
+                )?;
+            }
+            let status = if fields.bool("failed") == Some(true) {
+                "failed"
+            } else if fields.bool("emitted") == Some(true) {
+                "emitted"
+            } else {
+                "buffered"
+            };
+            write!(
+                output,
+                "{}              ╰─{} AU gap {} · output gap {} · packet span {:>9.3} ms · final-packet assembly CPU {:>9.3} ms · {status}",
+                style.dim,
+                style.reset,
+                duration_or_na(fields.u64("access_unit_gap_us").unwrap_or_default()),
+                duration_or_na(fields.u64("output_gap_us").unwrap_or_default()),
+                micros_to_ms(fields.u64("assembly_age_us").unwrap_or_default()),
+                micros_to_ms(fields.u64("packet_assemble_us").unwrap_or_default()),
+            )?;
+            let attempts = fields.u64("dave_decrypt_attempts").unwrap_or_default();
+            if attempts > 0 {
+                write!(
+                    output,
+                    " · DAVE {attempts} attempt{}",
+                    if attempts == 1 { "" } else { "s" },
+                )?;
+            }
+            writeln!(output)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn render_stage(
@@ -842,23 +1284,28 @@ fn render_stage_details(
             )?;
         }
         "outgoing.transport" => {
-            writeln!(
+            let packets_sent = fields.u64("packets_sent").unwrap_or_default();
+            let attempts = fields.u64("dave_encrypt_attempts").unwrap_or_default();
+            write!(
                 output,
-                "{}│{}    ╰─ {} RTP packet{} · {} on wire",
+                "{}│{}    ╰─ {packets_sent} RTP packet{} · {} on wire",
                 style.dim,
                 style.reset,
-                fields.u64("packets_sent").unwrap_or_default(),
-                if fields.u64("packets_sent") == Some(1) {
-                    ""
-                } else {
-                    "s"
-                },
+                if packets_sent == 1 { "" } else { "s" },
                 bytes(fields.u64("wire_bytes").unwrap_or_default()),
             )?;
+            if attempts > 0 {
+                write!(
+                    output,
+                    " · DAVE {attempts} attempt{}",
+                    if attempts == 1 { "" } else { "s" },
+                )?;
+            }
+            writeln!(output)?;
         }
         "outgoing.complete" => {
             let discord_us = fields.u64("discord_us").unwrap_or_default();
-            writeln!(
+            write!(
                 output,
                 "{}│{}    ╰─ Discord-side job {:>9.3} ms · pipeline {:>9.3} ms",
                 style.dim,
@@ -866,6 +1313,17 @@ fn render_stage_details(
                 micros_to_ms(discord_us),
                 micros_to_ms(pipeline_us),
             )?;
+            if fields.bool("failed") == Some(true) || fields.optional_debug_text("error").is_some()
+            {
+                write!(
+                    output,
+                    " · failed: {}",
+                    fields
+                        .optional_debug_text("error")
+                        .unwrap_or("unknown video send error"),
+                )?;
+            }
+            writeln!(output)?;
         }
         _ => {}
     }
@@ -874,6 +1332,22 @@ fn render_stage_details(
 
 fn micros_to_ms(micros: u64) -> f64 {
     micros as f64 / 1_000.0
+}
+
+fn duration_or_na(micros: u64) -> String {
+    if micros == 0 {
+        "n/a".to_owned()
+    } else {
+        format!("{:.3} ms", micros_to_ms(micros))
+    }
+}
+
+fn frames_per_second(interval_us: u64) -> f64 {
+    if interval_us == 0 {
+        0.0
+    } else {
+        1_000_000.0 / interval_us as f64
+    }
 }
 
 fn percentage(part: u64, total: u64) -> f64 {
@@ -966,6 +1440,18 @@ mod tests {
                 ("output_copy_us", 4),
             ],
         ));
+        report.record(fields(
+            "outgoing.transport",
+            &[
+                ("total_us", 2_000),
+                ("dave_encrypt_us", 1_500),
+                ("dave_preflight_us", 400),
+                ("dave_transform_us", 1_100),
+                ("dave_encrypt_attempts", 2),
+                ("packets_sent", 3),
+                ("wire_bytes", 3_600),
+            ],
+        ));
         let mut complete = fields(
             "outgoing.complete",
             &[
@@ -982,17 +1468,372 @@ mod tests {
         report
     }
 
+    fn healthy_report() -> FrameReport {
+        let mut report = sample_report();
+        let complete = report
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage() == "outgoing.complete")
+            .unwrap();
+        complete.insert("pipeline_elapsed_us", FieldValue::U64(30_000));
+        complete.insert("discord_us", FieldValue::U64(20_000));
+        complete.insert("frame_budget_us", FieldValue::U64(33_333));
+        complete.insert("over_budget", FieldValue::Bool(false));
+        complete.insert("failed", FieldValue::Bool(false));
+        complete.insert("error", FieldValue::Text("None".to_owned()));
+        let transport = report
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage() == "outgoing.transport")
+            .unwrap();
+        transport.insert("output_gap_us", FieldValue::U64(33_333));
+        transport.insert("keyframe", FieldValue::Bool(false));
+        report
+    }
+
+    fn report_stage_mut<'a>(report: &'a mut FrameReport, name: &str) -> &'a mut TimingFields {
+        report
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage() == name)
+            .unwrap()
+    }
+
     #[test]
-    fn report_uses_milliseconds_and_highlights_codec_bottleneck() {
+    fn report_separates_capture_call_age_from_budgeted_frame_work() {
         let mut output = String::new();
 
         render_report(&sample_report(), 11, 25.2, false, &mut output).unwrap();
 
-        assert!(output.contains("END TO END               412.085 ms"));
-        assert!(output.contains("BOTTLENECK  H264 codec"));
+        assert!(output.contains("CAPTURE CALL → SEND"));
+        assert!(output.contains("412.085 ms"));
+        assert!(output.contains("DISCORD FRAME WORK"));
+        assert!(output.contains("392.500 ms"));
+        assert!(output.contains("HOTTEST ACTIONABLE STEP  OpenH264 encode core"));
         assert!(output.contains("391.333 ms"));
+        assert!(output.contains("DAVE allocation + preflight"));
+        assert!(output.contains("DAVE transform + AES-GCM"));
+        assert!(output.contains("DAVE 2 attempts"));
         assert!(output.contains("11 stale frames replaced"));
         assert!(!output.contains("elapsed_us"));
+    }
+
+    #[test]
+    fn capture_wait_does_not_mark_fast_discord_work_over_budget() {
+        let mut report = sample_report();
+        let complete = report
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage() == "outgoing.complete")
+            .unwrap();
+        complete.insert("pipeline_elapsed_us", FieldValue::U64(298_037));
+        complete.insert("discord_us", FieldValue::U64(3_329));
+        complete.insert("frame_budget_us", FieldValue::U64(33_333));
+        complete.insert("over_budget", FieldValue::Bool(false));
+        let mut output = String::new();
+
+        render_report(&report, 0, 1.0, false, &mut output).unwrap();
+
+        assert!(output.contains("CAPTURE CALL → SEND"));
+        assert!(output.contains("298.037 ms"));
+        assert!(output.contains("DISCORD FRAME WORK"));
+        assert!(output.contains("3.329 ms"));
+        assert!(output.contains("0.1× OF BUDGET"));
+        assert!(output.contains("30.0 FPS · 33.333 ms"));
+        assert!(!output.contains("OVER BUDGET"));
+        assert!(!output.contains("BOTTLENECK"));
+    }
+
+    #[test]
+    fn healthy_reports_are_sampled_after_the_first() {
+        let report = healthy_report();
+        let mut state = ReportState::default();
+        let mut rendered = Vec::new();
+
+        for report_index in 1..=60 {
+            if state.should_render(&report, 0) {
+                rendered.push(report_index);
+            }
+        }
+
+        assert_eq!(rendered, [1, 30, 60]);
+    }
+
+    #[test]
+    fn anomalies_bypass_healthy_report_sampling() {
+        let healthy = healthy_report();
+        assert!(!report_is_anomalous(&healthy, 0));
+        assert!(report_is_anomalous(&healthy, 1));
+
+        let mut failed = healthy.clone();
+        report_stage_mut(&mut failed, "outgoing.complete").insert("failed", FieldValue::Bool(true));
+        assert!(report_is_anomalous(&failed, 0));
+
+        let mut over_budget = healthy.clone();
+        report_stage_mut(&mut over_budget, "outgoing.complete")
+            .insert("over_budget", FieldValue::Bool(true));
+        assert!(report_is_anomalous(&over_budget, 0));
+
+        let mut stalled = healthy.clone();
+        report_stage_mut(&mut stalled, "outgoing.transport")
+            .insert("output_gap_us", FieldValue::U64(66_667));
+        assert!(report_is_anomalous(&stalled, 0));
+
+        let mut keyframe = healthy.clone();
+        report_stage_mut(&mut keyframe, "outgoing.transport")
+            .insert("keyframe", FieldValue::Bool(true));
+        assert!(report_is_anomalous(&keyframe, 0));
+
+        let mut rebuilt = healthy.clone();
+        let mut av1 = fields(
+            "av1.encode",
+            &[("total_us", 10_000), ("need_more_data_streak", 0)],
+        );
+        av1.insert("context_rebuilt", FieldValue::Bool(true));
+        rebuilt.record(av1);
+        assert!(report_is_anomalous(&rebuilt, 0));
+
+        let mut buffered = healthy;
+        buffered.record(fields(
+            "av1.encode",
+            &[("total_us", 10_000), ("need_more_data_streak", 3)],
+        ));
+        assert!(report_is_anomalous(&buffered, 0));
+    }
+
+    #[test]
+    fn delayed_av1_output_preserves_buffering_and_rebuild_evidence() {
+        let mut report = FrameReport::default();
+        let mut buffered = fields(
+            "av1.encode",
+            &[("need_more_data_streak", 4), ("context_rebuild_us", 9_000)],
+        );
+        buffered.insert("context_rebuilt", FieldValue::Bool(true));
+        report.record(buffered);
+        let mut emitted = fields(
+            "av1.encode",
+            &[("need_more_data_streak", 0), ("context_rebuild_us", 0)],
+        );
+        emitted.insert("context_rebuilt", FieldValue::Bool(false));
+
+        report.record(emitted);
+
+        let av1 = report.stage("av1.encode").unwrap();
+        assert_eq!(av1.u64("need_more_data_streak"), Some(4));
+        assert_eq!(av1.bool("context_rebuilt"), Some(true));
+        assert_eq!(av1.u64("context_rebuild_us"), Some(9_000));
+    }
+
+    #[test]
+    fn av1_report_exposes_output_gap_and_frame_provenance() {
+        let mut report = healthy_report();
+        report.stages.retain(|stage| stage.stage() != "h264.encode");
+        let mut av1 = fields(
+            "av1.encode",
+            &[
+                ("total_us", 16_700),
+                ("state_setup_us", 12_000),
+                ("frame_alloc_us", 100),
+                ("rgb_to_yuv_us", 1_300),
+                ("send_frame_us", 300),
+                ("receive_packet_us", 3_000),
+                ("submitted_sequence", 106),
+                ("emitted_sequence", 100),
+                ("lag_frames", 6),
+                ("encoder_residence_us", 188_000),
+                ("context_generation", 3),
+                ("context_rebuild_us", 12_000),
+                ("emitted_context_generation", 3),
+                ("emitted_context_rebuild_us", 12_000),
+                ("need_more_data_streak", 5),
+                ("encoded_loop_count", 2),
+                ("width", 1_280),
+                ("height", 720),
+                ("input_bytes", 2_764_800),
+                ("output_bytes", 12_288),
+            ],
+        );
+        av1.insert("submitted_forced_keyframe", FieldValue::Bool(true));
+        av1.insert("emitted_forced_keyframe", FieldValue::Bool(true));
+        av1.insert("emitted_keyframe", FieldValue::Bool(true));
+        av1.insert("context_rebuilt", FieldValue::Bool(false));
+        av1.insert("emitted_context_rebuilt", FieldValue::Bool(true));
+        report.record(av1);
+        let transport = report_stage_mut(&mut report, "outgoing.transport");
+        transport.insert("output_gap_us", FieldValue::U64(100_000));
+        transport.insert("keyframe", FieldValue::Bool(true));
+        report.stages.sort_by_key(|stage| stage_rank(stage.stage()));
+        let mut output = String::new();
+
+        render_report(&report, 0, 2.0, false, &mut output).unwrap();
+
+        assert!(output.contains("WIRE OUTPUT GAP"));
+        assert!(output.contains("100.000 ms"));
+        assert!(output.contains("AV1 PROVENANCE"));
+        assert!(output.contains("submit #106 → emit #100"));
+        assert!(output.contains("lag 6 frames"));
+        assert!(output.contains("residence 188.000 ms"));
+        assert!(output.contains("KEYFRAME"));
+        assert!(output.contains("force current=true emitted=true"));
+        assert!(output.contains("context #3 rebuilt in 12.000 ms"));
+        assert!(output.contains("buffered streak 5"));
+        assert!(output.contains("encoded loop count 2"));
+        assert!(output.contains("encoder state setup"));
+        assert!(output.contains("rav1e frame allocation"));
+        assert!(output.contains("rav1e frame submission"));
+        assert!(output.contains("rav1e packet production"));
+    }
+
+    #[test]
+    fn failed_completion_prints_error_text() {
+        let mut report = healthy_report();
+        let complete = report_stage_mut(&mut report, "outgoing.complete");
+        complete.insert("emitted", FieldValue::Bool(false));
+        complete.insert("failed", FieldValue::Bool(true));
+        complete.insert(
+            "error",
+            FieldValue::Text("Some(udp send failed)".to_owned()),
+        );
+        let mut output = String::new();
+
+        render_report(&report, 0, 2.0, false, &mut output).unwrap();
+
+        assert!(output.contains("FAILED  udp send failed"));
+        assert!(output.contains("failed: udp send failed"));
+    }
+
+    #[test]
+    fn outgoing_control_is_compact_without_fake_duration() {
+        let mut control = fields("outgoing.control", &[]);
+        control.insert("kind", FieldValue::Text("Screen".to_owned()));
+        control.insert("action", FieldValue::Text("keyframe_pending".to_owned()));
+        control.insert("codec", FieldValue::Text("Av1".to_owned()));
+        control.insert("reason", FieldValue::Text("periodic".to_owned()));
+        control.insert("emitted", FieldValue::Bool(false));
+        control.insert("keyframe", FieldValue::Bool(false));
+        let mut output = String::new();
+
+        render_single_stage(&control, 2.0, false, &mut output).unwrap();
+
+        assert!(output.contains("VIDEO CONTROL · Screen · keyframe_pending"));
+        assert!(output.contains("codec Av1 · reason periodic · frame #42"));
+        assert!(output.contains("emitted false · keyframe false"));
+        assert!(!output.contains("0.000 ms"));
+    }
+
+    #[test]
+    fn dave_transition_control_exposes_gate_lifecycle() {
+        let mut control = fields("outgoing.control", &[("elapsed_us", 2_500)]);
+        control.insert("kind", FieldValue::Text("DAVE".to_owned()));
+        control.insert(
+            "action",
+            FieldValue::Text("dave_transition_executed".to_owned()),
+        );
+        control.insert("transition_id", FieldValue::U64(17));
+        control.insert("protocol_version", FieldValue::U64(1));
+        control.insert("pending_transitions", FieldValue::U64(0));
+        let mut output = String::new();
+
+        render_single_stage(&control, 2.0, false, &mut output).unwrap();
+
+        assert!(output.contains("DAVE · dave_transition_executed"));
+        assert!(output.contains("transition #17 · protocol v1 · pending 0"));
+        assert!(output.contains("2.500 ms"));
+    }
+
+    #[test]
+    fn decoder_report_splits_decode_allocation_and_conversion() {
+        let mut decode = fields(
+            "h264.decode",
+            &[
+                ("total_us", 4_200),
+                ("decoder_id", 7),
+                ("access_unit_bytes", 36_640),
+                ("width", 1_280),
+                ("height", 720),
+                ("output_bytes", 3_686_400),
+                ("codec_us", 2_100),
+                ("rgba_alloc_us", 400),
+                ("yuv_to_rgba_us", 1_600),
+                ("rgba_us", 2_000),
+            ],
+        );
+        decode.insert("conversion_path", FieldValue::Text("f32x8 SIMD".to_owned()));
+        decode.insert(
+            "decoder_thread_mode",
+            FieldValue::Text("single-thread (OpenH264 num_threads=0)".to_owned()),
+        );
+        decode.insert("emitted", FieldValue::Bool(true));
+        decode.insert("failed", FieldValue::Bool(false));
+        let mut output = String::new();
+
+        render_single_stage(&decode, 2.0, false, &mut output).unwrap();
+
+        assert!(output.contains("OpenH264 decode"));
+        assert!(output.contains("RGBA allocation + zero-fill"));
+        assert!(output.contains("YUV → RGBA conversion"));
+        assert!(output.contains("f32x8 SIMD"));
+        assert!(output.contains("single-thread (OpenH264 num_threads=0)"));
+        assert!(output.contains("decoder #7"));
+        assert!(!output.contains("rgba_us"));
+
+        decode.insert("emitted", FieldValue::Bool(false));
+        decode.insert("failed", FieldValue::Bool(true));
+        decode.insert("error", FieldValue::Text("corrupt bitstream".to_owned()));
+        let mut failed_output = String::new();
+        render_single_stage(&decode, 2.0, false, &mut failed_output).unwrap();
+        assert!(failed_output.contains("failed: corrupt bitstream"));
+        assert!(!failed_output.contains("0×0 RGBA"));
+    }
+
+    #[test]
+    fn incoming_report_shows_sender_and_local_cadence() {
+        let mut incoming = fields(
+            "incoming.receive",
+            &[
+                ("total_us", 4_000),
+                ("ssrc", 123),
+                ("decoder_id", 7),
+                ("stream_frame_index", 8),
+                ("rtp_delta_ticks", 4_500),
+                ("source_interval_us", 50_000),
+                ("access_unit_gap_us", 50_250),
+                ("output_gap_us", 100_500),
+                ("assembly_age_us", 2_000),
+                ("packet_assemble_us", 40),
+                ("receive_bookkeeping_us", 100),
+                ("dave_lock_wait_us", 10),
+                ("dave_decrypt_us", 90),
+                ("dave_decrypt_preflight_us", 20),
+                ("dave_decrypt_transform_us", 70),
+                ("dave_decrypt_attempts", 1),
+                ("decode_us", 3_800),
+            ],
+        );
+        incoming.insert("emitted", FieldValue::Bool(true));
+        let mut output = String::new();
+
+        render_single_stage(&incoming, 2.0, false, &mut output).unwrap();
+
+        assert!(output.contains("SSRC 123"));
+        assert!(output.contains("decoder #7"));
+        assert!(output.contains("receive bookkeeping/NACK"));
+        assert!(output.contains("DAVE decrypt allocation/preflight"));
+        assert!(output.contains("DAVE decrypt transform"));
+        assert!(output.contains("DAVE 1 attempt"));
+        assert!(output.contains("RTP Δ 4500 ticks"));
+        assert!(output.contains("observed RTP AU cadence 20.0 FPS"));
+        assert!(output.contains("AU gap 50.250 ms"));
+        assert!(output.contains("output gap 100.500 ms"));
+
+        incoming.insert("source_interval_us", FieldValue::U64(0));
+        incoming.insert("access_unit_gap_us", FieldValue::U64(0));
+        incoming.insert("output_gap_us", FieldValue::U64(0));
+        let mut first_output = String::new();
+        render_single_stage(&incoming, 2.0, false, &mut first_output).unwrap();
+        assert!(first_output.contains("observed RTP AU cadence n/a (first sample)"));
+        assert!(first_output.contains("AU gap n/a · output gap n/a"));
+        assert!(!first_output.contains("0.0 FPS"));
     }
 
     #[test]

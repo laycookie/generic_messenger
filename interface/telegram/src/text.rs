@@ -7,15 +7,15 @@ use grammers_client::{
 };
 use messenger_interface::{
     interface::{Ordering, Text, TextEvent},
-    stream::{ArcStream, WeakSocketStream},
+    owner::Retained,
+    stream::EventFuture,
     types::{Identifier, Message, Place, Revision, RichText, Room},
 };
 use tracing::warn;
 
 use crate::{
-    BoxError, CachedMessage, ChatTarget, MAX_CACHED_MESSAGES_PER_CHAT, StreamPollGuard,
-    TelegramMessenger, TelegramPeer, TelegramRoom, TelegramState, TelegramUser, WireMessage,
-    message_error,
+    BoxError, CachedMessage, ChatTarget, MAX_CACHED_MESSAGES_PER_CHAT, TelegramMessenger,
+    TelegramPeer, TelegramRoom, TelegramState, TelegramUser, WireMessage, message_error,
     query::{room_identifier, user_identifier},
     telegram_task,
 };
@@ -355,6 +355,27 @@ impl TelegramMessenger {
     fn pop_text_event(&self) -> Option<TextEvent> {
         self.state.lock().unwrap().events.pop_front()
     }
+
+    pub(crate) async fn next_text_event(&self) -> Option<TextEvent> {
+        loop {
+            if let Some(event) = self.pop_text_event() {
+                return Some(event);
+            }
+
+            let result = {
+                let _poll = self.poll_lock.lock().await;
+                if let Some(event) = self.pop_text_event() {
+                    return Some(event);
+                }
+                self.pump_update().await
+            };
+
+            if let Err(error) = result {
+                warn!("Telegram update stream failed: {error}");
+                Delay::new(Duration::from_secs(2)).await;
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -444,44 +465,12 @@ impl Text for TelegramMessenger {
             .ok_or_else(|| "Telegram send response had no text".into())
     }
 
-    async fn listen(
-        self: Arc<Self>,
-    ) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
-        self.ensure_dialogs().await?;
-        Ok(WeakSocketStream::from_arc(self))
+    async fn prepare_listener(&self) -> Result<(), Box<dyn Error + Sync + Send>> {
+        self.ensure_dialogs().await
     }
-}
 
-#[async_trait]
-impl ArcStream for TelegramMessenger {
-    type Item = TextEvent;
-
-    async fn next(self: Arc<Self>) -> Option<Self::Item> {
-        let _stream = StreamPollGuard::new(&self.active_streams);
-        loop {
-            if let Some(event) = self.pop_text_event() {
-                return Some(event);
-            }
-            if self.text_owner_dropped() {
-                return None;
-            }
-
-            let result = {
-                let _poll = self.poll_lock.lock().await;
-                if let Some(event) = self.pop_text_event() {
-                    return Some(event);
-                }
-                if self.text_owner_dropped() {
-                    return None;
-                }
-                self.pump_update().await
-            };
-
-            if let Err(error) = result {
-                warn!("Telegram update stream failed: {error}");
-                Delay::new(Duration::from_secs(2)).await;
-            }
-        }
+    fn next_event(self: Retained<Self>) -> EventFuture<TextEvent> {
+        Box::pin(async move { self.next_text_event().await })
     }
 }
 

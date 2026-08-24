@@ -8,11 +8,15 @@ use std::{
 };
 
 use arc_swap::ArcSwapOption;
+use async_trait::async_trait;
 use dashmap::DashMap;
 use facet::Facet;
 use futures::lock::Mutex as AsyncMutex;
-use futures::{FutureExt as _, channel::oneshot, future, select};
-use messenger_interface::interface::{FrameProducer, VideoBroadcastKind};
+use futures::{FutureExt as _, StreamExt as _, channel::mpsc, channel::oneshot, future, select};
+use messenger_interface::{
+    interface::{AudioEvent, FrameProducer, VideoBroadcastKind},
+    stream::ArcStream,
+};
 use num_enum::TryFromPrimitive;
 use simple_audio_channels::output::SampleProducer as AudioSampleProducer;
 use tracing::{debug, error, trace};
@@ -29,12 +33,15 @@ use self::{
 };
 
 pub(crate) mod audio;
+mod codecs;
 pub(super) mod connection;
 pub(crate) mod coordinator;
 mod dispatcher;
 mod events;
 mod gateway;
 mod payloads;
+
+pub(crate) use codecs::{AtomicDiscordVideoCodec, DiscordAudioCodec, DiscordVideoCodec};
 
 /// Voice gateway protocol version.
 pub(crate) const VOICE_GATEWAY_VERSION: usize = 9;
@@ -99,9 +106,9 @@ impl Endpoint {
 
 /// Which voice connection a gateway handler ([`events::GatewayPayload::exec`])
 /// runs against. The two diverge in exactly two spots: a stream carries remote
-/// *screen share* rather than camera video, and only the call spawns an audio
-/// loop on its first SessionDescription (a stream's media is pumped by the loop
-/// already watching it).
+/// *screen share* rather than camera video, and only the call publishes a
+/// per-call audio source on its first SessionDescription (a stream's media is
+/// pumped by the call's existing coordinator).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionRole {
     Call,
@@ -304,12 +311,91 @@ pub struct MediaGatewaySlot<H> {
 /// connection is decided by the shared media coordinator, not here.
 pub type StreamGateway = MediaGatewaySlot<StreamStatus>;
 
+/// Per-call mixer-handshake source. It owns only its call channel; gateway and
+/// backend ownership stay outside the source.
+pub(crate) struct CallAudioEventStream {
+    receiver: AsyncMutex<mpsc::UnboundedReceiver<AudioEvent>>,
+    closed: AtomicBool,
+}
+
+impl CallAudioEventStream {
+    fn new(receiver: mpsc::UnboundedReceiver<AudioEvent>) -> Self {
+        Self {
+            receiver: AsyncMutex::new(receiver),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
+#[async_trait]
+impl ArcStream for CallAudioEventStream {
+    type Item = AudioEvent;
+
+    async fn next(self: Arc<Self>) -> Option<Self::Item> {
+        if self.is_closed() {
+            return None;
+        }
+
+        let mut receiver = self.receiver.lock().await;
+        if self.is_closed() {
+            return None;
+        }
+
+        let event = receiver.next().await?;
+        (!self.is_closed()).then_some(event)
+    }
+}
+
+/// Strong source retention and producer endpoint for one call generation.
+struct CallAudioEvents {
+    generation: u64,
+    source: Arc<CallAudioEventStream>,
+    sender: mpsc::UnboundedSender<AudioEvent>,
+}
+
+impl CallAudioEvents {
+    fn new(generation: u64) -> Self {
+        let (sender, receiver) = mpsc::unbounded();
+        Self {
+            generation,
+            source: Arc::new(CallAudioEventStream::new(receiver)),
+            sender,
+        }
+    }
+
+    fn close(&self) {
+        self.source.close();
+        self.sender.close_channel();
+    }
+
+    fn submit(&self, event: AudioEvent) -> bool {
+        !self.source.is_closed() && self.sender.unbounded_send(event).is_ok()
+    }
+}
+
+impl Drop for CallAudioEvents {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// A call's primary media connection and every secondary Go Live connection
 /// derived from its voice session. Keeping the slots under one owner makes
 /// leaving or replacing the call tear down all dependent media connections.
 #[derive(Default)]
 pub struct MediaGateway {
     call: MediaGatewaySlot<VoiceStatus>,
+    /// Active call's audio event source. Replacement closes old source before
+    /// publishing a new generation, so reconnect consumers never share a queue.
+    audio_events: ArcSwapOption<CallAudioEvents>,
     pub broadcast: StreamGateway,
     watched_streams: DashMap<StreamKey, Arc<StreamGateway>>,
     watched_poll_cursor: AtomicUsize,
@@ -440,6 +526,63 @@ impl<H: MediaConnectState> MediaGatewaySlot<H> {
 }
 
 impl MediaGateway {
+    fn open_audio_events(&self) -> Arc<CallAudioEvents> {
+        let generation = self.call_generation();
+        if let Some(events) = self.audio_events.load_full()
+            && events.generation == generation
+            && !events.source.is_closed()
+        {
+            return events;
+        }
+
+        let events = Arc::new(CallAudioEvents::new(generation));
+        if let Some(previous) = self.audio_events.swap(Some(events.clone())) {
+            previous.close();
+        }
+        events
+    }
+
+    /// Opens a source only for the call gateway that is still installed. A
+    /// disconnect racing selected voice work cannot resurrect a retired call.
+    pub(crate) fn open_audio_source_for(
+        &self,
+        expected: &Arc<Gateway<Media>>,
+    ) -> Option<Arc<CallAudioEventStream>> {
+        let is_current = || {
+            self.call
+                .load_gateway()
+                .is_some_and(|current| Arc::ptr_eq(&current, expected))
+        };
+        if !is_current() {
+            return None;
+        }
+
+        let events = self.open_audio_events();
+        if is_current() {
+            Some(events.source.clone())
+        } else {
+            events.close();
+            None
+        }
+    }
+
+    fn active_audio_events(&self) -> Option<Arc<CallAudioEvents>> {
+        let events = self.audio_events.load_full()?;
+        (events.generation == self.call_generation() && !events.source.is_closed())
+            .then_some(events)
+    }
+
+    pub(crate) fn submit_audio(&self, event: AudioEvent) -> bool {
+        self.active_audio_events()
+            .is_some_and(|events| events.submit(event))
+    }
+
+    fn close_audio_source(&self) {
+        if let Some(events) = self.audio_events.swap(None) {
+            events.close();
+        }
+    }
+
     pub fn watched_stream(&self, key: &StreamKey) -> Option<Arc<StreamGateway>> {
         self.watched_streams
             .get(key)
@@ -703,11 +846,15 @@ impl MediaGateway {
     }
 
     pub async fn insert_endpoint(&self, endpoint: Endpoint) {
+        self.close_audio_source();
         self.call.insert_endpoint(endpoint).await;
+        self.close_audio_source();
     }
 
     pub async fn insert_session_id(&self, session_id: SessionId) {
+        self.close_audio_source();
         self.call.insert_session_id(session_id).await;
+        self.close_audio_source();
     }
 
     pub async fn session_id(&self) -> Option<SessionId> {
@@ -716,6 +863,7 @@ impl MediaGateway {
 
     /// End the call and every Go Live connection derived from its session.
     pub async fn disconnect(&self) {
+        self.close_audio_source();
         for (key, slot) in self.watched_streams() {
             if let Some(slot) = self.remove_watched_stream_if(&key, &slot) {
                 slot.disconnect().await;
@@ -723,6 +871,7 @@ impl MediaGateway {
         }
         self.broadcast.disconnect().await;
         self.call.disconnect().await;
+        self.close_audio_source();
     }
 }
 
@@ -1009,6 +1158,53 @@ mod tests {
             assert!(voice.watched_stream(&first_key).is_none());
             assert!(voice.watched_stream(&second_key).is_none());
             assert!(voice.broadcast.watching().await.is_none());
+        });
+    }
+
+    #[test]
+    fn audio_source_ends_when_call_disconnects() {
+        smol::block_on(async {
+            let voice = MediaGateway::default();
+            let source = voice.open_audio_events().source.clone();
+
+            let (event, ()) = futures::join!(source.clone().next(), voice.disconnect());
+
+            assert!(event.is_none());
+            assert!(voice.audio_events.load().is_none());
+        });
+    }
+
+    #[test]
+    fn reconnect_audio_source_is_distinct_and_drops_stale_events() {
+        smol::block_on(async {
+            let voice = MediaGateway::default();
+            let first = voice.open_audio_events().source.clone();
+            let (stale_sender, _stale_receiver) = oneshot::channel();
+            assert!(voice.submit_audio(AudioEvent::AddAudioInput(stale_sender)));
+
+            voice.disconnect().await;
+            let second = voice.open_audio_events().source.clone();
+
+            assert!(!Arc::ptr_eq(&first, &second));
+            assert!(first.clone().next().await.is_none());
+
+            let (current_sender, _current_receiver) = oneshot::channel();
+            assert!(voice.submit_audio(AudioEvent::AddAudioInput(current_sender)));
+            assert!(matches!(
+                second.next().await,
+                Some(AudioEvent::AddAudioInput(_))
+            ));
+        });
+    }
+
+    #[test]
+    fn dropping_call_owner_wakes_pending_audio_source() {
+        smol::block_on(async {
+            let voice = MediaGateway::default();
+            let source = voice.open_audio_events().source.clone();
+            drop(voice);
+
+            assert!(source.next().await.is_none());
         });
     }
 

@@ -22,9 +22,9 @@ use futures::{
 };
 use futures_timer::Delay;
 
-use messenger_interface::interface::{
-    ArcStream, Ordering, Query, Text, TextEvent, WeakSocketStream,
-};
+use messenger_interface::interface::{Ordering, Query, Text, TextEvent};
+use messenger_interface::owner::Retained;
+use messenger_interface::stream::EventFuture;
 use messenger_interface::types::{
     Emoji, House, ID, Identifier, Message, Place, Reaction, Revision, Room, RoomCapabilities, User,
 };
@@ -488,24 +488,6 @@ fn chat_message_reactions(
 }
 
 impl SteamMessenger {
-    /// Sleep up to `duration`, waking early (returning `false`) if the app
-    /// dropped its last messenger handle. Lets the live stream terminate
-    /// promptly during a reconnect backoff instead of lingering for the full
-    /// delay. A strong count of 1 means only the in-flight `next` future holds
-    /// the messenger (see [`ArcStream::next`] for `SteamMessenger`).
-    async fn sleep_unless_dropped(self: &Arc<Self>, duration: Duration) -> bool {
-        let mut remaining = duration;
-        while remaining > Duration::ZERO {
-            if Arc::strong_count(self) == 1 {
-                return false;
-            }
-            let step = remaining.min(TEXT_EVENT_IDLE_CHECK);
-            Delay::new(step).await;
-            remaining = remaining.saturating_sub(step);
-        }
-        Arc::strong_count(self) != 1
-    }
-
     pub(crate) async fn load_chat_groups(
         &self,
         connected: &Connected,
@@ -1147,28 +1129,22 @@ impl Text for SteamMessenger {
         ))
     }
 
-    async fn listen(
-        self: Arc<Self>,
-    ) -> Result<WeakSocketStream<TextEvent>, Box<dyn Error + Sync + Send>> {
-        // Establish once so a hard failure (bad credentials) surfaces here.
-        // The stream re-acquires the session via `connected()` on every poll,
-        // so it transparently rides through reconnects after a Steam logoff.
-        self.connected().await?;
-        Ok(WeakSocketStream::from_arc(self))
+    async fn prepare_listener(&self) -> Result<(), Box<dyn Error + Sync + Send>> {
+        self.connected().await.map(|_| ())
+    }
+
+    fn next_event(self: Retained<Self>) -> EventFuture<TextEvent> {
+        Box::pin(async move { self.next_text_event().await })
     }
 }
 
-/// Capped exponential backoff for reconnect attempt `attempt` (1-based):
-/// 1s, 2s, 4s, 8s, 16s, then capped at 30s.
+/// Exponential reconnect backoff capped at 30s.
 fn reconnect_backoff(attempt: u32) -> Duration {
     const CAP: Duration = Duration::from_secs(30);
     Duration::from_secs(1u64 << attempt.saturating_sub(1).min(5)).min(CAP)
 }
 
-/// Record a reconnect attempt and report whether the retry budget is spent.
-/// A failure more than `stable` after the previous one resets the counter, so
-/// only *rapid* repeated failures (a re-kick loop) count toward `max`; a
-/// long-lived session that drops once does not inch toward giving up.
+/// Counts rapid reconnects; stable sessions reset budget.
 fn note_reconnect(
     attempts: &mut u32,
     last_at: &mut Option<Instant>,
@@ -1184,21 +1160,10 @@ fn note_reconnect(
     *attempts > max
 }
 
-/// The live text-event stream is driven by the *messenger*, not a specific
-/// [`Connected`], so it survives a dropped Steam session: when the current
-/// session dies (Steam logoff), `connected()` re-establishes from the saved
-/// refresh token and the loop resumes on the fresh connection. Queries share
-/// the same `connected()`, so they recover too. Terminates only when the app
-/// drops its last `Arc<dyn Messenger>` handle.
-///
-/// Caveat: a raw TCP drop with no `CMsgClientLoggedOff` is *not* detected —
-/// steam-vent exposes no socket-close signal and its broadcast streams go
-/// silent rather than ending, so that case still needs an app restart.
-#[async_trait]
-impl ArcStream for SteamMessenger {
-    type Item = TextEvent;
-
-    async fn next(self: Arc<Self>) -> Option<Self::Item> {
+/// Messenger-owned event loop reconnects after Steam logoff.
+/// Raw TCP death remains undetectable because steam-vent streams go silent.
+impl SteamMessenger {
+    pub(crate) async fn next_text_event(&self) -> Option<TextEvent> {
         const MAX_RECONNECT_ATTEMPTS: u32 = 6;
         const STABLE_SESSION: Duration = Duration::from_secs(60);
 
@@ -1206,12 +1171,6 @@ impl ArcStream for SteamMessenger {
         let mut last_reconnect: Option<Instant> = None;
 
         loop {
-            // Only this in-flight `next` future still holds the messenger →
-            // the app dropped its handle; let `WeakSocketStream` end.
-            if Arc::strong_count(&self) == 1 {
-                return None;
-            }
-
             let connected = match self.connected().await {
                 Ok(connected) => connected,
                 Err(err) => {
@@ -1231,9 +1190,7 @@ impl ArcStream for SteamMessenger {
                         "Steam: reconnect failed ({err}); retrying in {}s (attempt {attempts}/{MAX_RECONNECT_ATTEMPTS})",
                         backoff.as_secs()
                     );
-                    if !self.sleep_unless_dropped(backoff).await {
-                        return None;
-                    }
+                    Delay::new(backoff).await;
                     continue;
                 }
             };
@@ -1242,8 +1199,7 @@ impl ArcStream for SteamMessenger {
                 TextPoll::Text(event) => return Some(event),
                 TextPoll::Idle => continue,
                 TextPoll::Disconnected => {
-                    // `next_text_event` already latched the session dead, so
-                    // the next `connected()` rebuilds it. Bound a re-kick loop.
+                    // Rebuild latched-dead session with bounded retry.
                     if note_reconnect(
                         &mut attempts,
                         &mut last_reconnect,
@@ -1260,9 +1216,7 @@ impl ArcStream for SteamMessenger {
                         "Steam: session disconnected; re-establishing in {}s (attempt {attempts}/{MAX_RECONNECT_ATTEMPTS})",
                         backoff.as_secs()
                     );
-                    if !self.sleep_unless_dropped(backoff).await {
-                        return None;
-                    }
+                    Delay::new(backoff).await;
                     continue;
                 }
             }

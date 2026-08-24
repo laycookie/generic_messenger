@@ -1,18 +1,9 @@
-//! Video feature area ([`Video`]) — webcam and screen-share streams — the
-//! frame channel types, and the realtime [`VideoEvent`]s.
+//! Video lifecycle, frame channels, and realtime events.
 //!
-//! Video is its own feature area, deliberately *not* a sub-capability of
-//! [`Audio`](super::audio::Audio): a backend can offer video streams without
-//! audio calls. Backends that carry both over one connection (e.g. Discord,
-//! where camera video rides the voice call's RTC connection) merge them
-//! internally — `connect` on either trait resolves to the shared session, and
-//! connecting the second feature in the same `location` is a cheap no-op.
-//!
-//! One trait covers every kind of stream a participant can broadcast;
-//! [`VideoBroadcastKind`] says which one a given stream is, so webcam and screen
-//! share don't need parallel APIs.
+//! Video remains independent from audio, though backends may share transport.
+//! [`VideoBroadcastKind`] distinguishes camera and screen streams.
 
-use std::{error::Error, sync::Arc};
+use std::error::Error;
 
 use async_trait::async_trait;
 use futures::channel::oneshot;
@@ -23,11 +14,9 @@ pub use simple_video::{
 
 use super::MessengerError;
 use super::audio::CallStatus;
-use crate::stream::WeakSocketStream;
 use crate::types::{ID, Identifier, Place, Room, VideoBroadcast};
 
-/// What a video stream shows. Backends that support only one kind simply
-/// never emit or accept the other.
+/// Video broadcast content type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VideoBroadcastKind {
     /// Webcam.
@@ -45,12 +34,8 @@ impl From<VideoBroadcastKind> for VideoBroadcast {
     }
 }
 
-/// Opaque identity of one remote video stream.
-///
-/// IDs are scoped to one backend instance. Every simultaneously active stream
-/// must have a distinct ID, including multiple streams owned by the same user.
-/// A stopped and restarted broadcast should receive a fresh ID so delayed
-/// lifecycle events cannot affect its replacement.
+/// Backend-scoped remote stream identity.
+/// Concurrent and restarted streams require distinct IDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VideoStreamId(ID);
 
@@ -64,12 +49,7 @@ impl VideoStreamId {
     }
 }
 
-/// Immutable display and routing context announced for a video stream.
-///
-/// This information does not participate in stream identity. Applications
-/// store it beside [`VideoStreamId`] while the stream is available; backend
-/// subscription methods receive only the ID and resolve native connection
-/// state from their private active-stream registry.
+/// Immutable stream metadata, separate from [`VideoStreamId`] identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VideoStreamMetadata {
     pub user: Option<ID>,
@@ -100,10 +80,7 @@ impl VideoResolution {
     }
 }
 
-/// Application-provided source for one outgoing video broadcast.
-///
-/// `frames_per_second` is both capture cadence and backend encoding target;
-/// `resolution` and `bitrate_bps` are UI-selected encode limits.
+/// Application source and encoding limits for outgoing video.
 #[non_exhaustive]
 pub struct VideoInput {
     pub frames: FrameConsumer,
@@ -128,25 +105,11 @@ impl VideoInput {
     }
 }
 
-/// Video stream lifecycle API.
-///
-/// Mirrors [`Audio`](super::audio::Audio)'s connection shape (`connect` /
-/// `disconnect` / `listen`) so the two feature areas stay symmetric; a
-/// backend sharing one transport implements both on the same session.
-///
-/// Broadcasting is signal-first: `start_video` announces the stream to the
-/// call, and the frames themselves are requested out-of-band via
-/// [`VideoEvent::AddVideoInput`] — the app owns the capture devices, the
-/// backend owns encoding and transport (the same split as microphone audio).
-///
-/// The own mute/deafen flags stay on [`super::AudioSelfVoiceState`]; toggling them
-/// must not affect an active video broadcast, and vice versa.
+/// Video connection, broadcast, and subscription lifecycle.
+/// App owns capture; backend requests frames through [`VideoEvent::AddVideoInput`].
 #[async_trait]
 pub trait Video: Send + Sync {
-    /// Prefer `codec` for future outgoing streams and request a negotiated
-    /// switch for active streams when the backend supports one.
-    ///
-    /// Backends without selectable encoders may ignore this hint.
+    /// Prefers codec for future and active streams when supported.
     async fn set_preferred_codec(
         &self,
         _codec: VideoCodec,
@@ -154,17 +117,13 @@ pub trait Video: Send + Sync {
         Ok(())
     }
 
-    /// Connect to video in `location`. On backends where video shares the
-    /// audio call's connection, this resolves to that session (and is a
-    /// no-op when [`Audio::connect`](super::audio::Audio::connect) already
-    /// established it).
+    /// Connects video, reusing shared audio transport when applicable.
     async fn connect(
         &self,
         location: &Identifier<Place<Room>>,
     ) -> Result<CallStatus, Box<dyn Error + Sync + Send>>;
 
-    /// Disconnect from video in `location`. On a shared connection this ends
-    /// only the video streams, not the audio call.
+    /// Disconnects video without ending shared audio transport.
     async fn disconnect(&self, location: &Identifier<Place<Room>>);
 
     /// Start broadcasting own video of `kind` in `location`.
@@ -181,17 +140,8 @@ pub trait Video: Send + Sync {
         kind: VideoBroadcastKind,
     ) -> Result<(), Box<dyn Error + Sync + Send>>;
 
-    /// Ask the backend to begin receiving an advertised remote stream.
-    ///
-    /// Backends call this only indirectly: they first emit
-    /// [`VideoEvent::VideoStreamAvailable`], the UI presents an explicit watch
-    /// action, and that action calls this method. Protocol details such as a
-    /// Discord Stream Watch or equivalent native subscription stay inside
-    /// the backend. Once delivery begins, the backend emits
-    /// [`VideoEvent::AddVideoStream`].
-    ///
-    /// Backends whose media arrives automatically skip the availability event,
-    /// emit `AddVideoStream` directly, and may keep this default implementation.
+    /// Starts receiving an advertised stream.
+    /// Automatic-delivery backends may skip availability and this method.
     async fn subscribe_video(
         &self,
         _stream: VideoStreamId,
@@ -199,10 +149,7 @@ pub trait Video: Send + Sync {
         Err(Box::new(MessengerError::NotImplemented))
     }
 
-    /// Stop receiving a stream previously started by [`Self::subscribe_video`].
-    /// An adapter may also stop delivery when the app drops the frame consumer,
-    /// but this explicit operation lets UIs release native subscriptions before
-    /// the remote broadcast itself ends.
+    /// Releases a subscription before remote broadcast ends.
     async fn unsubscribe_video(
         &self,
         _stream: VideoStreamId,
@@ -210,50 +157,33 @@ pub trait Video: Send + Sync {
         Err(Box::new(MessengerError::NotImplemented))
     }
 
-    /// Subscribe to video lifecycle and frame-channel handshake events.
-    ///
-    /// This stream carries stream availability plus requests to attach frame
-    /// channels; frame bytes travel through [`frame_channel`], not as
-    /// `VideoEvent` values. Intended for one long-lived consumer per backend.
-    /// The returned weak stream does not keep the backend alive. The default
-    /// reports [`MessengerError::NotImplemented`].
-    async fn listen(
-        self: Arc<Self>,
-    ) -> Result<WeakSocketStream<VideoEvent>, Box<dyn Error + Sync + Send>> {
+    /// Prepare this backend's video event source.
+    async fn prepare_listener(&self) -> Result<(), Box<dyn Error + Sync + Send>> {
         Err(Box::new(MessengerError::NotImplemented))
+    }
+
+    /// Polls next prepared event.
+    fn next_event(self: crate::owner::Retained<Self>) -> crate::stream::EventFuture<VideoEvent> {
+        Box::pin(async { None })
     }
 }
 
 /// Updates about video streams in connected calls.
 pub enum VideoEvent {
-    /// A remote stream exists, but this backend will not deliver its media
-    /// until the app calls [`Video::subscribe_video`] in response to a UI
-    /// action. Repeated advertisements for the same stream are idempotent.
-    ///
-    /// Backends that receive streams automatically do not emit this event;
-    /// they emit [`VideoEvent::AddVideoStream`] when delivery starts.
+    /// Remote stream awaiting explicit subscription; repeats are idempotent.
     VideoStreamAvailable {
         id: VideoStreamId,
         metadata: VideoStreamMetadata,
     },
-    /// A remote stream is now delivering frames. Reply with the producer half
-    /// of a [`frame_channel`] to display it on the consumer half. Apps should
-    /// respond immediately: any user choice already happened at
-    /// [`VideoEvent::VideoStreamAvailable`], when one was required. Metadata
-    /// is included because automatic-delivery backends may skip availability.
+    /// Remote frames started; reply with [`frame_channel`] producer.
     AddVideoStream {
         id: VideoStreamId,
         metadata: VideoStreamMetadata,
         channel: oneshot::Sender<FrameProducer>,
     },
-    /// A remote stream stopped being available. Removes both an unaccepted
-    /// advertisement and an active stream; its frame channel also closes.
+    /// Removes advertised or active remote stream.
     RemoveVideoStream { id: VideoStreamId },
-    /// Request local video input (camera / screen capture) for an own
-    /// broadcast started via [`Video::start_video`]. Reply with the consumer
-    /// half of a [`frame_channel`] plus its capture frame rate and push
-    /// captured frames into the producer; drop the sender to abort the
-    /// broadcast.
+    /// Requests local input for own broadcast; dropping channel aborts it.
     AddVideoInput {
         kind: VideoBroadcastKind,
         channel: oneshot::Sender<VideoInput>,
@@ -265,10 +195,9 @@ mod tests {
     use super::super::Messenger;
     use super::*;
     use crate::auth::{AuthMethod, Credential};
+    use crate::owner::Owner;
 
-    /// Implements only the [`Messenger`] core.
     struct NoVideo;
-    /// Implements the core plus the video feature area.
     struct WithVideo;
 
     macro_rules! impl_messenger_core {
@@ -277,7 +206,7 @@ mod tests {
             impl Messenger for $ty {
                 async fn create_messenger(
                     _: Credential,
-                ) -> Result<Arc<dyn Messenger>, Box<dyn Error + Send + Sync>> {
+                ) -> Result<Owner<dyn Messenger>, Box<dyn Error + Send + Sync>> {
                     unimplemented!()
                 }
                 fn auth_methods() -> &'static [AuthMethod] {
@@ -325,16 +254,22 @@ mod tests {
         }
     }
 
-    /// Same contract as the other feature-area casters: resolution is per
-    /// concrete type and survives erasure to `dyn Messenger`.
     #[test]
     fn video_caster_resolves_by_concrete_type() {
-        let plain: Arc<dyn Messenger> = Arc::new(NoVideo);
+        let plain: Owner<dyn Messenger> = Owner::new(NoVideo);
         assert!(plain.video().is_err());
-        assert!(plain.arc_video().is_err());
+        let plain_retained = plain
+            .downgrade()
+            .retain()
+            .expect("owner must remain active");
+        assert!(plain_retained.retained_video().is_err());
 
-        let video: Arc<dyn Messenger> = Arc::new(WithVideo);
+        let video: Owner<dyn Messenger> = Owner::new(WithVideo);
         assert!(video.video().is_ok());
-        assert!(video.arc_video().is_ok());
+        let video_retained = video
+            .downgrade()
+            .retain()
+            .expect("owner must remain active");
+        assert!(video_retained.retained_video().is_ok());
     }
 }

@@ -16,8 +16,12 @@ use futures::{StreamExt, future::join_all, join, stream};
 use futures_timer::Delay;
 use iced::{Element, Subscription, Task, task::Handle, window};
 use messenger_interface::auth::{Credential, InteractiveAuthSession};
-use messenger_interface::interface::{
-    CallState, CallStatus, MessengerError, QueryEvent, TextEvent, VideoCodec, VoiceEvent,
+use messenger_interface::{
+    interface::{
+        CallState, CallStatus, Messenger, MessengerError, QueryEvent, TextEvent, VideoCodec,
+        VoiceEvent,
+    },
+    owner::Owner,
 };
 use messenger_unifier::{MessengerId, MessengerRegistry};
 use pages::{
@@ -95,6 +99,10 @@ where
     unreachable!("startup retry loop always returns")
 }
 
+fn closed_messenger_error() -> Box<dyn std::error::Error + Send + Sync> {
+    std::io::Error::new(std::io::ErrorKind::NotConnected, "messenger is closed").into()
+}
+
 fn listener_error_is_retryable(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
     !matches!(
         error.downcast_ref::<MessengerError>(),
@@ -105,19 +113,19 @@ fn listener_error_is_retryable(error: &(dyn std::error::Error + Send + Sync + 's
 async fn create_verified_messenger(
     backend_name: &'static str,
     credential: Credential,
-) -> Result<Arc<dyn messenger_interface::interface::Messenger>, String> {
+) -> Result<Owner<dyn Messenger>, String> {
     let Some(backend) = login::backend(backend_name) else {
         return Err(format!("Unknown backend: {backend_name}"));
     };
-    let api = (backend.create)(credential)
+    let owner = (backend.create)(credential)
         .await
         .map_err(|error| error.to_string())?;
-    if let Ok(query) = api.clone().arc_query()
+    if let Ok(query) = owner.get().query()
         && let Err(error) = query.client_user().await
     {
         return Err(error.to_string());
     }
-    Ok(api)
+    Ok(owner)
 }
 
 impl Default for OperationGate {
@@ -243,11 +251,9 @@ struct App {
     /// Backends whose initial REST snapshot was already scheduled. Login and
     /// listener recovery call `StartUp` again; snapshots remain single-shot.
     started_messengers: HashSet<MessengerId>,
-    /// Capability listeners currently starting or streaming. Each route clears
-    /// its own entry on failure/end and retries without duplicating siblings.
+    /// Active listener routes, independently recovered.
     active_listeners: HashSet<(MessengerId, ListenerKind)>,
-    /// Permanently unsupported listener routes. Global startup/recovery must
-    /// not probe default `NotImplemented` methods every time a sibling ends.
+    /// Unsupported routes skipped during sibling recovery.
     disabled_listeners: HashSet<(MessengerId, ListenerKind)>,
     /// Backends whose initial snapshot has committed and may apply live events.
     initialized_messengers: HashSet<MessengerId>,
@@ -414,13 +420,13 @@ impl App {
                         return None;
                     };
                     match (backend.create)(cred).await {
-                        Ok(api) => {
-                            let Ok(query) = api.clone().arc_query() else {
+                        Ok(owner) => {
+                            let Ok(query) = owner.get().query() else {
                                 error!("Restored {name} backend has no query capability");
                                 return None;
                             };
                             match query.client_user().await {
-                                Ok(_) => Some(api),
+                                Ok(_) => Some(owner),
                                 Err(err) => {
                                     error!("Failed to verify restored {name} session: {err}");
                                     None
@@ -494,26 +500,39 @@ impl App {
                 let mut tasks = Vec::new();
                 let mut started_snapshot = false;
                 for (id, entry) in self.messengers.iter() {
-                    let api = entry.interface.api.clone();
-                    let Ok(query) = api.clone().arc_query() else {
+                    let interface = entry.interface.get();
+                    let (has_query, has_text, has_voice, has_video) = (
+                        interface.messenger().query().is_ok(),
+                        interface.messenger().text().is_ok(),
+                        interface.messenger().audio().is_ok(),
+                        interface.messenger().video().is_ok(),
+                    );
+                    if !has_query {
                         error!("Query not impl");
                         continue;
-                    };
-                    let Ok(text) = api.clone().arc_text() else {
+                    }
+                    if !has_text {
                         error!("Text not impl");
                         continue;
                     };
 
-                    // Register each socket independently of both REST startup
-                    // and other capabilities. End markers clear only their own
-                    // route and schedule recovery; sibling routes keep draining.
+                    // Start and recover each capability stream independently.
                     if !self.disabled_listeners.contains(&(id, ListenerKind::Query))
                         && self.active_listeners.insert((id, ListenerKind::Query))
                     {
-                        let stream_query = query.clone();
+                        let Some(stream_interface) = self.messengers.with_interface_async(
+                            id,
+                            async |interface| interface.listen_query().await,
+                        ) else {
+                            continue;
+                        };
                         tasks.push(
-                            Task::future(async move { stream_query.listen().await }).then(
-                                move |result| match result {
+                            Task::future(async move {
+                                stream_interface
+                                    .await
+                                    .unwrap_or_else(|| Err(closed_messenger_error()))
+                            })
+                                .then(move |result| match result {
                                     Ok(socket) => Task::stream(
                                         socket
                                             .map(move |event| AppMessage::QueryEvent((id, event)))
@@ -535,16 +554,25 @@ impl App {
                                             retry,
                                         })
                                     }
-                                },
-                            ),
+                                }),
                         );
                     }
                     if !self.disabled_listeners.contains(&(id, ListenerKind::Text))
                         && self.active_listeners.insert((id, ListenerKind::Text))
                     {
-                        tasks.push(Task::future(async move { text.listen().await }).then(
-                            move |result| {
-                                match result {
+                        let Some(stream_interface) = self.messengers.with_interface_async(
+                            id,
+                            async |interface| interface.listen_text().await,
+                        ) else {
+                            continue;
+                        };
+                        tasks.push(
+                            Task::future(async move {
+                                stream_interface
+                                    .await
+                                    .unwrap_or_else(|| Err(closed_messenger_error()))
+                            }).then(
+                                move |result| match result {
                                     Ok(socket) => Task::stream(
                                         socket
                                             .map(move |event| AppMessage::TextEvent((id, event)))
@@ -566,21 +594,29 @@ impl App {
                                             retry,
                                         })
                                     }
-                                }
-                            },
-                        ));
+                                },
+                            ),
+                        );
                     }
 
-                    let voice = api.clone().arc_audio().ok();
-                    let video = api.arc_video().ok();
                     let preferred_video_codec = self.preferred_video_codec;
-                    if let Some(voice) = voice
+                    if has_voice
                         && !self.disabled_listeners.contains(&(id, ListenerKind::Voice))
                         && self.active_listeners.insert((id, ListenerKind::Voice))
                     {
-                        tasks.push(Task::future(async move { voice.listen().await }).then(
-                            move |result| {
-                                match result {
+                        let Some(stream_interface) = self.messengers.with_interface_async(
+                            id,
+                            async |interface| interface.listen_voice().await,
+                        ) else {
+                            continue;
+                        };
+                        tasks.push(
+                            Task::future(async move {
+                                stream_interface
+                                    .await
+                                    .unwrap_or_else(|| Err(closed_messenger_error()))
+                            })
+                                .then(move |result| match result {
                                     Ok(socket) => Task::stream(
                                         socket
                                             .map(move |event| AppMessage::VoiceEvent((id, event)))
@@ -602,18 +638,26 @@ impl App {
                                             retry,
                                         })
                                     }
-                                }
-                            },
-                        ));
+                                }),
+                        );
                     }
-                    if let Some(video) = video
+                    if has_video
                         && !self.disabled_listeners.contains(&(id, ListenerKind::Video))
                         && self.active_listeners.insert((id, ListenerKind::Video))
                     {
+                        let Some(stream_interface) = self.messengers.with_interface_async(
+                            id,
+                            async move |interface| {
+                                interface.listen_video(preferred_video_codec).await
+                            },
+                        ) else {
+                            continue;
+                        };
                         tasks.push(
                             Task::future(async move {
-                                video.set_preferred_codec(preferred_video_codec).await?;
-                                video.listen().await
+                                stream_interface
+                                    .await
+                                    .unwrap_or_else(|| Err(closed_messenger_error()))
                             })
                             .then(move |result| match result {
                                 Ok(socket) => Task::stream(
@@ -643,28 +687,76 @@ impl App {
 
                     if self.started_messengers.insert(id) {
                         started_snapshot = true;
-                        let profile_query = query.clone();
-                        let contacts_query = query.clone();
-                        let rooms_query = query.clone();
+                        let Some(profile) = self.messengers.with_interface_async(
+                            id,
+                            async |interface| {
+                                retry_startup_request("profile", || async {
+                                    let query = interface
+                                        .messenger()
+                                        .query()
+                                        .map_err(|error| error.to_string())?;
+                                    query.client_user().await.map_err(|error| error.to_string())
+                                })
+                                .await
+                            },
+                        ) else {
+                            continue;
+                        };
+                        let Some(contacts) = self.messengers.with_interface_async(
+                            id,
+                            async |interface| {
+                                retry_startup_request("contacts", || async {
+                                    let query = interface
+                                        .messenger()
+                                        .query()
+                                        .map_err(|error| error.to_string())?;
+                                    query.contacts().await.map_err(|error| error.to_string())
+                                })
+                                .await
+                            },
+                        ) else {
+                            continue;
+                        };
+                        let Some(conversations) = self.messengers.with_interface_async(
+                            id,
+                            async |interface| {
+                                retry_startup_request("rooms", || async {
+                                    let query = interface
+                                        .messenger()
+                                        .query()
+                                        .map_err(|error| error.to_string())?;
+                                    query.rooms().await.map_err(|error| error.to_string())
+                                })
+                                .await
+                            },
+                        ) else {
+                            continue;
+                        };
+                        let Some(servers) = self.messengers.with_interface_async(
+                            id,
+                            async |interface| {
+                                retry_startup_request("houses", || async {
+                                    let query = interface
+                                        .messenger()
+                                        .query()
+                                        .map_err(|error| error.to_string())?;
+                                    query.houses().await.map_err(|error| error.to_string())
+                                })
+                                .await
+                            },
+                        ) else {
+                            continue;
+                        };
                         tasks.push(
                             Task::future(async move {
-                                join!(
-                                    retry_startup_request("profile", move || {
-                                        let query = profile_query.clone();
-                                        async move { query.client_user().await }
-                                    }),
-                                    retry_startup_request("contacts", move || {
-                                        let query = contacts_query.clone();
-                                        async move { query.contacts().await }
-                                    }),
-                                    retry_startup_request("rooms", move || {
-                                        let query = rooms_query.clone();
-                                        async move { query.rooms().await }
-                                    }),
-                                    retry_startup_request("houses", move || {
-                                        let query = query.clone();
-                                        async move { query.houses().await }
-                                    })
+                                let (profile, contacts, conversations, servers) =
+                                    join!(profile, contacts, conversations, servers);
+                                (
+                                    profile.unwrap_or_else(|| Err("messenger closed".to_owned())),
+                                    contacts.unwrap_or_else(|| Err("messenger closed".to_owned())),
+                                    conversations
+                                        .unwrap_or_else(|| Err("messenger closed".to_owned())),
+                                    servers.unwrap_or_else(|| Err("messenger closed".to_owned())),
                                 )
                             })
                             .then(
@@ -969,16 +1061,25 @@ impl App {
                     // Reset/removal won while subscribe was in flight. Issue a
                     // post-completion unsubscribe so request ordering cannot
                     // resurrect a native subscription with no UI consumer.
-                    let Some(entry) = self.messengers.get(messenger) else {
+                    let Some(unsubscribe) = self.messengers.with_interface_async(
+                        messenger,
+                        async move |interface| {
+                            let video = interface
+                                .messenger()
+                                .video()
+                                .map_err(|err| err.to_string())?;
+                            video
+                                .unsubscribe_video(stream)
+                                .await
+                                .map_err(|err| err.to_string())
+                        },
+                    ) else {
                         return Task::none();
                     };
-                    let api = entry.interface.api.clone();
                     return Task::future(async move {
-                        let video = api.video().map_err(|err| err.to_string())?;
-                        video
-                            .unsubscribe_video(stream)
+                        unsubscribe
                             .await
-                            .map_err(|err| err.to_string())
+                            .unwrap_or_else(|| Err("messenger closed".to_owned()))
                     })
                     .then(|result| match result {
                         Ok(()) => Task::none(),
@@ -1255,21 +1356,39 @@ impl App {
                         return Task::none();
                     }
                     self.preferred_video_codec = codec;
-                    Task::batch(self.messengers.iter().filter_map(|(_, entry)| {
-                        let video = entry.interface.api.clone().arc_video().ok()?;
-                        let name = entry.interface.name().to_owned();
-                        Some(
-                            Task::future(async move {
-                                video.set_preferred_codec(codec).await.map_err(|err| {
-                                    format!("Failed to select {codec:?} video on {name}: {err}")
-                                })
-                            })
-                            .then(|result| match result {
-                                Ok(()) => Task::none(),
-                                Err(error) => Task::done(AppMessage::MediaError(error)),
+                    Task::batch(
+                        self.messengers
+                            .iter()
+                            .filter(|(_, entry)| entry.interface.messenger().video().is_ok())
+                            .filter_map(|(id, entry)| {
+                                let name = entry.interface.name().to_owned();
+                                let set_codec = self.messengers.with_interface_async(
+                                    id,
+                                    async move |interface| {
+                                        let video = interface
+                                            .messenger()
+                                            .video()
+                                            .map_err(|err| err.to_string())?;
+                                        video.set_preferred_codec(codec).await.map_err(|err| {
+                                            format!(
+                                                "Failed to select {codec:?} video on {name}: {err}"
+                                            )
+                                        })
+                                    },
+                                )?;
+                                Some(
+                                    Task::future(async move {
+                                        set_codec.await.unwrap_or_else(|| {
+                                            Err("messenger closed".to_owned())
+                                        })
+                                    })
+                                    .then(|result| match result {
+                                        Ok(()) => Task::none(),
+                                        Err(error) => Task::done(AppMessage::MediaError(error)),
+                                    }),
+                                )
                             }),
-                        )
-                    }))
+                    )
                 }
                 settings::Message::ResetVideo => {
                     let subscriptions = self.remote_video.owned_subscriptions().collect::<Vec<_>>();
@@ -1291,7 +1410,7 @@ impl App {
                                 .into_iter()
                                 .map(|kind| {
                                     (
-                                        entry.interface.api.clone(),
+                                        entry.interface.id,
                                         call.source().swap_data((**call.source()).clone()),
                                         (entry.interface.id, call.id(), kind),
                                         kind,
@@ -1301,7 +1420,7 @@ impl App {
                         })
                         .collect::<Vec<_>>();
                     let mut tasks = Vec::with_capacity(stop_requests.len() + subscriptions.len());
-                    for (api, room, operation, kind) in stop_requests {
+                    for (messenger, room, operation, kind) in stop_requests {
                         let call_operation = (operation.0, operation.1);
                         let call_gate = self
                             .call_operations
@@ -1316,19 +1435,25 @@ impl App {
                             })
                             .clone();
                         let generation = gate.begin();
+                        let Some(stop) = self.messengers.with_interface_async(
+                            messenger,
+                            async move |interface| match interface.messenger().video() {
+                                Ok(video) => video
+                                    .stop_video(&room, kind)
+                                    .await
+                                    .map_err(|err| err.to_string()),
+                                Err(err) => Err(err.to_string()),
+                            },
+                        ) else {
+                            continue;
+                        };
                         tasks.push(
                             Task::future(async move {
                                 let _guard = gate.lock.lock().await;
                                 if !gate.is_current(generation) {
                                     return None;
                                 }
-                                Some(match api.video() {
-                                    Ok(video) => video
-                                        .stop_video(&room, kind)
-                                        .await
-                                        .map_err(|err| err.to_string()),
-                                    Err(err) => Err(err.to_string()),
-                                })
+                                stop.await
                             })
                             .then(|result| match result {
                                 Some(Err(error)) => Task::done(AppMessage::MediaError(error)),
@@ -1337,15 +1462,24 @@ impl App {
                         );
                     }
                     tasks.extend(subscriptions.into_iter().filter_map(|(messenger, stream)| {
-                        let entry = self.messengers.get(messenger)?;
-                        let api = entry.interface.api.clone();
-                        Some(
-                            Task::future(async move {
-                                let video = api.video().map_err(|err| err.to_string())?;
+                        let unsubscribe = self.messengers.with_interface_async(
+                            messenger,
+                            async move |interface| {
+                                let video = interface
+                                    .messenger()
+                                    .video()
+                                    .map_err(|err| err.to_string())?;
                                 video
                                     .unsubscribe_video(stream)
                                     .await
                                     .map_err(|err| err.to_string())
+                            },
+                        )?;
+                        Some(
+                            Task::future(async move {
+                                unsubscribe
+                                    .await
+                                    .unwrap_or_else(|| Err("messenger closed".to_owned()))
                             })
                             .then(|result| match result {
                                 Ok(()) => Task::none(),
@@ -1486,9 +1620,11 @@ impl App {
                 messenger::Action::ModifyMessengerData { id, modify } => {
                     Task::done(AppMessage::modify_data(id, modify))
                 }
-                messenger::Action::Call { interface, channel } => {
-                    let api = interface.api.clone();
-                    let messenger_id = interface.id;
+                messenger::Action::Call { messenger, channel } => {
+                    let messenger_id = messenger;
+                    if self.messengers.get(messenger_id).is_none() {
+                        return Task::none();
+                    }
                     let room_id = *channel.id();
                     let operation = (messenger_id, room_id);
                     let gate = self
@@ -1516,29 +1652,37 @@ impl App {
                     }
                     let room = channel.swap_data((*channel).clone());
                     let preferred_video_codec = self.preferred_video_codec;
+                    let Some(connect) = self.messengers.with_interface_async(
+                        messenger_id,
+                        async move |interface| {
+                            if let Ok(video) = interface.messenger().video() {
+                                video
+                                    .set_preferred_codec(preferred_video_codec)
+                                    .await
+                                    .map_err(|err| {
+                                        format!(
+                                            "Failed to select {preferred_video_codec:?} video: {err}"
+                                        )
+                                    })?;
+                            }
+                            let vc = interface
+                                .messenger()
+                                .audio()
+                                .map_err(|err| format!("Voice not supported: {err:?}"))?;
+                            vc.connect(&room)
+                                .await
+                                .map_err(|err| format!("Failed to connect voice: {err}"))
+                        },
+                    ) else {
+                        return Task::none();
+                    };
                     Task::future(async move {
                         let guard = gate.lock.lock().await;
                         let result = if gate.is_current(generation) {
                             Some(
-                                async {
-                                    if let Ok(video) = api.video() {
-                                        video
-                                            .set_preferred_codec(preferred_video_codec)
-                                            .await
-                                            .map_err(|err| {
-                                                format!(
-                                                    "Failed to select {preferred_video_codec:?} video: {err}"
-                                                )
-                                            })?;
-                                    }
-                                    let vc = api
-                                        .audio()
-                                        .map_err(|err| format!("Voice not supported: {err:?}"))?;
-                                    vc.connect(&room)
-                                        .await
-                                        .map_err(|err| format!("Failed to connect voice: {err}"))
-                                }
-                                .await,
+                                connect
+                                    .await
+                                    .unwrap_or_else(|| Err("messenger closed".to_owned())),
                             )
                         } else {
                             None
@@ -1560,11 +1704,10 @@ impl App {
                         "Requesting call state: muted={} deafened={}",
                         state.muted, state.deafened
                     );
-                    let Some(entry) = self.messengers.get(call.messenger_id()) else {
-                        return Task::none();
-                    };
-                    let api = entry.interface.api.clone();
                     let operation = (call.messenger_id(), call.id());
+                    if self.messengers.get(operation.0).is_none() {
+                        return Task::none();
+                    }
                     let call_gate = self
                         .call_operations
                         .entry(operation)
@@ -1588,10 +1731,14 @@ impl App {
                     self.audio_controls.set_deafened(state.deafened);
 
                     let room = call.source().swap_data((**call.source()).clone());
-                    Task::future(async move {
-                        let guard = gate.lock.lock().await;
-                        let result = if gate.is_current(generation) {
-                            Some(match api.audio().and_then(|voice| voice.self_state()) {
+                    let Some(set_state) = self.messengers.with_interface_async(
+                        operation.0,
+                        async move |interface| {
+                            match interface
+                                .messenger()
+                                .audio()
+                                .and_then(|voice| voice.self_state())
+                            {
                                 Ok(voice) => voice
                                     .set_self_voice_state(&room, state)
                                     .await
@@ -1599,7 +1746,19 @@ impl App {
                                 Err(err) => {
                                     Err(format!("Setting call state not supported: {err:#?}"))
                                 }
-                            })
+                            }
+                        },
+                    ) else {
+                        return Task::none();
+                    };
+                    Task::future(async move {
+                        let guard = gate.lock.lock().await;
+                        let result = if gate.is_current(generation) {
+                            Some(
+                                set_state
+                                    .await
+                                    .unwrap_or_else(|| Err("messenger closed".to_owned())),
+                            )
                         } else {
                             None
                         };
@@ -1652,7 +1811,7 @@ impl App {
                         None => self.video_inputs.remove(&input_key),
                     };
 
-                    let Some(entry) = self.messengers.get(call.messenger_id()) else {
+                    if self.messengers.get(call.messenger_id()).is_none() {
                         match previous {
                             Some(input) => {
                                 self.video_inputs.insert(input_key, input);
@@ -1662,27 +1821,41 @@ impl App {
                             }
                         }
                         return Task::none();
-                    };
-                    let api = entry.interface.api.clone();
+                    }
                     let preferred_video_codec = self.preferred_video_codec;
 
                     let room = call.source().swap_data((**call.source()).clone());
+                    let Some(toggle) = self.messengers.with_interface_async(
+                        call.messenger_id(),
+                        async move |interface| match interface.messenger().video() {
+                            Ok(video) => {
+                                if enabled {
+                                    video
+                                        .set_preferred_codec(preferred_video_codec)
+                                        .await
+                                        .map_err(|err| {
+                                            format!("Failed to toggle {kind:?} video: {err:#?}")
+                                        })?;
+                                    video.start_video(&room, kind).await.map_err(|err| {
+                                        format!("Failed to toggle {kind:?} video: {err:#?}")
+                                    })
+                                } else {
+                                    video.stop_video(&room, kind).await.map_err(|err| {
+                                        format!("Failed to toggle {kind:?} video: {err:#?}")
+                                    })
+                                }
+                            }
+                            Err(err) => Err(format!("Video not supported: {err:#?}")),
+                        },
+                    ) else {
+                        return Task::none();
+                    };
                     Task::future(async move {
                         let guard = gate.lock.lock().await;
                         let result = if gate.is_current(generation) {
-                            match api.video() {
-                                Ok(video) => async {
-                                    if enabled {
-                                        video.set_preferred_codec(preferred_video_codec).await?;
-                                        video.start_video(&room, kind).await
-                                    } else {
-                                        video.stop_video(&room, kind).await
-                                    }
-                                }
+                            toggle
                                 .await
-                                .map_err(|err| format!("Failed to toggle {kind:?} video: {err}")),
-                                Err(err) => Err(format!("Video not supported: {err:#?}")),
-                            }
+                                .unwrap_or_else(|| Err("Messenger closed".to_owned()))
                         } else {
                             Ok(())
                         };
@@ -1698,21 +1871,25 @@ impl App {
                 }
                 messenger::Action::SubscribeVideo { messenger, stream } => {
                     let key = (messenger, stream);
-                    let Some(entry) = self.messengers.get(messenger) else {
-                        return Task::none();
-                    };
-                    let api = entry.interface.api.clone();
-                    let Some(generation) = self.remote_video.begin_subscription(&key) else {
-                        return Task::none();
-                    };
-                    Task::future(async move {
-                        let result = match api.video() {
+                    let Some(subscribe) = self.messengers.with_interface_async(
+                        messenger,
+                        async move |interface| match interface.messenger().video() {
                             Ok(video) => video
                                 .subscribe_video(stream)
                                 .await
                                 .map_err(|err| err.to_string()),
                             Err(err) => Err(err.to_string()),
-                        };
+                        },
+                    ) else {
+                        return Task::none();
+                    };
+                    let Some(generation) = self.remote_video.begin_subscription(&key) else {
+                        return Task::none();
+                    };
+                    Task::future(async move {
+                        let result = subscribe
+                            .await
+                            .unwrap_or_else(|| Err("messenger closed".to_owned()));
                         AppMessage::VideoSubscriptionResult {
                             messenger,
                             stream,
@@ -1735,10 +1912,9 @@ impl App {
                         .or_insert_with(|| Arc::new(OperationGate::default()))
                         .clone();
                     let call_generation = call_gate.begin();
-                    let Some(entry) = self.messengers.get(messenger_id) else {
+                    if self.messengers.get(messenger_id).is_none() {
                         return Task::none();
-                    };
-                    let api = entry.interface.api.clone();
+                    }
                     let room = call.source().swap_data((**call.source()).clone());
 
                     // Remove immediately. A reconnect can be requested while
@@ -1764,28 +1940,42 @@ impl App {
                         let video_generation = video_gate.begin();
                         (video_operation, kind, video_gate, video_generation)
                     });
+                    let call_gate_state = call_gate.clone();
+                    let Some(disconnect) = self.messengers.with_interface_async(
+                        messenger_id,
+                        async move |interface| {
+                            let mut errors = Vec::new();
+                            for (_, kind, video_gate, video_generation) in video_operations {
+                                if video_gate.is_current(video_generation)
+                                    && let Err(error) = match interface.messenger().video() {
+                                        Ok(video) => video
+                                            .stop_video(&room, kind)
+                                            .await
+                                            .map_err(|err| err.to_string()),
+                                        Err(err) => Err(err.to_string()),
+                                    }
+                                {
+                                    errors.push(error);
+                                }
+                            }
+                            if call_gate_state.is_current(call_generation) {
+                                match interface.messenger().audio() {
+                                    Ok(vc) => vc.disconnect(&room).await,
+                                    Err(err) => {
+                                        errors.push(format!("Voice not supported: {err:#?}"))
+                                    }
+                                }
+                            }
+                            errors
+                        },
+                    ) else {
+                        return Task::none();
+                    };
                     Task::future(async move {
                         let guard = call_gate.lock.lock().await;
-                        let mut errors = Vec::new();
-                        for (_, kind, video_gate, video_generation) in video_operations {
-                            if video_gate.is_current(video_generation)
-                                && let Err(error) = match api.video() {
-                                    Ok(video) => video
-                                        .stop_video(&room, kind)
-                                        .await
-                                        .map_err(|err| err.to_string()),
-                                    Err(err) => Err(err.to_string()),
-                                }
-                            {
-                                errors.push(error);
-                            }
-                        }
-                        if call_gate.is_current(call_generation) {
-                            match api.audio() {
-                                Ok(vc) => vc.disconnect(&room).await,
-                                Err(err) => errors.push(format!("Voice not supported: {err:#?}")),
-                            }
-                        }
+                        let errors = disconnect
+                            .await
+                            .unwrap_or_else(|| vec!["messenger closed".to_owned()]);
                         drop(guard);
                         AppMessage::CallDisconnectResult {
                             key: operation,

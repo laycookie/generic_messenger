@@ -1,3 +1,5 @@
+#![feature(arbitrary_self_types)]
+
 //! Text-only Telegram user-client adapter.
 //!
 //! Uses Telegram's MTProto API through `grammers`. Login is interactive:
@@ -12,10 +14,7 @@ use std::{
     future::Future,
     hash::Hasher as _,
     path::{Component, Path, PathBuf},
-    sync::{
-        Arc, LazyLock, Mutex, Weak,
-        atomic::{AtomicUsize, Ordering, fence},
-    },
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
@@ -35,6 +34,7 @@ use grammers_session::{
 use messenger_interface::{
     auth::{AuthMethod, Credential, CredentialField, CredentialSchema},
     interface::{Messenger, QueryEvent, TextEvent},
+    owner::Owner,
     types::{ID, Revision},
 };
 use secure_string::SecureString;
@@ -69,7 +69,7 @@ static PENDING_LOGINS: LazyLock<Mutex<HashMap<ID, PendingLogin>>> =
 pub struct Telegram;
 
 impl Telegram {
-    pub async fn create_messenger(cred: Credential) -> Result<Arc<dyn Messenger>, BoxError> {
+    pub async fn create_messenger(cred: Credential) -> Result<Owner<dyn Messenger>, BoxError> {
         <TelegramMessenger as Messenger>::create_messenger(cred).await
     }
 
@@ -291,8 +291,6 @@ pub(crate) struct TelegramMessenger {
     state: Mutex<TelegramState>,
     dialog_lock: AsyncMutex<()>,
     poll_lock: AsyncMutex<()>,
-    query_stream: Mutex<Option<Arc<TelegramQueryStream>>>,
-    active_streams: AtomicUsize,
 }
 
 impl TelegramMessenger {
@@ -301,12 +299,12 @@ impl TelegramMessenger {
         api_hash: String,
         session_path: PathBuf,
         bundle: ClientBundle,
-    ) -> Result<Arc<dyn Messenger>, BoxError> {
+    ) -> Result<Owner<dyn Messenger>, BoxError> {
         let client = bundle.client.clone();
         let me = telegram_task(async move { client.get_me().await }).await??;
         let me = TelegramUser::from_user(&me);
 
-        Ok(Arc::new(Self {
+        let owner: Owner<dyn Messenger> = Owner::new(Self {
             api_id,
             api_hash: api_hash.into(),
             session_path,
@@ -321,16 +319,15 @@ impl TelegramMessenger {
             state: Mutex::new(TelegramState::default()),
             dialog_lock: AsyncMutex::new(()),
             poll_lock: AsyncMutex::new(()),
-            query_stream: Mutex::new(None),
-            active_streams: AtomicUsize::new(0),
-        }))
+        });
+        Ok(owner)
     }
 
     async fn restore(
         api_id: SecureString,
         api_hash: SecureString,
         session: SecureString,
-    ) -> Result<Arc<dyn Messenger>, BoxError> {
+    ) -> Result<Owner<dyn Messenger>, BoxError> {
         let api_id = parse_api_id(&api_id)?;
         let api_hash = parse_api_hash(&api_hash)?;
         let session_path = PathBuf::from(session.unsecure().trim());
@@ -355,7 +352,7 @@ impl TelegramMessenger {
         phone: SecureString,
         code: Option<SecureString>,
         password: Option<SecureString>,
-    ) -> Result<Arc<dyn Messenger>, BoxError> {
+    ) -> Result<Owner<dyn Messenger>, BoxError> {
         let api_id = parse_api_id(&api_id)?;
         let api_hash = parse_api_hash(&api_hash)?;
         let phone = parse_phone(&phone)?;
@@ -411,7 +408,7 @@ impl TelegramMessenger {
     async fn continue_login(
         attempt: LoginAttempt,
         pending: PendingLogin,
-    ) -> Result<Arc<dyn Messenger>, BoxError> {
+    ) -> Result<Owner<dyn Messenger>, BoxError> {
         let LoginAttempt {
             key,
             api_id,
@@ -578,23 +575,11 @@ impl TelegramMessenger {
             .copied()
             .ok_or_else(|| message_error("No Telegram peer reference for this room"))
     }
-
-    pub(crate) fn text_owner_dropped(self: &Arc<Self>) -> bool {
-        let active = self.active_streams.load(Ordering::SeqCst);
-        fence(Ordering::SeqCst);
-        Arc::strong_count(self) <= active + 1
-    }
-
-    pub(crate) fn query_owner_dropped(self: &Arc<Self>) -> bool {
-        let active = self.active_streams.load(Ordering::SeqCst);
-        fence(Ordering::SeqCst);
-        Arc::strong_count(self) <= active
-    }
 }
 
 #[async_trait]
 impl Messenger for TelegramMessenger {
-    async fn create_messenger(cred: Credential) -> Result<Arc<dyn Messenger>, BoxError> {
+    async fn create_messenger(cred: Credential) -> Result<Owner<dyn Messenger>, BoxError> {
         match TelegramAuth::try_from(cred)? {
             TelegramAuth::UserLogin {
                 api_id,
@@ -632,26 +617,6 @@ impl Messenger for TelegramMessenger {
             CredentialField::new("api_hash", self.api_hash.clone()),
             CredentialField::new("session", self.session_path.to_string_lossy().into_owned()),
         ])
-    }
-}
-
-pub(crate) struct TelegramQueryStream {
-    pub(crate) owner: Weak<TelegramMessenger>,
-}
-
-pub(crate) struct StreamPollGuard<'a>(&'a AtomicUsize);
-
-impl<'a> StreamPollGuard<'a> {
-    pub(crate) fn new(counter: &'a AtomicUsize) -> Self {
-        fence(Ordering::SeqCst);
-        counter.fetch_add(1, Ordering::SeqCst);
-        Self(counter)
-    }
-}
-
-impl Drop for StreamPollGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

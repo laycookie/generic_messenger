@@ -1,30 +1,20 @@
-//! Main gateway ownership and backend stream lifecycle.
+//! Main gateway ownership and connection initialization.
 
-use std::{
-    pin::pin,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    task::Poll,
-};
+use std::sync::Arc;
 
-use asyncs_sync::Notify;
-use futures::{future::poll_fn, lock::Mutex};
+use arc_swap::ArcSwapOption;
+use futures_locks::Mutex;
 
 use super::{Gateway, Handshake as _, Handshaking, general::General};
-use crate::{Capabilities, Intents, lazy_arc::LazyArc, rest_api::DiscordApi};
+use crate::{Capabilities, Intents, rest_api::DiscordApi};
 
-/// Sole owner of main-gateway configuration and backend stream lifecycle.
+/// Sole owner of main-gateway configuration and connection state.
 pub(crate) struct GatewaySupervisor {
     intents: Intents,
     capabilities: Capabilities,
-    pub(crate) current: LazyArc<Gateway<General>>,
-    /// Serializes selecting and fully executing one gateway turn. Event
-    /// listeners may cancel while waiting for this lock or for a websocket
-    /// frame, but retain the guard after a frame is consumed so dispatch can
-    /// never overlap or be abandoned halfway through.
+    pub(crate) current: ArcSwapOption<Gateway<General>>,
+    /// Serializes gateway turns; owned guard follows committed work.
     pub(crate) turn: Mutex<()>,
-    pub(crate) killed: AtomicBool,
-    pub(crate) kill_notify: Notify,
-    pub(crate) active_streams: AtomicUsize,
 }
 
 impl GatewaySupervisor {
@@ -32,11 +22,8 @@ impl GatewaySupervisor {
         Self {
             intents,
             capabilities,
-            current: Default::default(),
+            current: ArcSwapOption::empty(),
             turn: Mutex::new(()),
-            killed: AtomicBool::new(false),
-            kill_notify: Default::default(),
-            active_streams: AtomicUsize::new(0),
         }
     }
 
@@ -44,48 +31,27 @@ impl GatewaySupervisor {
         &self,
         api: &DiscordApi,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.killed.load(Ordering::Acquire) {
-            return Err("messenger was dropped".into());
+        // Teardown unpublishes while holding `turn`.
+        if self.current.load().is_some() {
+            return Ok(());
         }
-        self.current
-            .get_or_try_init(async || {
-                Gateway::<General, Handshaking>::new(
-                    api.token(),
-                    self.intents.bits(),
-                    self.capabilities.bits(),
-                )
-                .await?
-                .handshake()
-                .await
-            })
-            .await?;
+
+        // Recheck after shared turn/initialization permit.
+        let _permit = self.turn.lock().await;
+        if self.current.load().is_some() {
+            return Ok(());
+        }
+
+        let gateway = Gateway::<General, Handshaking>::new(
+            api.token(),
+            self.intents.bits(),
+            self.capabilities.bits(),
+        )
+        .await?
+        .handshake()
+        .await?;
+        self.current.store(Some(Arc::new(gateway)));
         Ok(())
-    }
-
-    pub(crate) fn kill(&self) {
-        self.killed.store(true, Ordering::Release);
-        self.current.store(None);
-        self.kill_notify.notify_all();
-    }
-
-    pub(crate) async fn killed_signal(&self) {
-        if self.killed.load(Ordering::Acquire) {
-            return;
-        }
-        let mut notified = pin!(self.kill_notify.notified());
-        poll_fn(|cx| {
-            if self.killed.load(Ordering::Acquire) {
-                return Poll::Ready(());
-            }
-            if notified.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(());
-            }
-            if self.killed.load(Ordering::Acquire) {
-                return Poll::Ready(());
-            }
-            Poll::Pending
-        })
-        .await;
     }
 }
 

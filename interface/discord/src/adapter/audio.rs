@@ -1,14 +1,15 @@
 //! High-level audio call and voice-state adapter.
 
-use std::{error::Error, io, pin::pin, sync::Arc};
+use std::{error::Error, io, pin::pin};
 
 use async_trait::async_trait;
-use futures::{FutureExt as _, channel::oneshot};
+use futures::{FutureExt as _, channel::oneshot, future::Either};
 use messenger_interface::{
     interface::{
         Audio as AudioTrait, AudioSelfVoiceState, CallStatus, VideoBroadcastKind, VoiceEvent,
     },
-    stream::{ArcStream, WeakSocketStream},
+    owner::Retained,
+    stream::EventFuture,
     types::{Identifier, Place, Room, VoiceState},
 };
 use tracing::{debug, error, warn};
@@ -16,20 +17,13 @@ use tracing::{debug, error, warn};
 use simple_audio_channels::input::SampleConsumer;
 
 use crate::{
-    InnerDiscord, Owned,
+    InnerDiscord,
     adapter::video::VideoControls,
     gateways::{
         general::{SelfVoiceFlags, VoiceCommand},
-        media::VoiceTarget,
+        media::{VoiceTarget, coordinator::MediaDrive},
     },
-    stream_poll::StreamPollGuard,
 };
-
-#[unitstruct::unit_struct]
-pub(crate) struct VoiceDiscord;
-
-#[unitstruct::unit_struct]
-pub(crate) struct AudioDiscord;
 
 /// Pending and active microphone handles shared with media coordination.
 #[derive(Default)]
@@ -40,12 +34,13 @@ pub(crate) struct AudioManager {
 }
 
 #[async_trait]
-impl AudioTrait for InnerDiscord<Owned> {
+impl AudioTrait for InnerDiscord {
     async fn connect(
         &self,
         location: &Identifier<Place<Room>>,
     ) -> Result<CallStatus, Box<dyn Error + Sync + Send>> {
-        let load_gateway = self.gateway.current.load();
+        let runtime = self.runtime();
+        let load_gateway = runtime.gateway.current.load();
         let Some(gateway) = load_gateway.as_ref() else {
             return Err(
                 io::Error::new(io::ErrorKind::NotConnected, "gateway not connected").into(),
@@ -53,11 +48,11 @@ impl AudioTrait for InnerDiscord<Owned> {
         };
         let channel_id = *location.id();
         let guild_id = {
-            let Some(route) = self.cache.channel_routes.get(&channel_id) else {
+            let Some(route) = runtime.cache.channel_routes.get(&channel_id) else {
                 warn!(
                     "Tried to connect voice for a Room without a discord channel mapping: room_id={:?}, cache_size={}",
                     location.id(),
-                    self.cache.channel_routes.len()
+                    runtime.cache.channel_routes.len()
                 );
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -94,12 +89,13 @@ impl AudioTrait for InnerDiscord<Owned> {
     }
 
     async fn disconnect(&self, location: &Identifier<Place<Room>>) {
-        let load_gateway = self.gateway.current.load();
+        let runtime = self.runtime();
+        let load_gateway = runtime.gateway.current.load();
         let Some(gateway) = load_gateway.as_ref() else {
             error!("Not connected to the socket");
             return;
         };
-        let video = VideoControls::new(self);
+        let video = VideoControls::new(runtime);
         if let Err(err) = video.stop_go_live().await {
             warn!("Failed to stop Go Live while leaving call: {err}");
         }
@@ -109,7 +105,7 @@ impl AudioTrait for InnerDiscord<Owned> {
             video.emit_remove_participant_video(user, channel, VideoBroadcastKind::Screen);
         }
 
-        let Some(route) = self.cache.channel_routes.get(location.id()) else {
+        let Some(route) = runtime.cache.channel_routes.get(location.id()) else {
             warn!("Tried to disconnect voice for a Room without a discord channel mapping");
             return;
         };
@@ -123,31 +119,64 @@ impl AudioTrait for InnerDiscord<Owned> {
         }
     }
 
-    async fn listen(
-        self: Arc<Self>,
-    ) -> Result<WeakSocketStream<VoiceEvent>, Box<dyn Error + Sync + Send>> {
-        self.listen_as::<VoiceDiscord, _>().await
+    async fn prepare_listener(&self) -> Result<(), Box<dyn Error + Sync + Send>> {
+        self.ensure_gateway().await
+    }
+
+    fn next_event(self: Retained<Self>) -> EventFuture<VoiceEvent> {
+        Box::pin(async move {
+            let mut retained = self;
+            loop {
+                if !retained.is_active() {
+                    return None;
+                }
+                let selected = {
+                    let runtime = retained.get().runtime();
+                    let gateway = runtime.gateway.current.load_full()?;
+                    let mut event = pin!(gateway.events.next_voice().fuse());
+                    let mut drive = pin!(runtime.drive_media().fuse());
+                    futures::select! {
+                        event = event => Either::Left(event),
+                        result = drive => Either::Right(result),
+                    }
+                };
+                match selected {
+                    Either::Left(event) => return Some(event),
+                    Either::Right(MediaDrive::Complete(result)) => result?,
+                    Either::Right(MediaDrive::Gateway(turn)) => {
+                        retained = InnerDiscord::finish_gateway_turn(retained, turn).await?;
+                    }
+                }
+            }
+        })
     }
 }
 
 #[async_trait]
-impl AudioSelfVoiceState for InnerDiscord<Owned> {
+impl AudioSelfVoiceState for InnerDiscord {
     async fn set_self_voice_state(
         &self,
         _location: &Identifier<Place<Room>>,
         state: VoiceState,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let load_gateway = self.gateway.current.load();
+        let runtime = self.runtime();
+        let load_gateway = runtime.gateway.current.load();
         let Some(gateway) = load_gateway.as_ref() else {
             return Err(
                 io::Error::new(io::ErrorKind::NotConnected, "gateway not connected").into(),
             );
         };
-        let Some(profile_id) = self.cache.profile.load().as_ref().map(|profile| profile.id) else {
+        let Some(profile_id) = runtime
+            .cache
+            .profile
+            .load()
+            .as_ref()
+            .map(|profile| profile.id)
+        else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "own profile not loaded").into());
         };
         let voice_state =
-            self.cache.voice.state(profile_id).ok_or_else(|| {
+            runtime.cache.voice.state(profile_id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "not in a voice call")
             })?;
 
@@ -164,37 +193,5 @@ impl AudioSelfVoiceState for InnerDiscord<Owned> {
             })
             .await?;
         Ok(())
-    }
-}
-
-#[async_trait]
-impl ArcStream for InnerDiscord<VoiceDiscord> {
-    type Item = VoiceEvent;
-
-    async fn next(self: Arc<Self>) -> Option<Self::Item> {
-        let _guard = StreamPollGuard::new(&self.gateway.active_streams);
-        loop {
-            if self
-                .gateway
-                .killed
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return None;
-            }
-            if self.owner_dropped() {
-                self.gateway.kill();
-                return None;
-            }
-            let gateway = self.gateway.current.load_full()?;
-            let mut event = pin!(gateway.events.next_voice().fuse());
-            let mut turn = pin!(self.wait_for_gateway_turn().fuse());
-            futures::select! {
-                event = event => return Some(event),
-                turn = turn => {
-                    let turn = turn?;
-                    self.execute_gateway_turn(turn).await?;
-                },
-            }
-        }
     }
 }

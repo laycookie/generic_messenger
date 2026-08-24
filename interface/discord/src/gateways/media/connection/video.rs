@@ -38,6 +38,25 @@ const MAX_VIDEO_RTP_PAYLOAD: usize = 1100;
 const MAX_REORDERED_VIDEO_PACKETS: usize = 64;
 /// One RTCP Generic NACK PID/BLP pair represents at most 17 sequences.
 const MAX_NACK_SEQUENCES: usize = 17;
+/// Discord video RTP clock rate.
+const H264_RTP_CLOCK_RATE: u64 = 90_000;
+
+/// Timing deltas for one completed access unit from one remote SSRC.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct VideoReceiveCadence {
+    /// Zero-based access-unit index within this receive state.
+    pub stream_frame_index: u64,
+    /// Wrapping RTP timestamp delta from previous access unit.
+    pub rtp_delta_ticks: u32,
+    /// Sender interval derived from [`Self::rtp_delta_ticks`].
+    pub source_interval_us: u64,
+    /// Local completion-time gap from previous access unit.
+    pub access_unit_gap_us: u64,
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
 
 fn extend_access_unit(target: &mut Vec<u8>, bytes: &[u8]) -> Result<(), io::Error> {
     let len = target
@@ -467,6 +486,10 @@ pub struct VideoRecv {
     pub assembler: FrameAssembler,
     reorder: VideoPacketReorder,
     decoder: H264Decoder,
+    stream_frame_index: u64,
+    last_rtp_timestamp: Option<u32>,
+    last_access_unit_at: Option<Instant>,
+    last_output_at: Option<Instant>,
 }
 
 impl VideoRecv {
@@ -475,7 +498,53 @@ impl VideoRecv {
             assembler: FrameAssembler::new(),
             reorder: VideoPacketReorder::new(),
             decoder: H264Decoder::new()?,
+            stream_frame_index: 0,
+            last_rtp_timestamp: None,
+            last_access_unit_at: None,
+            last_output_at: None,
         })
+    }
+
+    /// Record cadence for one completed H264 access unit.
+    pub(super) fn observe_access_unit(
+        &mut self,
+        rtp_timestamp: u32,
+        arrived_at: Instant,
+    ) -> VideoReceiveCadence {
+        let stream_frame_index = self.stream_frame_index;
+        self.stream_frame_index = self.stream_frame_index.wrapping_add(1);
+        let rtp_delta_ticks = self
+            .last_rtp_timestamp
+            .replace(rtp_timestamp)
+            .map_or(0, |previous| rtp_timestamp.wrapping_sub(previous));
+        let source_interval_us =
+            u64::from(rtp_delta_ticks).saturating_mul(1_000_000) / H264_RTP_CLOCK_RATE;
+        let access_unit_gap_us = self
+            .last_access_unit_at
+            .replace(arrived_at)
+            .map_or(0, |previous| {
+                duration_micros(arrived_at.saturating_duration_since(previous))
+            });
+        VideoReceiveCadence {
+            stream_frame_index,
+            rtp_delta_ticks,
+            source_interval_us,
+            access_unit_gap_us,
+        }
+    }
+
+    /// Record cadence for an access unit which emitted a decoded frame.
+    pub(super) fn observe_output(&mut self, arrived_at: Instant) -> u64 {
+        self.last_output_at
+            .replace(arrived_at)
+            .map_or(0, |previous| {
+                duration_micros(arrived_at.saturating_duration_since(previous))
+            })
+    }
+
+    /// Identifier shared by inner decoder and outer receive timing events.
+    pub(super) const fn decoder_timing_id(&self) -> u64 {
+        self.decoder.timing_id()
     }
 
     /// Decode one Annex-B access unit to an RGBA frame. `Ok(None)` when the
@@ -667,6 +736,28 @@ mod tests {
 
     /// NAL type 1 (non-IDR slice) with NRI set.
     const NAL_HEADER: u8 = 0x61;
+
+    #[test]
+    fn receive_cadence_handles_rtp_wrap_and_output_gaps() {
+        let mut recv = VideoRecv::new().unwrap();
+        let started_at = Instant::now();
+        let first = recv.observe_access_unit(u32::MAX - 2_999, started_at);
+        assert_eq!(first, VideoReceiveCadence::default());
+        assert_eq!(recv.observe_output(started_at), 0);
+
+        let next_at = started_at + Duration::from_micros(33_333);
+        let second = recv.observe_access_unit(0, next_at);
+        assert_eq!(
+            second,
+            VideoReceiveCadence {
+                stream_frame_index: 1,
+                rtp_delta_ticks: 3_000,
+                source_interval_us: 33_333,
+                access_unit_gap_us: 33_333,
+            }
+        );
+        assert_eq!(recv.observe_output(next_at), 33_333);
+    }
 
     #[test]
     fn detects_idr_access_units() {

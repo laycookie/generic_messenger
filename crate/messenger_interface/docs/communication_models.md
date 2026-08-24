@@ -69,8 +69,8 @@ cursor mechanism, and the client has to deduplicate carefully across polls
 if entries can change between them.
 
 In the `messenger_interface` model, a REST-only backend implements `Query`
-straightforwardly (each method is one or more HTTP calls) but `listen()`
-has to be synthesized client-side as a polling loop. That polling loop
+straightforwardly (each method is one or more HTTP calls) but `next_event()`
+has to synthesize events client-side with a polling loop. That polling loop
 needs persistent "last seen" state to survive restarts, which pushes more
 bookkeeping into the backend than a socket-only design needs.
 
@@ -129,8 +129,8 @@ follow the same approach.
 
 The trait split into `Query`, `Text`, `Audio`, and `Video` deliberately stays agnostic
 to which model a backend uses. A socket-only backend can implement `Query`
-by reading its local cache; a REST-only backend can implement `listen()`
-as a polling loop; a hybrid backend has to handle both paths.
+by reading its local cache; a REST-only backend can implement `next_event()` as
+a polling loop; a hybrid backend has to handle both paths.
 
 The reconciliation policy described in `races.md` (cache is
 gateway-authoritative; HTTP fills gaps; tombstones for deletes) is designed

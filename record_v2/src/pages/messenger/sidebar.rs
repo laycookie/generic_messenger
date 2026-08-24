@@ -391,7 +391,7 @@ impl Sidebar {
                     // compute its toggle from stale flags.
                     let can_set_state = messenger
                         .interface
-                        .api
+                        .messenger()
                         .audio()
                         .is_ok_and(|voice| voice.self_state().is_ok());
                     let self_state = VoiceState {
@@ -439,26 +439,27 @@ impl Sidebar {
                             button
                         })
                     };
-                    let video_toggles = messenger.interface.api.video().is_ok().then(|| {
-                        [
-                            video_toggle(
-                                "Cam",
-                                VideoBroadcastKind::Camera,
-                                own_broadcast.contains(VideoBroadcast::CAMERA),
-                            ),
-                            video_toggle(
-                                "Live",
-                                VideoBroadcastKind::Screen,
-                                own_broadcast.contains(VideoBroadcast::SCREENSHARE),
-                            ),
-                            Button::new(Text::new("Test").size(10))
-                                .on_press(Action::InspectVideoCapture)
-                                .into(),
-                            Button::new(Text::new("Pick").size(10))
-                                .on_press(Action::PickScreenCapture)
-                                .into(),
-                        ]
-                    });
+                    let video_toggles =
+                        messenger.interface.messenger().video().is_ok().then(|| {
+                            [
+                                video_toggle(
+                                    "Cam",
+                                    VideoBroadcastKind::Camera,
+                                    own_broadcast.contains(VideoBroadcast::CAMERA),
+                                ),
+                                video_toggle(
+                                    "Live",
+                                    VideoBroadcastKind::Screen,
+                                    own_broadcast.contains(VideoBroadcast::SCREENSHARE),
+                                ),
+                                Button::new(Text::new("Test").size(10))
+                                    .on_press(Action::InspectVideoCapture)
+                                    .into(),
+                                Button::new(Text::new("Pick").size(10))
+                                    .on_press(Action::PickScreenCapture)
+                                    .into(),
+                            ]
+                        });
 
                     let header = row![call_status]
                         .extend(

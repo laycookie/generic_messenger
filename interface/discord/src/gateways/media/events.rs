@@ -19,6 +19,15 @@ pub(super) fn execute_pending_transition(
     transition_id: u16,
 ) {
     let Some((_, new_version)) = dave_pending_transitions.remove(&transition_id) else {
+        tracing::trace!(
+            target: "video_timing",
+            stage = "outgoing.control",
+            kind = "DAVE",
+            action = "dave_execute_missing",
+            transition_id,
+            failed = true,
+            "DAVE transition execute missing"
+        );
         warn!(
             "Received execute transition, but we don't have a pending transition for {transition_id}"
         );
@@ -31,6 +40,18 @@ pub(super) fn execute_pending_transition(
             "DAVE protocol version mismatch: old={old_version:?}, new={new_version:?}. Transition not applied"
         );
     }
+    tracing::trace!(
+        target: "video_timing",
+        stage = "outgoing.control",
+        kind = "DAVE",
+        action = "dave_transition_executed",
+        transition_id,
+        previous_protocol_version = u64::from(old_version.get()),
+        protocol_version = u64::from(new_version.get()),
+        pending_transitions = dave_pending_transitions.len(),
+        failed = old_version != new_version,
+        "DAVE transition executed"
+    );
 }
 
 pub(super) async fn respond_to_mls_transition<E: std::fmt::Debug>(
@@ -42,6 +63,7 @@ pub(super) async fn respond_to_mls_transition<E: std::fmt::Debug>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match process_result {
         Err(err) => {
+            dave_pending_transitions.remove(&transition_id);
             error!("{err:?}");
             websocket
                 .send(Message::Text(

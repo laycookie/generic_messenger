@@ -6,9 +6,8 @@ members = [
 	"crate/audio",
 	"crate/audio/macro",
 	"crate/video",
-	"crate/video_capture",
+	"crate/messenger_stream",
 	"crate/messenger_interface",
-	"crate/unitstruct",
 	"crate/messenger_unifier",
 	"crate/messenger_downloader",
 	"crate/login_store",
@@ -43,12 +42,9 @@ async-trait = "0.1.89"
 chrono = "0.4"
 
 # Video capture and RGB↔YUV conversion are hot loops even during application
-# development. Keep those crates optimized so `cargo run` does not make debug
-# arithmetic consume a full CPU core.
+# development. Keep video code and native codec dependencies optimized so
+# `cargo run` does not make debug arithmetic consume a full CPU core.
 [profile.dev.package.simple-video]
-opt-level = 3
-
-[profile.dev.package.simple-video-capture]
 opt-level = 3
 
 [profile.dev.package.nokhwa-core]

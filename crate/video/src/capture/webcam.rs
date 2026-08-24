@@ -1,5 +1,6 @@
 use std::{fmt, time::Instant};
 
+use crate::{PixelData, VideoFrame, VideoFrameTiming};
 use nokhwa::{
     Camera,
     pixel_format::RgbFormat,
@@ -8,9 +9,13 @@ use nokhwa::{
         Resolution,
     },
 };
-use simple_video::{PixelData, VideoFrame, VideoFrameTiming};
+#[cfg(target_os = "linux")]
+use v4l::{
+    capability::Flags as V4lCapabilities, device::Device as V4lDevice, format::FourCC,
+    video::Capture as V4lCapture,
+};
 
-use crate::{CaptureResult, FrameCapture, capture::elapsed_micros};
+use super::{CaptureResult, FrameCapture, elapsed_micros};
 
 /// Stable, owned identifier used to reopen a webcam.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -267,9 +272,103 @@ pub fn has_webcam_permission() -> bool {
     nokhwa::nokhwa_check()
 }
 
-/// Discover webcams using current platform's native backend.
+#[cfg(target_os = "linux")]
+fn linux_webcam_is_usable(index: u32) -> Option<bool> {
+    let Ok(device_index) = usize::try_from(index) else {
+        return None;
+    };
+    let device = match V4lDevice::new(device_index) {
+        Ok(device) => device,
+        Err(error) => {
+            tracing::debug!(
+                camera.index = index,
+                error = %error,
+                "V4L webcam probe unavailable; retaining device conservatively"
+            );
+            return None;
+        }
+    };
+    let capabilities = match device.query_caps() {
+        Ok(capabilities) => capabilities.capabilities,
+        Err(error) => {
+            tracing::debug!(
+                camera.index = index,
+                error = %error,
+                "V4L webcam capabilities unavailable; retaining device conservatively"
+            );
+            return None;
+        }
+    };
+    // v4l 0.14 reads device_caps, which may be empty for legacy drivers.
+    // A non-empty set without single-plane capture is definitive because
+    // Nokhwa's Linux backend cannot stream multi-plane or metadata nodes.
+    if !capabilities.is_empty() && !capabilities.contains(V4lCapabilities::VIDEO_CAPTURE) {
+        return Some(false);
+    }
+
+    match device.enum_formats() {
+        Ok(formats) => Some(
+            formats
+                .iter()
+                .any(|format| nokhwa_supports_v4l_format(format.fourcc)),
+        ),
+        Err(error) => {
+            tracing::debug!(
+                camera.index = index,
+                error = %error,
+                "V4L webcam formats unavailable; retaining device conservatively"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn nokhwa_supports_v4l_format(format: FourCC) -> bool {
+    matches!(
+        &format.repr,
+        b"YUYV" | b"MJPG" | b"GRAY" | b"RGB3" | b"BGR3" | b"NV12"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_linux_webcams_with(
+    mut sources: Vec<WebcamSource>,
+    mut is_usable: impl FnMut(u32) -> Option<bool>,
+) -> Vec<WebcamSource> {
+    sources.sort_by(|left, right| left.id.cmp(&right.id));
+    sources
+        .into_iter()
+        .filter(|source| {
+            let usable = match &source.id {
+                WebcamId::Index(index) => is_usable(*index),
+                WebcamId::String(_) => None,
+            };
+            if usable == Some(false) {
+                tracing::debug!(
+                    camera.id = %source.id,
+                    camera.name = %source.name,
+                    "unusable V4L webcam endpoint ignored"
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_linux_webcams(sources: Vec<WebcamSource>) -> Vec<WebcamSource> {
+    normalize_linux_webcams_with(sources, linux_webcam_is_usable)
+}
+
+/// Discover webcams which can produce frames supported by this crate.
+///
+/// Linux V4L metadata, multi-plane, and unsupported-format nodes are removed.
+/// Nodes which cannot be probed are retained conservatively.
 pub fn webcams() -> CaptureResult<Vec<WebcamSource>> {
-    Ok(nokhwa::query(ApiBackend::Auto)?
+    let sources: Vec<WebcamSource> = nokhwa::query(ApiBackend::Auto)?
         .into_iter()
         .map(|info| WebcamSource {
             id: WebcamId::from(info.index()),
@@ -277,7 +376,11 @@ pub fn webcams() -> CaptureResult<Vec<WebcamSource>> {
             description: info.description().to_owned(),
             miscellaneous: info.misc(),
         })
-        .collect())
+        .collect();
+    #[cfg(target_os = "linux")]
+    return Ok(normalize_linux_webcams(sources));
+    #[cfg(not(target_os = "linux"))]
+    Ok(sources)
 }
 
 /// Open webcam stream producing decoded RGB8 frames.
@@ -345,6 +448,16 @@ impl FrameCapture for WebcamCapture {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn webcam_source(index: u32, name: &str) -> WebcamSource {
+        WebcamSource {
+            id: WebcamId::Index(index),
+            name: name.to_owned(),
+            description: String::new(),
+            miscellaneous: String::new(),
+        }
+    }
+
     #[test]
     fn webcam_format_round_trips() {
         let format = WebcamFormat {
@@ -405,5 +518,75 @@ mod tests {
         let formats = [format(15), format(30)];
 
         assert_eq!(bounded_format(&formats, 960, 540, 24), Some(format(30)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_discovery_keeps_only_endpoints_that_can_produce_supported_frames() {
+        let sources = vec![
+            webcam_source(3, "USB Camera"),
+            webcam_source(2, "USB Camera"),
+            webcam_source(5, "Capture Card"),
+            webcam_source(4, "USB Camera"),
+            webcam_source(0, "USB Camera"),
+            webcam_source(1, "USB Camera"),
+        ];
+
+        let normalized = normalize_linux_webcams_with(sources, |index| match index {
+            0 | 4 => Some(true),
+            1 | 2 | 3 | 5 => Some(false),
+            _ => unreachable!("unexpected webcam index"),
+        });
+
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|source| source.id().clone())
+                .collect::<Vec<_>>(),
+            vec![WebcamId::Index(0), WebcamId::Index(4)]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_discovery_preserves_multiple_usable_endpoints() {
+        let sources = vec![
+            webcam_source(0, "USB Camera"),
+            webcam_source(2, "USB Camera"),
+        ];
+
+        let normalized = normalize_linux_webcams_with(sources, |_| Some(true));
+
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].id(), &WebcamId::Index(0));
+        assert_eq!(normalized[1].id(), &WebcamId::Index(2));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_discovery_retains_unverified_endpoints() {
+        let sources = vec![
+            webcam_source(2, "USB Camera"),
+            webcam_source(0, "USB Camera"),
+        ];
+
+        let normalized = normalize_linux_webcams_with(sources, |_| None);
+
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|source| source.id().clone())
+                .collect::<Vec<_>>(),
+            vec![WebcamId::Index(0), WebcamId::Index(2)]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_format_filter_matches_nokhwa_decoder_support() {
+        for supported in [b"YUYV", b"MJPG", b"GRAY", b"RGB3", b"BGR3", b"NV12"] {
+            assert!(nokhwa_supports_v4l_format(FourCC::new(supported)));
+        }
+        assert!(!nokhwa_supports_v4l_format(FourCC::new(b"H264")));
     }
 }

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use discord::Discord;
 use messenger_interface::auth::{Credential, CredentialField};
 
@@ -12,44 +10,15 @@ fn token_credential(token: String) -> Credential {
 }
 
 #[test]
-fn messenger_drop_frees_memory() {
+fn messenger_drop_closes_lifetime() {
     let Some(token) = token() else {
         eprintln!("skipped: DISCORD_TOKEN wasn't provided");
         return;
     };
     let messenger = smol::block_on(Discord::create_messenger(token_credential(token))).unwrap();
-    let weak = Arc::downgrade(&messenger);
+    let lifetime = messenger.downgrade();
 
     drop(messenger);
 
-    assert!(weak.upgrade().is_none());
-}
-
-#[test]
-fn messenger_drop_frees_streams() {
-    let Some(token) = token() else {
-        eprintln!("skipped: DISCORD_TOKEN wasn't provided");
-        return;
-    };
-    smol::block_on(async {
-        let messenger = Discord::create_messenger(token_credential(token))
-            .await
-            .unwrap();
-        let weak = Arc::downgrade(&messenger);
-
-        let q = messenger.clone().arc_query().unwrap();
-        let t = messenger.clone().arc_text().unwrap();
-        let v = messenger.clone().arc_audio().unwrap();
-
-        let _q_stream = q.listen().await.unwrap();
-        let _t_stream = t.listen().await.unwrap();
-        let _v_stream = v.listen().await.unwrap();
-
-        drop(messenger);
-        drop(_q_stream);
-        drop(_t_stream);
-        drop(_v_stream);
-
-        assert!(weak.upgrade().is_none());
-    });
+    assert!(!lifetime.is_active());
 }
