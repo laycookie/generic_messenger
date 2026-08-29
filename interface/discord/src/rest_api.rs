@@ -53,6 +53,7 @@ impl DiscordApi {
         .await?
         .json::<api::Profile>()
         .await
+        .map_err(Into::into)
     }
 
     /// `GET /users/@me/relationships`
@@ -67,6 +68,7 @@ impl DiscordApi {
         .await?
         .json::<Vec<api::Friend>>()
         .await
+        .map_err(Into::into)
     }
 
     /// `GET /users/@me/channels`
@@ -81,6 +83,7 @@ impl DiscordApi {
         .await?
         .json::<Vec<api::Channel>>()
         .await
+        .map_err(Into::into)
     }
 
     /// `GET /users/@me/guilds`
@@ -95,6 +98,7 @@ impl DiscordApi {
         .await?
         .json::<Vec<api::Guild>>()
         .await
+        .map_err(Into::into)
     }
 
     /// `GET /guilds/{guild_id}/channels`
@@ -110,6 +114,7 @@ impl DiscordApi {
         .await?
         .json::<Vec<api::Channel>>()
         .await
+        .map_err(Into::into)
     }
 
     /// `GET /channels/{channel_id}/messages`
@@ -128,6 +133,7 @@ impl DiscordApi {
             .await?
             .json::<Vec<api::Message>>()
             .await
+            .map_err(Into::into)
     }
 
     /// `GET /users/{user_id}`
@@ -143,6 +149,7 @@ impl DiscordApi {
         .await?
         .json::<api::UserDetails>()
         .await
+        .map_err(Into::into)
     }
 
     /// User-token endpoint; requires a mutual friend/guild with the target.
@@ -156,6 +163,7 @@ impl DiscordApi {
             .await?
             .json::<api::UserProfile>()
             .await
+            .map_err(Into::into)
     }
 
     /// `GET /guilds/{guild_id}?with_counts=true`
@@ -169,6 +177,7 @@ impl DiscordApi {
             .await?
             .json::<api::GuildDetails>()
             .await
+            .map_err(Into::into)
     }
 
     /// `PUT /channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me`
@@ -231,6 +240,7 @@ impl DiscordApi {
         .await?
         .json::<api::Message>()
         .await
+        .map_err(Into::into)
     }
 
     /// `PATCH /channels/{channel_id}/messages/{message_id}`
@@ -255,6 +265,7 @@ impl DiscordApi {
         .await?
         .json::<api::Message>()
         .await
+        .map_err(Into::into)
     }
 
     /// `DELETE /channels/{channel_id}/messages/{message_id}`

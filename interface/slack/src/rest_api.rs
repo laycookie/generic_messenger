@@ -30,6 +30,7 @@ impl SlackMessenger {
             .await?
             .json::<T>()
             .await
+            .map_err(Into::into)
     }
 
     async fn api_post_json<T: for<'a> Facet<'a>>(
@@ -48,6 +49,7 @@ impl SlackMessenger {
         .await?
         .json::<T>()
         .await
+        .map_err(Into::into)
     }
 
     pub(crate) async fn rest_auth_test(

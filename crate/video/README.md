@@ -46,6 +46,17 @@ instead of blocking its caller.
   threads.
 - Capture errors remain typed as `CaptureError`.
 
+`CaptureLimits::new`, `CaptureLimits::validate`,
+`ScreenCaptureConfig::validate`, and `WebcamCaptureConfig::validate` let callers
+reject invalid user settings before native device work begins. Low-level open
+methods perform the same validation themselves.
+
+Raw frame storage may be owned or immutable/shared. Use
+`PixelData::format()`, `bytes_per_pixel()`, `is_shared()`, and `as_bytes()`
+instead of matching storage variants just to inspect a frame. `VideoFrame::new`
+remains a compatibility constructor; use `VideoFrame::try_new` at untrusted API
+boundaries to validate dimensions and byte length immediately.
+
 On macOS, call `initialize_webcams` before discovery and continue from its
 callback after permission resolves.
 
@@ -96,6 +107,23 @@ fn capture_one_screen_frame() -> Result<(), CaptureError> {
     Ok(())
 }
 ```
+
+## Codec behavior
+
+H264 and AV1 encoders accept 1–60 FPS and explicit codec-specific bitrate
+ranges. Out-of-range settings return `VideoError` rather than being silently
+clamped. H264 input dimensions must be non-zero and even; geometry outside
+OpenH264's 3840×2160 landscape/portrait envelope is rejected before entering
+its panic-prone RGB wrappers. The decoder also rejects access units above
+`MAX_H264_ACCESS_UNIT_BYTES` before passing them to native code. OpenH264 picks
+the SPS level from actual geometry and cadence, and its limited-range BT.601
+RGB conversion is now signalled in VUI.
+
+rav1e can retain frames after the last `encode` call. Call
+`Av1Encoder::finish()` when a stream ends to receive every delayed temporal
+unit in order. Resolution changes drain the previous context into the normal
+output queue instead of discarding delayed frames, and the encoder remains
+reusable after `finish`.
 
 ## Features
 

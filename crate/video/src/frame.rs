@@ -7,11 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::VideoError;
-
-fn elapsed_micros(start: Instant) -> u64 {
-    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
-}
+use crate::{VideoError, geometry::fitted_dimensions, timing::elapsed_micros};
 
 static NEXT_VIDEO_FRAME_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -52,6 +48,26 @@ impl VideoFrameTiming {
     }
 }
 
+/// Decoded pixel layout carried by [`PixelData`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum PixelFormat {
+    /// Three bytes per pixel in red, green, blue order.
+    Rgb8,
+    /// Four bytes per pixel in red, green, blue, alpha order.
+    Rgba8,
+}
+
+impl PixelFormat {
+    /// Number of bytes occupied by one pixel.
+    pub const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Rgb8 => 3,
+            Self::Rgba8 => 4,
+        }
+    }
+}
+
 /// Decoded pixel data for one video frame.
 #[derive(Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -68,13 +84,25 @@ pub enum PixelData {
 }
 
 impl PixelData {
-    fn bytes_per_pixel(&self) -> usize {
+    /// Pixel layout, independent of whether storage is owned or shared.
+    pub const fn format(&self) -> PixelFormat {
         match self {
-            Self::Rgba8(_) | Self::SharedRgba8(_) => 4,
-            Self::Rgb8(_) | Self::SharedRgb8(_) => 3,
+            Self::Rgba8(_) | Self::SharedRgba8(_) => PixelFormat::Rgba8,
+            Self::Rgb8(_) | Self::SharedRgb8(_) => PixelFormat::Rgb8,
         }
     }
 
+    /// Number of bytes occupied by one pixel.
+    pub const fn bytes_per_pixel(&self) -> usize {
+        self.format().bytes_per_pixel()
+    }
+
+    /// Whether this value references immutable shared storage.
+    pub const fn is_shared(&self) -> bool {
+        matches!(self, Self::SharedRgba8(_) | Self::SharedRgb8(_))
+    }
+
+    /// Contiguous row-major bytes.
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Rgba8(data) | Self::Rgb8(data) => data,
@@ -97,6 +125,9 @@ pub struct VideoFrame {
 
 impl VideoFrame {
     /// Build a frame without capture timing metadata.
+    ///
+    /// This compatibility constructor does not validate byte length. Prefer
+    /// [`Self::try_new`] at untrusted or external API boundaries.
     pub fn new(width: u32, height: u32, pixel_data: PixelData) -> Self {
         Self {
             width,
@@ -104,6 +135,13 @@ impl VideoFrame {
             pixel_data,
             timing: None,
         }
+    }
+
+    /// Build and validate a frame without capture timing metadata.
+    pub fn try_new(width: u32, height: u32, pixel_data: PixelData) -> Result<Self, VideoError> {
+        let frame = Self::new(width, height, pixel_data);
+        frame.validate()?;
+        Ok(frame)
     }
 
     /// Build a frame carrying timing started at its capture boundary.
@@ -119,6 +157,18 @@ impl VideoFrame {
             pixel_data,
             timing,
         }
+    }
+
+    /// Build and validate a frame carrying capture timing metadata.
+    pub fn try_with_timing(
+        width: u32,
+        height: u32,
+        pixel_data: PixelData,
+        timing: Option<VideoFrameTiming>,
+    ) -> Result<Self, VideoError> {
+        let frame = Self::with_timing(width, height, pixel_data, timing);
+        frame.validate()?;
+        Ok(frame)
     }
 
     /// Correlation metadata when timing is enabled for this frame.
@@ -166,7 +216,8 @@ impl VideoFrame {
     }
 
     /// Dimensions produced when this frame is downscaled to fit inside the
-    /// supplied bounds. Validates the frame without allocating or scaling it.
+    /// supplied bounds. Already-fitting geometry is returned unchanged. This
+    /// validates the frame without allocating or scaling it.
     pub fn dimensions_to_fit(
         &self,
         max_width: u32,
@@ -449,32 +500,6 @@ impl FrameScaler {
     }
 }
 
-fn fitted_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
-    let (mut width, mut height) =
-        if u64::from(max_width) * u64::from(height) <= u64::from(max_height) * u64::from(width) {
-            (
-                max_width,
-                (u64::from(height) * u64::from(max_width) / u64::from(width)) as u32,
-            )
-        } else {
-            (
-                (u64::from(width) * u64::from(max_height) / u64::from(height)) as u32,
-                max_height,
-            )
-        };
-    width = width.max(1);
-    height = height.max(1);
-    // YUV420 encoders require even dimensions. Captures are normally much
-    // larger than two pixels, so rounding down is safe and avoids padding.
-    if width > 1 {
-        width &= !1;
-    }
-    if height > 1 {
-        height &= !1;
-    }
-    (width, height)
-}
-
 /// Compressed video codec carried by an [`EncodedVideoFrame`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
@@ -576,6 +601,26 @@ mod tests {
                 assert_eq!(simd, scalar, "offset={offset} pixels={pixels}");
             }
         }
+    }
+
+    #[test]
+    fn pixel_format_introspection_ignores_storage_ownership() {
+        let owned = PixelData::Rgb8(vec![0; 3]);
+        let shared = PixelData::SharedRgb8(vec![0; 3].into());
+        assert_eq!(owned.format(), PixelFormat::Rgb8);
+        assert_eq!(owned.bytes_per_pixel(), 3);
+        assert!(!owned.is_shared());
+        assert_eq!(shared.format(), PixelFormat::Rgb8);
+        assert!(shared.is_shared());
+    }
+
+    #[test]
+    fn fallible_constructor_validates_at_the_api_boundary() {
+        assert!(VideoFrame::try_new(1, 1, PixelData::Rgba8(vec![0; 4])).is_ok());
+        assert!(matches!(
+            VideoFrame::try_new(1, 1, PixelData::Rgba8(vec![0; 3])),
+            Err(VideoError::FrameSizeMismatch { .. })
+        ));
     }
 
     #[test]

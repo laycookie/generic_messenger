@@ -10,8 +10,8 @@ chrono = { workspace = true }
 facet = { workspace = true }
 facet-json = { workspace = true }
 futures = { workspace = true }
-messenger_downloader = { path = "../../crate/messenger_downloader" }
-messenger_interface = { path = "../../crate/messenger_interface" }
-percent-encoding = "2"
-secure-string = "0.3.0"
-surf = "2.3.2"
+messenger_downloader = { workspace = true }
+messenger_interface = { workspace = true }
+percent-encoding = { workspace = true }
+secure-string = { workspace = true }
+surf = { workspace = true }

@@ -226,6 +226,12 @@ fn rtpsize_nonce(prefix: &[u8]) -> crypto_aead::xchacha20poly1305::Nonce {
     crypto_aead::xchacha20poly1305::Nonce::from_bytes(nonce)
 }
 
+fn transport_key(
+    description: &SessionDescription,
+) -> io::Result<crypto_aead::xchacha20poly1305::Key> {
+    Ok((*description.validated_secret_key()?).into())
+}
+
 /// Reserve one wire-sized transport nonce without permitting wraparound.
 /// Counter uses one extra bit of state so `u32::MAX` remains usable once;
 /// subsequent sends fail and force connection/key renewal.
@@ -339,9 +345,11 @@ pub struct RecvTransport<'a> {
 /// sharing one, which would corrupt audio when people talk simultaneously.
 pub struct RecvCodec {
     decoders: HashMap<Ssrc, opus::Decoder>,
+    audio_last_active: HashMap<Ssrc, Instant>,
     /// Per-SSRC video reassembly + H264 decode state, created on first
     /// sight of a video packet from that SSRC.
     video: HashMap<Ssrc, VideoRecv>,
+    video_last_active: HashMap<Ssrc, Instant>,
     /// Rate-limit repeated NACKs while a requested RTX packet is in flight.
     video_nack_sent: HashMap<(Ssrc, u16), Instant>,
     // Sized for a worst-case media packet: 12-byte RTP header + extensions
@@ -355,13 +363,39 @@ impl RecvCodec {
     pub fn new() -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             decoders: HashMap::new(),
+            audio_last_active: HashMap::new(),
             video: HashMap::new(),
+            video_last_active: HashMap::new(),
             video_nack_sent: HashMap::new(),
             rtp_packet_buf: [0; 2048],
             decoded_audio_buf: [0; 11520],
         })
     }
 }
+
+/// Make room for a newly observed SSRC by retiring the least recently active
+/// decoder. The cap remains a memory bound under forged SSRC churn without
+/// permanently rejecting legitimate streams that join later in a long call.
+fn retire_lru_if_full<T>(
+    states: &mut HashMap<Ssrc, T>,
+    last_active: &mut HashMap<Ssrc, Instant>,
+    incoming: Ssrc,
+) -> Option<Ssrc> {
+    if states.contains_key(&incoming) || states.len() < MAX_REMOTE_MEDIA_STREAMS {
+        return None;
+    }
+
+    let retired = states
+        .keys()
+        .copied()
+        // Missing activity metadata sorts first and repairs any inconsistent
+        // state instead of turning the defensive cap into a permanent error.
+        .min_by_key(|ssrc| (last_active.get(ssrc).copied(), *ssrc))?;
+    states.remove(&retired);
+    last_active.remove(&retired);
+    Some(retired)
+}
+
 impl RecvTransport<'_> {
     /// Ask the sender for an H264 keyframe using RTCP PSFB PLI (RFC 4585).
     ///
@@ -383,9 +417,7 @@ impl RecvTransport<'_> {
             )
             .into());
         }
-        let secret_key = description
-            .secret_key()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing secret key"))?;
+        let key = transport_key(description)?;
 
         // RTCP PSFB PLI: V=2, FMT=1, PT=206, length=2, sender SSRC,
         // media SSRC. RTP-size encryption leaves common header + sender SSRC
@@ -398,8 +430,6 @@ impl RecvTransport<'_> {
 
         let nonce_u32 = next_transport_nonce(self.nonce)?;
         let nonce = rtpsize_nonce(&nonce_u32);
-        let key = crypto_aead::xchacha20poly1305::Key::from_bytes(secret_key)
-            .expect("Invalid key length");
         let encrypted = crypto_aead::xchacha20poly1305::encrypt(
             &media_ssrc.to_be_bytes(),
             Some(&header),
@@ -438,9 +468,7 @@ impl RecvTransport<'_> {
             )
             .into());
         }
-        let secret_key = description
-            .secret_key()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing secret key"))?;
+        let key = transport_key(description)?;
 
         let mut lost_mask = 0u16;
         for sequence in rest {
@@ -464,8 +492,6 @@ impl RecvTransport<'_> {
 
         let nonce_u32 = next_transport_nonce(self.nonce)?;
         let nonce = rtpsize_nonce(&nonce_u32);
-        let key = crypto_aead::xchacha20poly1305::Key::from_bytes(secret_key)
-            .expect("Invalid key length");
         let encrypted =
             crypto_aead::xchacha20poly1305::encrypt(&body, Some(&header), &nonce, &key)?;
         let mut packet = Vec::with_capacity(header.len() + encrypted.len() + nonce_u32.len());
@@ -523,7 +549,12 @@ impl RecvTransport<'_> {
             } else {
                 // RTP-size RTCP keeps common header + sender SSRC clear and
                 // encrypts media SSRC + feedback control information.
-                let nonce_size = mode.nonce_size();
+                let nonce_size = mode.nonce_size().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "encryption mode has no RTP nonce",
+                    )
+                })?;
                 if packet.len() < 8 + nonce_size + 16 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -534,12 +565,7 @@ impl RecvTransport<'_> {
                 let header = &packet[..8];
                 let encrypted_end = packet.len() - nonce_size;
                 let nonce = rtpsize_nonce(&packet[encrypted_end..]);
-                let key = crypto_aead::xchacha20poly1305::Key::from_bytes(
-                    description.secret_key().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "missing secret key")
-                    })?,
-                )
-                .expect("Invalid key length");
+                let key = transport_key(description)?;
                 let body = crypto_aead::xchacha20poly1305::decrypt(
                     &packet[8..encrypted_end],
                     Some(header),
@@ -660,16 +686,17 @@ impl RecvTransport<'_> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing encryption mode"))?;
         let decrypted_payload = match mode {
             EncryptionMode::aead_xchacha20_poly1305_rtpsize => {
-                let (voice_payload, nonce_u32) = split_rtpsize_body(rtp_body, mode.nonce_size())?;
+                let nonce_size = mode.nonce_size().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "encryption mode has no RTP nonce",
+                    )
+                })?;
+                let (voice_payload, nonce_u32) = split_rtpsize_body(rtp_body, nonce_size)?;
 
                 let nonce = rtpsize_nonce(nonce_u32);
 
-                let key = crypto_aead::xchacha20poly1305::Key::from_bytes(
-                    description.secret_key().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "missing secret key")
-                    })?,
-                )
-                .expect("Invalid key length");
+                let key = transport_key(&description)?;
 
                 crypto_aead::xchacha20poly1305::decrypt(
                     voice_payload,
@@ -762,12 +789,13 @@ impl RecvTransport<'_> {
             let timestamp = u32::from(rtp_packet.get_timestamp());
             let marker = rtp_packet.get_marker() == 1;
 
-            if !codec.video.contains_key(&ssrc) && codec.video.len() >= MAX_REMOTE_MEDIA_STREAMS {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "too many remote video SSRCs",
-                )
-                .into());
+            if let Some(retired) =
+                retire_lru_if_full(&mut codec.video, &mut codec.video_last_active, ssrc)
+            {
+                codec
+                    .video_nack_sent
+                    .retain(|(source, _), _| *source != retired);
+                debug!("Retired inactive video decoder for SSRC {retired}");
             }
             let new_video_ssrc = !codec.video.contains_key(&ssrc);
             if new_video_ssrc {
@@ -776,6 +804,7 @@ impl RecvTransport<'_> {
                     warn!("Failed to request keyframe for video SSRC {ssrc}: {err}");
                 }
             }
+            codec.video_last_active.insert(ssrc, Instant::now());
             let assemble_started = timing_enabled.then(Instant::now);
             let outcome = codec
                 .video
@@ -1029,12 +1058,12 @@ impl RecvTransport<'_> {
             }
         };
 
-        // Decode opus with a per-SSRC decoder: Opus carries inter-frame state,
+        // Decode Opus with a per-SSRC decoder: Opus carries inter-frame state,
         // so feeding interleaved speakers through one decoder corrupts both.
-        if !codec.decoders.contains_key(&ssrc) && codec.decoders.len() >= MAX_REMOTE_MEDIA_STREAMS {
-            return Err(
-                io::Error::new(io::ErrorKind::InvalidData, "too many remote audio SSRCs").into(),
-            );
+        if let Some(retired) =
+            retire_lru_if_full(&mut codec.decoders, &mut codec.audio_last_active, ssrc)
+        {
+            debug!("Retired inactive audio decoder for SSRC {retired}");
         }
         let decoder = match codec.decoders.entry(ssrc) {
             Entry::Occupied(decoder) => decoder.into_mut(),
@@ -1043,6 +1072,7 @@ impl RecvTransport<'_> {
                 opus::Channels::Stereo,
             )?),
         };
+        codec.audio_last_active.insert(ssrc, Instant::now());
         let n_decoded_samples = decoder.decode(voice_data, &mut codec.decoded_audio_buf, false)?;
 
         Ok(UdpPacket::Voice {
@@ -1308,9 +1338,7 @@ impl SendTransport<'_> {
         let mode = description
             .mode()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing encryption mode"))?;
-        let secret_key = description
-            .secret_key()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing secret key"))?;
+        let key = transport_key(&description)?;
 
         let encoded_len = codec
             .encoder
@@ -1394,9 +1422,6 @@ impl SendTransport<'_> {
         match mode {
             EncryptionMode::aead_xchacha20_poly1305_rtpsize => {
                 let nonce = rtpsize_nonce(&nonce_u32);
-                let key = crypto_aead::xchacha20poly1305::Key::from_bytes(&secret_key[..])
-                    .expect("Invalid key length");
-
                 let encrypted = crypto_aead::xchacha20poly1305::encrypt(
                     audio_payload,
                     Some(rtp_header),
@@ -1465,7 +1490,7 @@ impl VideoSendTransport<'_> {
 
     async fn send_sender_report(
         &self,
-        secret_key: &[u8],
+        secret_key: &[u8; 32],
         rtp_timestamp: u32,
         packet_count: u32,
         octet_count: u32,
@@ -1491,8 +1516,7 @@ impl VideoSendTransport<'_> {
 
         let nonce_u32 = next_transport_nonce(self.nonce)?;
         let nonce = rtpsize_nonce(&nonce_u32);
-        let key = crypto_aead::xchacha20poly1305::Key::from_bytes(secret_key)
-            .expect("Invalid key length");
+        let key = (*secret_key).into();
         let encrypted =
             crypto_aead::xchacha20poly1305::encrypt(&sender_info, Some(&header), &nonce, &key)?;
 
@@ -1612,9 +1636,7 @@ impl VideoSendTransport<'_> {
             )
             .into());
         }
-        let secret_key = description
-            .secret_key()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing secret key"))?;
+        let secret_key = description.validated_secret_key()?;
 
         // DAVE encrypts the whole access unit codec-aware (NAL framing is
         // preserved) *before* packetization — same order the receive path
@@ -1766,8 +1788,7 @@ impl VideoSendTransport<'_> {
         };
         let history_us = history_started.map(elapsed_micros).unwrap_or_default();
 
-        let key = crypto_aead::xchacha20poly1305::Key::from_bytes(&secret_key[..])
-            .expect("Invalid key length");
+        let key = (*secret_key).into();
 
         let mut packet_buf = [0u8; 2048];
         let mut aead_us = 0_u64;
@@ -1956,9 +1977,7 @@ impl VideoSendTransport<'_> {
             .description
             .load_full()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no session description"))?;
-        let secret_key = description
-            .secret_key()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing secret key"))?;
+        let secret_key = description.validated_secret_key()?;
         let codec_state = self.selected_video_codec_state.load(Ordering::Acquire);
         let packets = {
             let mut state = self.video_send_state.lock().unwrap();
@@ -1980,8 +1999,7 @@ impl VideoSendTransport<'_> {
                 .collect::<Vec<_>>()
         };
 
-        let key = crypto_aead::xchacha20poly1305::Key::from_bytes(secret_key)
-            .expect("Invalid key length");
+        let key = (*secret_key).into();
         let mut packet_buf = [0u8; 2048];
         let mut sent = 0;
         for (sequence, original) in &packets {
@@ -2213,26 +2231,31 @@ impl Connection {
             nonce: AtomicU64::new(0),
         }
     }
-    /// Install (or rotate) the session description. Returns `true` when
-    /// this was the first description for the connection — i.e. the call
-    /// just became ready — and `false` for a key rotation.
-    pub fn set_description(&self, description: SessionDescription) -> bool {
+    /// Install (or rotate) a validated session description. Returns `true` when
+    /// this was the first description for the connection — i.e. the call just
+    /// became ready — and `false` for a key rotation.
+    pub fn set_description(&self, description: SessionDescription) -> io::Result<bool> {
+        description.validate()?;
+
         let first = self.description.load().is_none();
-        if let Err(err) = self.set_video_codec_name(description.video_codec()) {
-            warn!("Ignoring unsupported server-selected video codec: {err}");
-        }
+        self.set_video_codec_name(description.video_codec())?;
         if let Some(keyframe_interval_ms) = description.keyframe_interval_ms() {
             self.set_video_keyframe_interval_ms(keyframe_interval_ms);
         }
         self.description.store(Some(Arc::new(description)));
-        first
+        Ok(first)
     }
 
     /// Update server-confirmed outbound codec after Session Description or
     /// Session Update. Returns whether codec changed.
     pub(crate) fn set_video_codec_name(&self, name: &str) -> Result<bool, io::Error> {
-        let codec = DiscordVideoCodec::from_wire_name(name);
-        let codec_value = codec.map_or(VIDEO_CODEC_UNKNOWN, video_codec_value);
+        let codec = DiscordVideoCodec::from_wire_name(name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unsupported video codec selected by server",
+            )
+        })?;
+        let codec_value = video_codec_value(codec);
         // Serialize generation change with history reservation. Old send jobs
         // either finish reserving before switch or observe new generation and
         // abort; new jobs cannot have their freshly-written history cleared.
@@ -2256,12 +2279,7 @@ impl Connection {
         if changed {
             video_send_state.history.clear();
         }
-        codec.map(|_| changed).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("unsupported video codec selected by server: {name}"),
-            )
-        })
+        Ok(changed)
     }
 
     pub(crate) fn video_codec(&self) -> Option<VideoCodec> {
@@ -2288,6 +2306,35 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_stream_cap_retires_lru_instead_of_permanently_rejecting_new_ssrcs() {
+        let mut states = HashMap::new();
+        let mut last_active = HashMap::new();
+        let now = Instant::now();
+        for ssrc in 1..=MAX_REMOTE_MEDIA_STREAMS as Ssrc {
+            states.insert(ssrc, ());
+            last_active.insert(ssrc, now + Duration::from_nanos(u64::from(ssrc)));
+        }
+
+        let incoming = 10_000;
+        assert_eq!(
+            retire_lru_if_full(&mut states, &mut last_active, incoming),
+            Some(1)
+        );
+        assert!(!states.contains_key(&1));
+        assert!(!last_active.contains_key(&1));
+        states.insert(incoming, ());
+        last_active.insert(incoming, Instant::now());
+
+        // Missing activity metadata is repaired first rather than making the
+        // cap reject every future legitimate stream.
+        last_active.remove(&2);
+        assert_eq!(
+            retire_lru_if_full(&mut states, &mut last_active, incoming + 1),
+            Some(2)
+        );
+    }
 
     #[test]
     fn generic_nack_expands_packet_id_and_bitmask() {
@@ -2343,13 +2390,15 @@ mod tests {
                 Duration::from_millis(DEFAULT_VIDEO_KEYFRAME_INTERVAL_MS.into())
             );
 
-            assert!(connection.set_description(
-                SessionDescription::for_tests_with_keyframe_interval(
-                    EncryptionMode::aead_xchacha20_poly1305_rtpsize,
-                    vec![7u8; 32],
-                    Some(5_000),
-                )
-            ));
+            assert!(
+                connection
+                    .set_description(SessionDescription::for_tests_with_keyframe_interval(
+                        EncryptionMode::aead_xchacha20_poly1305_rtpsize,
+                        vec![7u8; 32],
+                        Some(5_000),
+                    ))
+                    .unwrap()
+            );
             assert_eq!(connection.video_keyframe_interval(), Duration::from_secs(5));
 
             assert!(connection.set_video_keyframe_interval_ms(750));
@@ -2358,10 +2407,14 @@ mod tests {
                 Duration::from_millis(750)
             );
 
-            assert!(!connection.set_description(SessionDescription::for_tests(
-                EncryptionMode::aead_xchacha20_poly1305_rtpsize,
-                vec![8u8; 32],
-            )));
+            assert!(
+                !connection
+                    .set_description(SessionDescription::for_tests(
+                        EncryptionMode::aead_xchacha20_poly1305_rtpsize,
+                        vec![8u8; 32],
+                    ))
+                    .unwrap()
+            );
             assert_eq!(
                 connection.video_keyframe_interval(),
                 Duration::from_millis(750),
@@ -2375,10 +2428,14 @@ mod tests {
         smol::block_on(async {
             let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let connection = Connection::new(udp, 1000, 0, 0);
-            assert!(connection.set_description(SessionDescription::for_tests(
-                EncryptionMode::aead_xchacha20_poly1305_rtpsize,
-                vec![7u8; 32],
-            )));
+            assert!(
+                connection
+                    .set_description(SessionDescription::for_tests(
+                        EncryptionMode::aead_xchacha20_poly1305_rtpsize,
+                        vec![7u8; 32],
+                    ))
+                    .unwrap()
+            );
             let pending_dave = DaveSession::new(
                 std::num::NonZeroU16::new(davey::DAVE_PROTOCOL_VERSION).unwrap(),
                 1,
@@ -2437,10 +2494,14 @@ mod tests {
             udp.connect(addr).await.unwrap();
 
             let connection = Connection::new(udp, 1000, 0, 0);
-            assert!(connection.set_description(SessionDescription::for_tests(
-                EncryptionMode::aead_xchacha20_poly1305_rtpsize,
-                vec![7u8; 32],
-            )));
+            assert!(
+                connection
+                    .set_description(SessionDescription::for_tests(
+                        EncryptionMode::aead_xchacha20_poly1305_rtpsize,
+                        vec![7u8; 32],
+                    ))
+                    .unwrap()
+            );
 
             let dave_session = AsyncMutex::new(None);
             let ssrc_to_user_id = DashMap::new();
@@ -2477,10 +2538,14 @@ mod tests {
             let addr = udp.local_addr().unwrap();
             udp.connect(addr).await.unwrap();
             let connection = Connection::new(udp, 1000, 0, 0);
-            assert!(connection.set_description(SessionDescription::for_tests(
-                EncryptionMode::aead_xchacha20_poly1305_rtpsize,
-                vec![7u8; 32],
-            )));
+            assert!(
+                connection
+                    .set_description(SessionDescription::for_tests(
+                        EncryptionMode::aead_xchacha20_poly1305_rtpsize,
+                        vec![7u8; 32],
+                    ))
+                    .unwrap()
+            );
             let dave_session = AsyncMutex::new(None);
             let audio_users = DashMap::new();
             let video_users = DashMap::new();
@@ -2593,10 +2658,14 @@ mod tests {
             udp.connect(addr).await.unwrap();
 
             let connection = Connection::new(udp, 1000, 1001, 1002);
-            assert!(connection.set_description(SessionDescription::for_tests(
-                EncryptionMode::aead_xchacha20_poly1305_rtpsize,
-                vec![7u8; 32],
-            )));
+            assert!(
+                connection
+                    .set_description(SessionDescription::for_tests(
+                        EncryptionMode::aead_xchacha20_poly1305_rtpsize,
+                        vec![7u8; 32],
+                    ))
+                    .unwrap()
+            );
 
             let dave_session = AsyncMutex::new(None);
             let mut send_codec = connection
@@ -2713,10 +2782,14 @@ mod tests {
             udp.connect(addr).await.unwrap();
 
             let connection = Connection::new(udp, 1000, 1001, 1002);
-            assert!(connection.set_description(SessionDescription::for_tests(
-                EncryptionMode::aead_xchacha20_poly1305_rtpsize,
-                vec![7u8; 32],
-            )));
+            assert!(
+                connection
+                    .set_description(SessionDescription::for_tests(
+                        EncryptionMode::aead_xchacha20_poly1305_rtpsize,
+                        vec![7u8; 32],
+                    ))
+                    .unwrap()
+            );
             let dave_session = AsyncMutex::new(None);
             let send_t = connection.video_send_transport(&dave_session);
             let mut codec = connection
@@ -2780,10 +2853,14 @@ mod tests {
             udp.connect(addr).await.unwrap();
 
             let connection = Connection::new(udp, 1000, 1001, 1002);
-            assert!(connection.set_description(SessionDescription::for_tests(
-                EncryptionMode::aead_xchacha20_poly1305_rtpsize,
-                vec![7u8; 32],
-            )));
+            assert!(
+                connection
+                    .set_description(SessionDescription::for_tests(
+                        EncryptionMode::aead_xchacha20_poly1305_rtpsize,
+                        vec![7u8; 32],
+                    ))
+                    .unwrap()
+            );
             assert_eq!(connection.video_codec(), Some(VideoCodec::H264));
             assert!(connection.set_video_codec_name("AV1").unwrap());
             let av1_state = connection
@@ -2848,8 +2925,17 @@ mod tests {
                 av1_state
             );
 
+            let h264_state = connection
+                .selected_video_codec_state
+                .load(Ordering::Acquire);
             assert!(connection.set_video_codec_name("future-codec").is_err());
-            assert_eq!(connection.video_codec(), None);
+            assert_eq!(connection.video_codec(), Some(VideoCodec::H264));
+            assert_eq!(
+                connection
+                    .selected_video_codec_state
+                    .load(Ordering::Acquire),
+                h264_state
+            );
         });
     }
 

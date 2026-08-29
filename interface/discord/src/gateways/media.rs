@@ -2,7 +2,7 @@ use std::{
     error::Error,
     fmt, io, mem,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -45,6 +45,7 @@ pub(crate) use codecs::{AtomicDiscordVideoCodec, DiscordAudioCodec, DiscordVideo
 
 /// Voice gateway protocol version.
 pub(crate) const VOICE_GATEWAY_VERSION: usize = 9;
+const MAX_PENDING_CALL_AUDIO_EVENTS: usize = 128;
 
 pub type SessionId = String;
 
@@ -314,12 +315,12 @@ pub type StreamGateway = MediaGatewaySlot<StreamStatus>;
 /// Per-call mixer-handshake source. It owns only its call channel; gateway and
 /// backend ownership stay outside the source.
 pub(crate) struct CallAudioEventStream {
-    receiver: AsyncMutex<mpsc::UnboundedReceiver<AudioEvent>>,
+    receiver: AsyncMutex<mpsc::Receiver<AudioEvent>>,
     closed: AtomicBool,
 }
 
 impl CallAudioEventStream {
-    fn new(receiver: mpsc::UnboundedReceiver<AudioEvent>) -> Self {
+    fn new(receiver: mpsc::Receiver<AudioEvent>) -> Self {
         Self {
             receiver: AsyncMutex::new(receiver),
             closed: AtomicBool::new(false),
@@ -358,26 +359,41 @@ impl ArcStream for CallAudioEventStream {
 struct CallAudioEvents {
     generation: u64,
     source: Arc<CallAudioEventStream>,
-    sender: mpsc::UnboundedSender<AudioEvent>,
+    // `futures::mpsc` grants one extra slot per Sender clone. Keep exactly one
+    // sender behind a short synchronous lock so repeated submissions cannot
+    // inflate the nominal bounded capacity.
+    sender: StdMutex<mpsc::Sender<AudioEvent>>,
 }
 
 impl CallAudioEvents {
     fn new(generation: u64) -> Self {
-        let (sender, receiver) = mpsc::unbounded();
+        // futures mpsc adds one guaranteed slot per sender; this type keeps
+        // exactly one sender, so subtract it to make the named cap exact.
+        let (sender, receiver) = mpsc::channel(MAX_PENDING_CALL_AUDIO_EVENTS - 1);
         Self {
             generation,
             source: Arc::new(CallAudioEventStream::new(receiver)),
-            sender,
+            sender: StdMutex::new(sender),
         }
     }
 
     fn close(&self) {
         self.source.close();
-        self.sender.close_channel();
+        self.sender
+            .lock()
+            .expect("call audio event sender mutex poisoned")
+            .close_channel();
     }
 
     fn submit(&self, event: AudioEvent) -> bool {
-        !self.source.is_closed() && self.sender.unbounded_send(event).is_ok()
+        if self.source.is_closed() {
+            return false;
+        }
+        self.sender
+            .lock()
+            .expect("call audio event sender mutex poisoned")
+            .try_send(event)
+            .is_ok()
     }
 }
 
@@ -1171,6 +1187,23 @@ mod tests {
 
             assert!(event.is_none());
             assert!(voice.audio_events.load().is_none());
+        });
+    }
+
+    #[test]
+    fn call_audio_event_queue_has_a_strict_fixed_capacity() {
+        smol::block_on(async {
+            let events = CallAudioEvents::new(1);
+            for _ in 0..MAX_PENDING_CALL_AUDIO_EVENTS {
+                let (sender, _receiver) = oneshot::channel();
+                assert!(events.submit(AudioEvent::AddAudioInput(sender)));
+            }
+            let (overflow, _receiver) = oneshot::channel();
+            assert!(!events.submit(AudioEvent::AddAudioInput(overflow)));
+
+            assert!(events.source.clone().next().await.is_some());
+            let (replacement, _receiver) = oneshot::channel();
+            assert!(events.submit(AudioEvent::AddAudioInput(replacement)));
         });
     }
 

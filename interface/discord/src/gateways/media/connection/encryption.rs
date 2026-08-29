@@ -1,4 +1,8 @@
+use std::{fmt, io};
+
 use facet::Facet;
+
+use super::super::{DiscordAudioCodec, DiscordVideoCodec};
 
 // <https://docs.discord.food/topics/voice-connections#transport-encryption-mode>
 #[allow(non_camel_case_types)]
@@ -25,15 +29,10 @@ impl EncryptionMode {
             EncryptionMode::xsalsa20_poly1305_lite => "xsalsa20_poly1305_lite",
         }
     }
-    pub fn nonce_size(&self) -> usize {
+    pub const fn nonce_size(&self) -> Option<usize> {
         match self {
-            EncryptionMode::aead_aes256_gcm => unimplemented!(),
-            EncryptionMode::aead_aes256_gcm_rtpsize => unimplemented!(),
-            EncryptionMode::aead_xchacha20_poly1305_rtpsize => 4,
-            EncryptionMode::xsalsa20_poly1305 => unimplemented!(),
-            EncryptionMode::xsalsa20_poly1305_suffix => unimplemented!(),
-            EncryptionMode::xsalsa20_poly1305_lite => unimplemented!(),
-            EncryptionMode::xsalsa20_poly1305_lite_rtpsize => unimplemented!(),
+            EncryptionMode::aead_xchacha20_poly1305_rtpsize => Some(4),
+            _ => None,
         }
     }
 }
@@ -58,7 +57,7 @@ impl TryFrom<&str> for EncryptionMode {
 }
 
 /// <https://docs.discord.food/topics/voice-connections#session-description-structure>
-#[derive(Debug, Facet)]
+#[derive(Facet)]
 pub struct SessionDescription {
     audio_codec: String,
     video_codec: String,
@@ -68,12 +67,74 @@ pub struct SessionDescription {
     keyframe_interval: Option<u32>,
     dave_protocol_version: u16,
 }
+
+impl fmt::Debug for SessionDescription {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionDescription")
+            .field("audio_codec", &self.audio_codec)
+            .field("video_codec", &self.video_codec)
+            .field("media_session_id", &"[redacted]")
+            .field("mode", &self.mode)
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("keyframe_interval", &self.keyframe_interval)
+            .field("dave_protocol_version", &self.dave_protocol_version)
+            .finish()
+    }
+}
+
 impl SessionDescription {
     pub fn mode(&self) -> Option<&EncryptionMode> {
         self.mode.as_ref()
     }
-    pub fn secret_key(&self) -> Option<&Vec<u8>> {
-        self.secret_key.as_ref()
+    pub fn validated_secret_key(&self) -> io::Result<&[u8; 32]> {
+        let key = self
+            .secret_key
+            .as_deref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing secret key"))?;
+        key.try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "voice transport secret key must contain exactly 32 bytes",
+            )
+        })
+    }
+    pub fn validate(&self) -> io::Result<()> {
+        if !self
+            .audio_codec
+            .eq_ignore_ascii_case(DiscordAudioCodec::Opus.wire_name())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unsupported voice audio codec",
+            ));
+        }
+        if DiscordVideoCodec::from_wire_name(&self.video_codec).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unsupported voice video codec",
+            ));
+        }
+        match self.mode() {
+            Some(EncryptionMode::aead_xchacha20_poly1305_rtpsize) => {}
+            Some(mode) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("unsupported encryption mode: {mode:?}"),
+                ));
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing encryption mode",
+                ));
+            }
+        }
+        self.validated_secret_key()?;
+        Ok(())
     }
     pub fn dave_protocol_version(&self) -> u16 {
         self.dave_protocol_version
@@ -108,5 +169,70 @@ impl SessionDescription {
             keyframe_interval,
             dave_protocol_version: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_modes_have_no_panic_capable_nonce_size() {
+        assert_eq!(EncryptionMode::aead_aes256_gcm.nonce_size(), None);
+        assert_eq!(
+            EncryptionMode::aead_xchacha20_poly1305_rtpsize.nonce_size(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn session_description_rejects_invalid_transport_state() {
+        let short_key = SessionDescription::for_tests(
+            EncryptionMode::aead_xchacha20_poly1305_rtpsize,
+            vec![7; 31],
+        );
+        assert_eq!(
+            short_key.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let unsupported =
+            SessionDescription::for_tests(EncryptionMode::aead_aes256_gcm, vec![7; 32]);
+        assert_eq!(
+            unsupported.validate().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+
+        let mut unsupported_audio = SessionDescription::for_tests(
+            EncryptionMode::aead_xchacha20_poly1305_rtpsize,
+            vec![7; 32],
+        );
+        unsupported_audio.audio_codec = "aac".into();
+        assert_eq!(
+            unsupported_audio.validate().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+
+        let mut unsupported_video = SessionDescription::for_tests(
+            EncryptionMode::aead_xchacha20_poly1305_rtpsize,
+            vec![7; 32],
+        );
+        unsupported_video.video_codec = "VP9".into();
+        assert_eq!(
+            unsupported_video.validate().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn session_description_debug_redacts_secret_material() {
+        let description = SessionDescription::for_tests(
+            EncryptionMode::aead_xchacha20_poly1305_rtpsize,
+            vec![251; 32],
+        );
+        let debug = format!("{description:?}");
+
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("251"));
     }
 }

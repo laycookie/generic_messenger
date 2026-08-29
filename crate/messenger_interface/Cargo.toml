@@ -8,8 +8,8 @@ license = "GPL-2.0-only"
 repository = "https://github.com/laycookie/generic_messenger"
 
 [dependencies]
-simple-audio-channels = { path = "../audio", version = "0.0.1" }
-simple-video = { path = "../video", version = "0.0.1", default-features = false }
+simple-audio-channels = { workspace = true }
+simple-video = { workspace = true }
 messenger_stream = { path = "../messenger_stream", version = "0.0.1" }
 tracing = { workspace = true }
 async-trait = { workspace = true }
@@ -18,9 +18,9 @@ facet = { workspace = true }
 facet-error = { workspace = true }
 bitflags = { workspace = true }
 chrono = { workspace = true }
-secure-string = "0.3.0"
-credential_macro = { path = "../../macro" }
-tempfile = "3"
+secure-string = { workspace = true }
+credential_macro = { workspace = true }
+tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { workspace = true, features = ["fs"] }

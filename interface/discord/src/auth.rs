@@ -3,6 +3,7 @@
 use std::error::Error;
 
 use credential_macro::base64_literal;
+use messenger_downloader::DownloadError;
 use messenger_interface::auth::{
     AuthFuture, Credential, CredentialField, CredentialSchema, InteractiveAuthMethod,
     InteractiveAuthPrompt, InteractiveAuthSession, QrPayload,
@@ -51,7 +52,7 @@ pub(crate) const fn login_headers() -> [(&'static str, &'static str); 2] {
 pub(crate) enum DiscordAuth {
     #[credential(method = "Token")]
     Token {
-        #[credential(label = "Token")]
+        #[credential(label = "Token", secret)]
         token: SecureString,
     },
     #[credential(method = "Email & password")]
@@ -60,7 +61,7 @@ pub(crate) enum DiscordAuth {
         username: SecureString,
         #[credential(label = "Password", secret)]
         password: SecureString,
-        #[credential(label = "Two-factor code (if enabled)")]
+        #[credential(label = "Two-factor code (if enabled)", secret)]
         otp: Option<SecureString>,
     },
 }
@@ -184,10 +185,7 @@ pub(crate) async fn login_with_credentials(
     }
 }
 
-fn explain_login_error(
-    err: Box<dyn Error + Sync + Send>,
-    login: &str,
-) -> Box<dyn Error + Sync + Send> {
+fn explain_login_error(err: DownloadError, login: &str) -> Box<dyn Error + Sync + Send> {
     let body = err.to_string();
     if body.contains("captcha") {
         return "Discord requires a CAPTCHA for this login, which this app cannot solve. \
@@ -205,7 +203,7 @@ fn explain_login_error(
         };
         return hint.into();
     }
-    err
+    Box::new(err)
 }
 
 #[cfg(test)]
@@ -219,6 +217,44 @@ mod tests {
         };
 
         assert_eq!(method.label, "QR code");
+    }
+
+    #[test]
+    fn token_password_and_otp_prompts_are_masked() {
+        let methods = DiscordAuth::auth_methods();
+        let token = methods
+            .iter()
+            .find(|method| method.label == "Token")
+            .unwrap();
+        assert!(token.fields.iter().all(|field| field.secret));
+
+        let password = methods
+            .iter()
+            .find(|method| method.label == "Email & password")
+            .unwrap();
+        assert!(
+            password
+                .fields
+                .iter()
+                .filter(|field| matches!(field.key, "password" | "otp"))
+                .all(|field| field.secret)
+        );
+    }
+
+    #[test]
+    fn mixed_or_duplicate_credential_fields_are_rejected() {
+        let mixed = Credential(vec![
+            CredentialField::new("token", "token-value"),
+            CredentialField::new("username", "user@example.com"),
+            CredentialField::new("password", "password"),
+        ]);
+        assert!(DiscordAuth::try_from(mixed).is_err());
+
+        let duplicate = Credential(vec![
+            CredentialField::new("token", "first"),
+            CredentialField::new("token", "second"),
+        ]);
+        assert!(DiscordAuth::try_from(duplicate).is_err());
     }
 
     #[test]

@@ -22,6 +22,8 @@ where
 
 pub(crate) use frame::{GatewayFrame, GatewayFrameConversionError, GatewayPayload};
 pub(crate) use polling::{GatewayTurn, finish_committed_gateway_turn};
-pub(crate) use state::{GatewayState, Handshake, Handshaking, Heartbeat, expect_hello};
-pub(crate) use supervisor::GatewaySupervisor;
+pub(crate) use state::{
+    GatewayState, Handshake, Handshaking, Heartbeat, expect_hello, with_timeout,
+};
+pub(crate) use supervisor::{GatewaySupervisor, ReconnectMode};
 pub(crate) use transport::{GatewayStreamExt, Websocket};

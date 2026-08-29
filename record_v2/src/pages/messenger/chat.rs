@@ -253,14 +253,14 @@ impl Chat {
     /// Fetch this room's custom emoji and stickers from the backend.
     fn load_palette(&self, messengers: &MessengerRegistry) -> Task<Message> {
         let room = self.room.clone();
-        let Some(palette) = messengers.with_interface_async(
-            self.messenger,
-            async move |interface| match interface.messenger().text() {
+        let Some(palette) =
+            messengers.with_interface_async(self.messenger, async move |interface| match interface
+                .messenger()
+                .text()
+            {
                 Ok(text) => {
-                    let (emojis, stickers) = futures::join!(
-                        text.pickable_emojis(&room),
-                        text.pickable_stickers(&room)
-                    );
+                    let (emojis, stickers) =
+                        futures::join!(text.pickable_emojis(&room), text.pickable_stickers(&room));
                     (
                         emojis.unwrap_or_else(|e| {
                             debug!("No custom emoji palette: {e}");
@@ -273,8 +273,8 @@ impl Chat {
                     )
                 }
                 Err(_) => (Vec::new(), Vec::new()),
-            },
-        ) else {
+            })
+        else {
             return Task::none();
         };
         Task::future(async move {
@@ -589,11 +589,7 @@ impl Chat {
         column![channel_info, chat, composer].into()
     }
 
-    pub fn update(
-        &mut self,
-        message: Message,
-        messengers: &MessengerRegistry,
-    ) -> UpdateResult {
+    pub fn update(&mut self, message: Message, messengers: &MessengerRegistry) -> UpdateResult {
         match message {
             Message::MsgInput(change) => {
                 self.msg_box = change;

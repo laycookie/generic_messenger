@@ -107,7 +107,9 @@ fn expand_credential_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
             decls.push(quote! { let mut #fident = ::core::option::Option::None; });
             arms.push(quote! {
                 #key => {
-                    if #fident.is_none() {
+                    if #fident.is_some() {
+                        __variant_matches = false;
+                    } else {
                         #fident = ::core::option::Option::Some(__field.value.clone());
                     }
                 }
@@ -133,30 +135,39 @@ fn expand_credential_schema(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         });
 
-        // A variant matches when every required field was supplied; optional
-        // fields pass through as `Option`. First matching variant wins.
+        // A variant matches only when every supplied key belongs to it, no key
+        // is duplicated, and every required field exists. Optional fields pass
+        // through as `Option`. Exact matching prevents malformed mixed-method
+        // credentials from being silently interpreted as the first variant.
         let success = quote! {
             return ::core::result::Result::Ok(#name::#vident { #(#construct),* });
         };
         let body = if required.is_empty() {
-            success
+            quote! {
+                if __variant_matches {
+                    #success
+                }
+            }
         } else {
             quote! {
-                if let ( #( ::core::option::Option::Some(#required) ),* ,) =
-                    ( #( #required ),* ,)
-                {
-                    #success
+                if __variant_matches {
+                    if let ( #( ::core::option::Option::Some(#required) ),* ,) =
+                        ( #( #required ),* ,)
+                    {
+                        #success
+                    }
                 }
             }
         };
 
         parse_blocks.push(quote! {
             {
+                let mut __variant_matches = true;
                 #(#decls)*
                 for __field in &__cred.0 {
                     match __field.key {
                         #(#arms)*
-                        _ => {}
+                        _ => __variant_matches = false,
                     }
                 }
                 #body

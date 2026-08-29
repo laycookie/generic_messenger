@@ -2,7 +2,10 @@ pub mod login;
 pub mod messenger;
 pub mod settings;
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::Screen;
 use futures::channel::oneshot;
@@ -15,6 +18,59 @@ use messenger_interface::owner::Owner;
 use messenger_interface::types::{House, ID, Identifier, Place, Room, User};
 use messenger_unifier::{MessengerId, MessengerRegistry};
 use simple_video::CaptureSource;
+use zeroize::Zeroizing;
+
+static NEXT_RETAINED_CREDENTIAL_ID: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) struct RetainedCredential {
+    pub id: u64,
+    pub name: String,
+    pub auth: Zeroizing<String>,
+    pub failure: CredentialFailure,
+}
+
+pub(crate) enum CredentialFailure {
+    BackendUnavailable,
+    CredentialParseFailed,
+    SessionRestoreFailed,
+}
+
+impl CredentialFailure {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::BackendUnavailable => "BACKEND_UNAVAILABLE",
+            Self::CredentialParseFailed => "CREDENTIAL_PARSE_FAILED",
+            Self::SessionRestoreFailed => "SESSION_RESTORE_FAILED",
+        }
+    }
+
+    pub const fn detail(&self) -> &'static str {
+        match self {
+            Self::BackendUnavailable => "Backend is unknown or not enabled in this build.",
+            Self::CredentialParseFailed => {
+                "Stored credential does not match the backend authentication schema."
+            }
+            Self::SessionRestoreFailed => {
+                "Saved credentials could not restore this session. Sign in again or remove the saved account."
+            }
+        }
+    }
+}
+
+impl RetainedCredential {
+    pub fn new(name: &str, auth: &str, failure: CredentialFailure) -> Self {
+        Self::from_owned(name.to_owned(), Zeroizing::new(auth.to_owned()), failure)
+    }
+
+    pub fn from_owned(name: String, auth: Zeroizing<String>, failure: CredentialFailure) -> Self {
+        Self {
+            id: NEXT_RETAINED_CREDENTIAL_ID.fetch_add(1, Ordering::Relaxed),
+            name,
+            auth,
+            failure,
+        }
+    }
+}
 
 pub type RemoteVideoKey = (MessengerId, VideoStreamId);
 pub type VideoInputKey = (MessengerId, VideoBroadcastKind);
@@ -273,6 +329,10 @@ pub(crate) enum AppMessage {
         kind: ListenerKind,
         error: Option<String>,
         retry: bool,
+    },
+    CredentialsRestored {
+        messengers: Vec<Owner<dyn Messenger>>,
+        retained: Vec<RetainedCredential>,
     },
     SaveCredentials,
     // === Audio ===

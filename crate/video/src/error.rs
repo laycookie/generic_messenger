@@ -5,8 +5,19 @@ use std::{
 
 /// Error produced while validating, converting, encoding, or decoding video.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum VideoError {
     InvalidDimensions,
+    InvalidFrameRate {
+        minimum: u32,
+        maximum: u32,
+        actual: u32,
+    },
+    InvalidBitrate {
+        minimum: u32,
+        maximum: u32,
+        actual: u32,
+    },
     FrameSizeOverflow,
     FrameSizeMismatch {
         expected: usize,
@@ -30,6 +41,22 @@ impl Display for VideoError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidDimensions => formatter.write_str("invalid video frame dimensions"),
+            Self::InvalidFrameRate {
+                minimum,
+                maximum,
+                actual,
+            } => write!(
+                formatter,
+                "video frame rate must be between {minimum} and {maximum} FPS, got {actual}"
+            ),
+            Self::InvalidBitrate {
+                minimum,
+                maximum,
+                actual,
+            } => write!(
+                formatter,
+                "video bitrate must be between {minimum} and {maximum} bps, got {actual}"
+            ),
             Self::FrameSizeOverflow => formatter.write_str("video frame size overflow"),
             Self::FrameSizeMismatch { expected, actual } => {
                 write!(

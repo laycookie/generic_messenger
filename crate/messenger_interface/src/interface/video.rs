@@ -175,10 +175,13 @@ pub enum VideoEvent {
         id: VideoStreamId,
         metadata: VideoStreamMetadata,
     },
-    /// Remote frames started; reply with [`frame_channel`] producer.
+    /// Remote frames started. `initial_frame` preserves the decoded frame that
+    /// discovered the stream; reply with a [`frame_channel`] producer for later
+    /// frames.
     AddVideoStream {
         id: VideoStreamId,
         metadata: VideoStreamMetadata,
+        initial_frame: VideoFrame,
         channel: oneshot::Sender<FrameProducer>,
     },
     /// Removes advertised or active remote stream.

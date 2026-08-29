@@ -9,10 +9,10 @@
 //! SteamID into the `Identifier<User>` the UI renders. Mirrors the Discord
 //! interface's typed `CdnImage` caching.
 
-use std::{io, path::PathBuf};
+use std::path::PathBuf;
 
 use dashmap::DashMap;
-use messenger_downloader::{Cached, DownloadError, DownloadResult, Fetch};
+use messenger_downloader::{Cached, DownloadError, Fetch};
 use sha2::{Digest as _, Sha256};
 
 use messenger_interface::types::{CacheCategory, ID, Identifier, User};
@@ -66,7 +66,7 @@ impl SteamImage {
         }
     }
 
-    fn url(&self) -> DownloadResult<String> {
+    fn url(&self) -> Result<String, DownloadError> {
         match self {
             Self::Avatar { hash, .. } => {
                 validate_avatar_hash(hash)?;
@@ -89,7 +89,7 @@ impl SteamImage {
     /// — so a single owner's images share a directory and distinct owners never
     /// collide on a shared hash. Emoticons and stickers are globally identified
     /// by their own name, so they sit directly under the category.
-    fn file_name(&self) -> DownloadResult<String> {
+    fn file_name(&self) -> Result<String, DownloadError> {
         match self {
             Self::Avatar { steamid, hash } => {
                 validate_avatar_hash(hash)?;
@@ -117,7 +117,7 @@ impl SteamImage {
     /// Fetch the image (or load it from the on-disk cache) and return its local
     /// path. A cache hit skips the network; the shared downloader handles the
     /// existence check and atomic write.
-    pub(crate) async fn fetch(self) -> DownloadResult<PathBuf> {
+    pub(crate) async fn fetch(self) -> Result<PathBuf, DownloadError> {
         let url = self.url()?;
         let file_name = self.file_name()?;
         Fetch::<Cached>::cached_fetch(
@@ -132,34 +132,36 @@ impl SteamImage {
     }
 }
 
-fn validate_item_reference(reference: &str) -> DownloadResult<()> {
+fn validate_item_reference(reference: &str) -> Result<(), DownloadError> {
     if reference.is_empty()
         || reference.len() > MAX_ITEM_REFERENCE_LEN
         || reference.chars().any(char::is_control)
         || matches!(reference, "." | "..")
     {
-        return Err(invalid_reference("invalid Steam image reference"));
+        return Err(DownloadError::InvalidInput("invalid Steam image reference"));
     }
     Ok(())
 }
 
-fn validate_avatar_hash(hash: &str) -> DownloadResult<()> {
+fn validate_avatar_hash(hash: &str) -> Result<(), DownloadError> {
     if hash.len() != 40 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(invalid_reference("invalid Steam avatar SHA-1 hash"));
+        return Err(DownloadError::InvalidInput(
+            "invalid Steam avatar SHA-1 hash",
+        ));
     }
     Ok(())
 }
 
-fn cdn_item_url(base: &str, item: &str) -> DownloadResult<String> {
+fn cdn_item_url(base: &str, item: &str) -> Result<String, DownloadError> {
     validate_item_reference(item)?;
     let mut url = surf::Url::parse(base)?;
     url.path_segments_mut()
-        .map_err(|_| invalid_reference("Steam CDN URL cannot contain path segments"))?
+        .map_err(|_| DownloadError::InvalidInput("Steam CDN URL cannot contain path segments"))?
         .push(item);
     Ok(url.into())
 }
 
-fn validate_sticker_url(url: &surf::Url) -> DownloadResult<()> {
+fn validate_sticker_url(url: &surf::Url) -> Result<(), DownloadError> {
     const ALLOWED_HOSTS: [&str; 2] = [
         "community.steamstatic.com",
         "community.akamai.steamstatic.com",
@@ -175,7 +177,7 @@ fn validate_sticker_url(url: &surf::Url) -> DownloadResult<()> {
             .is_some_and(|host| ALLOWED_HOSTS.contains(&host))
         && url.path().starts_with("/economy/sticker/");
     if !trusted {
-        return Err(invalid_reference(
+        return Err(DownloadError::InvalidInput(
             "Steam sticker URL must use approved HTTPS Steam CDN endpoint",
         ));
     }
@@ -195,10 +197,6 @@ fn reference_cache_key(kind: &str, reference: &str) -> String {
         output.push(HEX[usize::from(byte & 0x0f)] as char);
     }
     output
-}
-
-fn invalid_reference(message: &'static str) -> DownloadError {
-    io::Error::new(io::ErrorKind::InvalidInput, message).into()
 }
 
 pub(crate) async fn steam_user_identifier(

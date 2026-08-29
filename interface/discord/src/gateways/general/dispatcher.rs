@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    io,
-    sync::{Arc, atomic::Ordering},
-};
+use std::{collections::HashMap, io, num::NonZeroU64, sync::Arc, time::Duration};
 
 use facet_pretty::FacetPretty;
 use futures::future::join_all;
@@ -29,9 +25,10 @@ use crate::{
     api::{self, Message},
     downloaders::CdnImage,
     gateways::{
-        GatewayFrame,
+        GatewayFrame, ReconnectMode,
         media::{ConnectProgress, Endpoint, StreamKey},
     },
+    random::SystemRandom,
 };
 
 impl GatewayFrame<Opcode> {
@@ -46,14 +43,6 @@ impl GatewayFrame<Opcode> {
         let payload = self.payload()?;
         let context = EventContext::new(&discord.cache, &discord.media, gateway);
 
-        if let Some(s) = payload.sequence() {
-            gateway
-                .state
-                .last_sequence_number
-                .get_or_init(|| s.into())
-                .store(s, Ordering::Relaxed);
-        };
-
         match payload.opcode() {
             Opcode::Hello => {}
             Opcode::Dispatch => {
@@ -61,10 +50,25 @@ impl GatewayFrame<Opcode> {
                     warn!("Dispatch opcode received without an event type (t)");
                     return Ok(());
                 };
+                let event_name = match event_name {
+                    Ok(event_name) => event_name,
+                    Err(err) => {
+                        // Unknown dispatches are forward-compatible no-ops. The
+                        // ordered executor still commits their sequence after
+                        // this handler succeeds so Resume never replays forever.
+                        debug!("Ignoring unknown Discord dispatch event: {err}");
+                        return Ok(());
+                    }
+                };
                 debug!("Dispatch event: {}", event_name.pretty());
-                match event_name {
+                match &event_name {
                     GatewayEvent::Ready => {
                         let ready = payload.decode::<ReadyPayload>()?;
+                        let resumable_session = ready
+                            .session_id
+                            .clone()
+                            .zip(ready.resume_gateway_url.clone())
+                            .zip(payload.sequence());
                         // Reconnects reuse runtime state. Clear every
                         // session-scoped cache before publishing this Ready,
                         // including empty collections, so deleted entities do
@@ -184,11 +188,31 @@ impl GatewayFrame<Opcode> {
 
                         discord.cache.replace_guilds(cached_guilds);
                         join_all(voice_participant_futures).await;
+
+                        gateway.mark_resumed();
+                        if let Some(((session_id, gateway_url), sequence)) = resumable_session {
+                            // Register only after the full READY snapshot has
+                            // applied; an error above must force Identify rather
+                            // than preserving partially initialized state.
+                            discord.gateway.register_resume_session(
+                                gateway,
+                                session_id,
+                                gateway_url,
+                                sequence,
+                            );
+                        } else {
+                            discord.gateway.discard_resume_session(gateway);
+                            warn!("READY omitted data required for Gateway Resume");
+                        }
+                    }
+                    GatewayEvent::Resumed => {
+                        gateway.mark_resumed();
+                        discord.gateway.confirm_resume_session(gateway);
+                        debug!("Discord Gateway session resumed successfully");
                     }
                     GatewayEvent::SessionsReplace => {
-                        debug!("Session replace");
-                        let session = payload.decode::<Vec<SessionObjectPayload>>()?;
-                        debug!("{}", session.pretty());
+                        let sessions = payload.decode::<Vec<SessionObjectPayload>>()?;
+                        debug!(count = sessions.len(), "Session list replaced");
                     }
                     GatewayEvent::GuildCreate => {
                         let guild = payload.decode::<ReadyGuildPayload>()?;
@@ -510,14 +534,24 @@ impl GatewayFrame<Opcode> {
                         let channel_id_hash = message.channel_id;
                         let msg_id_hash = message.id;
 
-                        trace!("{}", message.pretty());
-                        let (content, history) = message.revisions().await;
-                        let icon = match &message.author.avatar {
-                            Some(hash) => {
-                                CdnImage::avatar(message.author.id, hash).fetch().await.ok()
+                        trace!(
+                            channel_id = message.channel_id,
+                            message_id = message.id,
+                            author_id = message.author.id,
+                            content_bytes = message.content.len(),
+                            sticker_count = message.sticker_items.as_ref().map_or(0, Vec::len),
+                            "Message created"
+                        );
+                        let avatar = async {
+                            match &message.author.avatar {
+                                Some(hash) => {
+                                    CdnImage::avatar(message.author.id, hash).fetch().await.ok()
+                                }
+                                None => None,
                             }
-                            None => None,
                         };
+                        let ((content, history), icon) =
+                            futures::join!(message.revisions(), avatar);
                         let author = Identifier::new(
                             message.author.id,
                             GlobalUser {
@@ -561,7 +595,14 @@ impl GatewayFrame<Opcode> {
                             }
                         };
 
-                        trace!("{}", message.pretty());
+                        trace!(
+                            channel_id = message.channel_id,
+                            message_id = message.id,
+                            author_id = message.author.id,
+                            content_bytes = message.content.len(),
+                            sticker_count = message.sticker_items.as_ref().map_or(0, Vec::len),
+                            "Message updated"
+                        );
 
                         // Record before emitting: if a concurrent
                         // `rest_get_messages` is in flight, its merge step
@@ -576,16 +617,21 @@ impl GatewayFrame<Opcode> {
                                 message: message.clone(),
                             });
 
-                        let (content, history) = message.revisions().await;
+                        let avatar = async {
+                            match &message.author.avatar {
+                                Some(hash) => {
+                                    CdnImage::avatar(message.author.id, hash).fetch().await.ok()
+                                }
+                                None => None,
+                            }
+                        };
                         // Edit payloads often omit `reactions`; map what we
                         // got so reactions survive when they are included.
-                        let reactions = message.interface_reactions().await;
-                        let icon = match &message.author.avatar {
-                            Some(hash) => {
-                                CdnImage::avatar(message.author.id, hash).fetch().await.ok()
-                            }
-                            None => None,
-                        };
+                        let ((content, history), reactions, icon) = futures::join!(
+                            message.revisions(),
+                            message.interface_reactions(),
+                            avatar
+                        );
                         let author = Identifier::new(
                             message.author.id,
                             GlobalUser {
@@ -763,7 +809,13 @@ impl GatewayFrame<Opcode> {
                         // STREAM_SERVER_UPDATE (endpoint + token); either can
                         // arrive first, so both retry the connect.
                         let payload = payload.decode::<StreamCreatePayload>()?;
-                        trace!("{}", payload.pretty());
+                        trace!(
+                            stream_key = %payload.stream_key,
+                            rtc_server_id = ?payload.rtc_server_id,
+                            viewer_count = payload.viewer_ids.as_ref().map_or(0, Vec::len),
+                            paused = ?payload.paused,
+                            "Stream created or updated"
+                        );
                         if let Some(rtc_server_id) = payload.rtc_server_id {
                             let stream_key = StreamKey::from(payload.stream_key);
                             if gateway.voice.broadcast.watching().await.as_ref()
@@ -786,7 +838,12 @@ impl GatewayFrame<Opcode> {
                     }
                     GatewayEvent::StreamServerUpdate => {
                         let payload = payload.decode::<StreamServerUpdatePayload>()?;
-                        trace!("{}", payload.pretty());
+                        trace!(
+                            stream_key = %payload.stream_key,
+                            guild_id = ?payload.guild_id,
+                            has_endpoint = payload.endpoint.is_some(),
+                            "Stream server updated"
+                        );
                         let stream_key = StreamKey::from(payload.stream_key);
                         let Some(endpoint) = payload.endpoint else {
                             warn!("STREAM_SERVER_UPDATE without an endpoint");
@@ -838,18 +895,30 @@ impl GatewayFrame<Opcode> {
                     _ => warn!("Unknown event_name received: {}", event_name.pretty()),
                 }
             }
-            Opcode::Reconnect | Opcode::InvalidSession => {
-                // The server wants this connection gone (and we don't
-                // implement RESUME). Tear the gateway down: the event
-                // streams end, and a later listener setup establishes a
-                // fresh connection with a fresh `Ready` snapshot.
-                warn!(
-                    "Server requested reconnect / invalidated the session; tearing down the gateway"
-                );
-                discord.end_gateway_session(gateway).await;
+            Opcode::Reconnect => {
+                warn!("Discord requested a reconnect; preserving the resumable session");
+                discord
+                    .end_gateway_session(gateway, ReconnectMode::Resume)
+                    .await;
             }
-            Opcode::HeartbeatAck => {
-                trace!("HeartbeatAck");
+            Opcode::InvalidSession => {
+                let resumable = payload.decode::<bool>()?;
+                // Discord requires randomized backoff before either Resume or
+                // Identify after opcode 9, preventing reconnect stampedes.
+                let backoff_choices =
+                    NonZeroU64::new(5).expect("invalid-session backoff range is nonzero");
+                let delay = Duration::from_secs(SystemRandom::default().below(backoff_choices) + 1);
+                let reconnect = if resumable {
+                    ReconnectMode::ResumeAfter(delay)
+                } else {
+                    ReconnectMode::ReidentifyAfter(delay)
+                };
+                warn!(
+                    resumable,
+                    ?delay,
+                    "Discord invalidated the current Gateway connection"
+                );
+                discord.end_gateway_session(gateway, reconnect).await;
             }
             _ => {
                 warn!("Unknown opcode received: {}", payload.opcode().pretty())

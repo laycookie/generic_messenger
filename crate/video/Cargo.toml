@@ -11,25 +11,26 @@ readme = "README.md"
 default = ["capture"]
 av1 = ["dep:rav1e"]
 h264 = ["dep:openh264"]
-capture = ["dep:nokhwa", "dep:scap", "dep:thiserror", "dep:v4l"]
+capture = ["dep:facet", "dep:facet-error", "dep:nokhwa", "dep:scap", "dep:v4l"]
 bench-internals = []
 
 [dependencies]
+facet = { workspace = true, optional = true }
+facet-error = { workspace = true, optional = true }
 futures = { workspace = true }
 openh264 = { version = "0.9.7", optional = true }
 rav1e = { version = "0.8.1", default-features = false, features = ["asm", "threading"], optional = true }
-thiserror = { version = "2.0.12", optional = true }
 tracing = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nokhwa = { version = "0.10.11", features = ["input-v4l"], optional = true }
+nokhwa = { workspace = true, features = ["input-v4l"], optional = true }
 v4l = { version = "0.14.0", default-features = false, features = ["v4l2-sys"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nokhwa = { version = "0.10.11", features = ["input-avfoundation"], optional = true }
+nokhwa = { workspace = true, features = ["input-avfoundation"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-nokhwa = { version = "0.10.11", features = ["input-msmf"], optional = true }
+nokhwa = { workspace = true, features = ["input-msmf"], optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 # 0.1.0-beta.1 pulls cpal 0.15, whose alsa-sys link conflicts with
@@ -37,7 +38,7 @@ nokhwa = { version = "0.10.11", features = ["input-msmf"], optional = true }
 scap = { version = "0.0.8", optional = true }
 
 [dev-dependencies]
-criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+criterion = { workspace = true }
 
 [[bench]]
 name = "simd_conversions"

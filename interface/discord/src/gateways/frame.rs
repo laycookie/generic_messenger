@@ -65,8 +65,11 @@ impl TryFrom<WebsocketMessage> for GatewayFrame<media::VoiceOpcode> {
 #[derive(Facet)]
 struct JsonGatewayPayload<'a, Op> {
     op: Op,
-    t: Option<GatewayEvent>,
-    s: Option<usize>,
+    // Keep dispatch event names raw. Discord can add event names without a
+    // gateway version bump; decoding the envelope must still preserve `s` so
+    // heartbeats/resume state advance even when this client ignores the event.
+    t: Option<facet_json::RawJson<'a>>,
+    s: Option<u64>,
     d: facet_json::RawJson<'a>,
 }
 
@@ -77,8 +80,8 @@ enum GatewayData<'a> {
 
 pub(crate) struct GatewayPayload<'a, Op> {
     op: Op,
-    event_type: Option<GatewayEvent>,
-    sequence: Option<usize>,
+    event_type: Option<facet_json::RawJson<'a>>,
+    sequence: Option<u64>,
     data: GatewayData<'a>,
 }
 
@@ -115,7 +118,7 @@ where
                 Ok(GatewayPayload {
                     op,
                     event_type: None,
-                    sequence: frame.sequence.map(usize::from),
+                    sequence: frame.sequence.map(u64::from),
                     data: GatewayData::Binary(frame.payload),
                 })
             }
@@ -129,11 +132,21 @@ impl<'a, Op> GatewayPayload<'a, Op> {
         &self.op
     }
 
-    pub(super) fn event_type(&self) -> Option<&GatewayEvent> {
-        self.event_type.as_ref()
+    /// Decode a known dispatch event name without making the surrounding
+    /// gateway envelope depend on that closed enum. `Some(Err(_))` means the
+    /// server sent a syntactically valid but unknown/non-string `t` value.
+    pub(super) fn event_type(&self) -> Option<Result<GatewayEvent, io::Error>> {
+        self.event_type.as_ref().map(|raw| {
+            facet_json::from_str(raw.as_str()).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown gateway event type: {err}"),
+                )
+            })
+        })
     }
 
-    pub(super) fn sequence(&self) -> Option<usize> {
+    pub(super) fn sequence(&self) -> Option<u64> {
         self.sequence
     }
 
@@ -161,13 +174,6 @@ impl<'a, Op> GatewayPayload<'a, Op> {
             )),
         }
     }
-
-    pub(super) fn raw_json(&self) -> Option<&str> {
-        match &self.data {
-            GatewayData::Json(raw) => Some(raw.as_str()),
-            GatewayData::Binary(_) => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -181,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn main_frame_decodes_raw_json_data() {
+    fn main_frame_decodes_json_data() {
         let message = WebsocketMessage::Text(
             r#"{"op":0,"t":"MESSAGE_DELETE_BULK","s":42,"d":{"value":7}}"#.into(),
         );
@@ -194,10 +200,22 @@ mod tests {
         ));
         assert!(matches!(
             payload.event_type(),
-            Some(GatewayEvent::MessageDeleteBulk)
+            Some(Ok(GatewayEvent::MessageDeleteBulk))
         ));
         assert_eq!(payload.sequence(), Some(42));
-        assert_eq!(payload.raw_json(), Some(r#"{"value":7}"#));
+        assert_eq!(payload.decode::<TestPayload>().unwrap().value, 7);
+    }
+
+    #[test]
+    fn main_frame_preserves_unknown_dispatch_sequence() {
+        let message = WebsocketMessage::Text(
+            r#"{"op":0,"t":"FUTURE_DISPATCH","s":43,"d":{"value":7}}"#.into(),
+        );
+        let frame = GatewayFrame::<super::super::general::Opcode>::try_from(message).unwrap();
+        let payload = frame.payload().unwrap();
+
+        assert_eq!(payload.sequence(), Some(43));
+        assert!(matches!(payload.event_type(), Some(Err(_))));
         assert_eq!(payload.decode::<TestPayload>().unwrap().value, 7);
     }
 

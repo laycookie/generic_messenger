@@ -1,280 +1,134 @@
-//! Persistence for the `LoginInfo` credential file.
+//! Persistent login credential storage.
 //!
-//! The file format is one `name:auth` pair per line, where `name` identifies a
-//! platform and `auth` is that platform's serialized [`Credential`]. The generic
-//! [`load`]/[`save`] functions own the line layer (the `name:auth` split); the
-//! [`to_line`]/[`from_line`] codec owns turning a [`Credential`]'s collected
-//! fields into a delimiter-safe `auth` blob and back.
+//! [`to_line`]/[`from_line`] encode a backend [`Credential`] as a delimiter-safe
+//! percent-encoded `key=value&...` blob. A secret containing `:` `&` `=` or a
+//! newline therefore round-trips intact, and each decoded key is resolved back
+//! to one of the backend's known static field keys.
 //!
-//! A blob is a percent-encoded `key=value&...` list, one pair per collected
-//! field (the key is the field's schema key), so a secret containing `:` `&` `=`
-//! or a newline round-trips intact. On load, each key is resolved back to one of
-//! the backend's known field keys.
-//!
-//! TODO(security): credentials remain plaintext. Replace this file with an OS
-//! credential vault/keyring while retaining this codec only for migration.
+//! [`load`]/[`save`] keep those blobs in the operating system's credential vault
+//! when it is usable. `LoginInfo` then contains only a versioned list of backend
+//! names and opaque vault identifiers. Existing legacy `name:auth` plaintext
+//! files remain readable on Unix for compatibility and are migrated
+//! transactionally: the file is replaced only after every secret has been
+//! written successfully. When the OS vault is unavailable, Unix falls back to
+//! an owner-only plaintext store; status-aware APIs report that downgrade and
+//! its sanitized cause. Explicit plaintext selection uses a tagged format so it
+//! persists without being auto-migrated. Vault manifests are downgraded only by
+//! an explicit [`StorageMode::Plaintext`] request.
 
-use std::{
-    fs::{self, File},
-    io::{self, BufRead, BufReader, Write},
-    path::Path,
+mod codec;
+mod filesystem;
+mod store;
+mod vault;
+
+const MAX_LOGIN_FILE_BYTES: u64 = 1024 * 1024;
+const VAULT_MANIFEST_PREFIX: &str = "# generic_messenger credential vault ";
+const VAULT_MANIFEST_HEADER: &str = "# generic_messenger credential vault v1";
+const PLAINTEXT_STORE_PREFIX: &str = "# generic_messenger plaintext credentials ";
+const PLAINTEXT_STORE_HEADER: &str = "# generic_messenger plaintext credentials v1";
+const VAULT_JOURNAL_PREFIX: &str = "# generic_messenger credential vault transaction ";
+const VAULT_JOURNAL_HEADER_V1: &str = "# generic_messenger credential vault transaction v1";
+const VAULT_JOURNAL_HEADER: &str = "# generic_messenger credential vault transaction v2";
+const VAULT_SERVICE: &str = "io.github.mroute.generic_messenger";
+
+const EXISTING_PLAINTEXT_STORE_ALLOWED: bool = cfg!(unix);
+
+/// Opaque fingerprint used to reject stale cross-process credential writes.
+#[derive(Clone, Eq, PartialEq)]
+pub struct StoreRevision([u8; 32]);
+
+impl std::fmt::Debug for StoreRevision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StoreRevision(..)")
+    }
+}
+
+/// Durable location used for saved login secrets.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum StorageMode {
+    /// Native OS credential manager. `LoginInfo` contains opaque references only.
+    SystemVault,
+    /// Owner-only plaintext `LoginInfo` file. Supported only where permissions
+    /// can be enforced by this crate.
+    Plaintext,
+}
+
+/// Current credential-storage mode plus any OS-vault failure that affected it.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StorageStatus {
+    mode: StorageMode,
+    automatic_fallback: bool,
+    vault_error: Option<String>,
+    warning: Option<String>,
+}
+
+impl StorageStatus {
+    fn system_vault(vault_error: Option<String>) -> Self {
+        Self {
+            mode: StorageMode::SystemVault,
+            automatic_fallback: false,
+            vault_error,
+            warning: None,
+        }
+    }
+
+    fn plaintext(automatic_fallback: bool, vault_error: Option<String>) -> Self {
+        Self {
+            mode: StorageMode::Plaintext,
+            automatic_fallback,
+            vault_error,
+            warning: None,
+        }
+    }
+
+    /// Durable location currently selected for saved secrets.
+    pub const fn mode(&self) -> StorageMode {
+        self.mode
+    }
+
+    /// True when plaintext was selected automatically after an OS-vault failure.
+    pub const fn is_automatic_fallback(&self) -> bool {
+        self.automatic_fallback
+    }
+
+    /// Sanitized OS-vault failure associated with current status, if any.
+    pub fn vault_error(&self) -> Option<&str> {
+        self.vault_error.as_deref()
+    }
+
+    fn with_warning(mut self, warning: impl Into<String>) -> Self {
+        let warning = warning.into();
+        self.warning = Some(match self.warning {
+            Some(existing) => format!("{existing}; {warning}"),
+            None => warning,
+        });
+        self
+    }
+
+    /// Recoverable storage warning associated with current state, if any.
+    pub fn warning(&self) -> Option<&str> {
+        self.warning.as_deref()
+    }
+}
+
+/// Whether explicit plaintext storage can enforce owner-only file permissions.
+pub const fn plaintext_storage_supported() -> bool {
+    EXISTING_PLAINTEXT_STORE_ALLOWED
+}
+
+pub struct Loaded<T> {
+    pub values: Vec<T>,
+    pub revision: StoreRevision,
+    pub storage: StorageStatus,
+}
+
+/// Result of a status-aware credential save.
+pub struct Saved {
+    pub revision: StoreRevision,
+    pub storage: StorageStatus,
+}
+
+pub use codec::{from_line, to_line};
+pub use store::{
+    load, load_versioned, save, save_versioned, save_versioned_as, save_versioned_with_status,
 };
-
-use messenger_interface::auth::{Credential, CredentialField};
-
-/// Serialize a [`Credential`] to a single delimiter-safe `auth` blob (see module
-/// docs): one percent-encoded `key=value` pair per field.
-pub fn to_line(credential: &Credential) -> String {
-    let mut line = String::new();
-    for field in &credential.0 {
-        if !line.is_empty() {
-            line.push('&');
-        }
-        line.push_str(&encode(field.key));
-        line.push('=');
-        line.push_str(&encode(field.value.unsecure()));
-    }
-    line
-}
-
-/// Parse a blob produced by [`to_line`], resolving each stored key to one of the
-/// schema's `keys` (the backend's known field keys, so the parsed
-/// [`CredentialField`] can hold a `&'static str`). Returns `None` if any pair is
-/// malformed (no `=`, or an invalid percent escape) or carries a key not in
-/// `keys` — an unrecognized field rejects the whole credential rather than being
-/// silently dropped.
-///
-/// Also accepts the short-lived migration shape where the whole `key=value&...`
-/// blob was percent-encoded as one string, so `token=...` became `token%3D...`.
-pub fn from_line(line: &str, keys: &[&'static str]) -> Option<Credential> {
-    parse_fields(line, keys).or_else(|| {
-        let decoded = decode(line)?;
-        parse_fields(&decoded, keys)
-    })
-}
-
-fn parse_fields(line: &str, keys: &[&'static str]) -> Option<Credential> {
-    let mut fields = Vec::new();
-    for pair in line.split('&').filter(|pair| !pair.is_empty()) {
-        let (key, value) = pair.split_once('=')?;
-        let key = decode(key)?;
-        let key = keys.iter().copied().find(|known| *known == key)?;
-        fields.push(CredentialField::new(key, decode(value)?));
-    }
-    Some(Credential(fields))
-}
-
-/// Percent-encode every byte outside the unreserved set, so the result is safe to
-/// place in a `key=value&...` blob (no `:` `&` `=` `%` or newline survive
-/// unescaped).
-fn encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for &byte in value.as_bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push('%');
-            out.push_str(&format!("{byte:02X}"));
-        }
-    }
-    out
-}
-
-/// Reverse of [`encode`]. Returns `None` on a malformed `%XX` sequence or a
-/// non-UTF-8 result.
-fn decode(value: &str) -> Option<String> {
-    let mut bytes = Vec::with_capacity(value.len());
-    let mut iter = value.bytes();
-    while let Some(byte) = iter.next() {
-        if byte == b'%' {
-            let hex = |c: u8| match c {
-                b'0'..=b'9' => Some(c - b'0'),
-                b'a'..=b'f' => Some(c - b'a' + 10),
-                b'A'..=b'F' => Some(c - b'A' + 10),
-                _ => None,
-            };
-            bytes.push((hex(iter.next()?)? << 4) | hex(iter.next()?)?);
-        } else {
-            bytes.push(byte);
-        }
-    }
-    String::from_utf8(bytes).ok()
-}
-
-/// Reads `path`, mapping each `name:auth` line through `resolve`.
-///
-/// A missing file yields an empty `Vec`. Lines without a `:` separator, and
-/// lines whose `resolve` returns `None` (e.g. an unrecognized platform), are
-/// skipped — a single bad line does not abort the load.
-pub fn load<T>(
-    path: impl AsRef<Path>,
-    mut resolve: impl FnMut(&str, &str) -> Option<T>,
-) -> io::Result<Vec<T>> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err),
-    };
-
-    let mut loaded = Vec::new();
-
-    for line in BufReader::new(&file).lines() {
-        let line = line?;
-
-        let Some((name, auth)) = line.split_once(':') else {
-            continue;
-        };
-
-        if let Some(value) = resolve(name, auth) {
-            loaded.push(value);
-        }
-    }
-
-    Ok(loaded)
-}
-
-/// Atomically replace `path` with one `name:auth` line per entry.
-///
-/// New contents are fully written and synced to a private sibling temp file
-/// before rename. Failed writes therefore leave previous credential file
-/// untouched.
-pub fn save<I, K, V>(path: impl AsRef<Path>, entries: I) -> io::Result<()>
-where
-    I: IntoIterator<Item = (K, V)>,
-    K: AsRef<str>,
-    V: AsRef<str>,
-{
-    let path = path.as_ref();
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-
-    let mut contents = Vec::new();
-    for (name, auth) in entries {
-        writeln!(contents, "{}:{}", name.as_ref(), auth.as_ref())?;
-    }
-
-    let mut temp = tempfile::Builder::new()
-        .prefix(".LoginInfo-")
-        .suffix(".tmp")
-        .tempfile_in(parent)?;
-    set_private_permissions(temp.as_file())?;
-    temp.write_all(&contents)?;
-    temp.flush()?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|err| err.error)?;
-    sync_parent_directory(parent)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_permissions(file: &File) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_private_permissions(_file: &File) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_parent_directory(parent: &Path) -> io::Result<()> {
-    File::open(parent)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Look up a field's value by key in a parsed credential.
-    fn value<'a>(cred: &'a Credential, key: &str) -> Option<&'a str> {
-        cred.0
-            .iter()
-            .find(|field| field.key == key)
-            .map(|field| field.value.unsecure())
-    }
-
-    #[test]
-    fn value_round_trips_through_special_chars() {
-        let cred = Credential(vec![CredentialField::new("token", "abc:123&x=%y zπ")]);
-        let line = to_line(&cred);
-        // The blob must be free of the delimiters the file format uses.
-        assert!(!line.contains(['\n', ':', ' ']));
-        let restored = from_line(&line, &["token"]).unwrap();
-        assert_eq!(value(&restored, "token"), Some("abc:123&x=%y zπ"));
-    }
-
-    #[test]
-    fn multiple_fields_round_trip_including_keys() {
-        let cred = Credential(vec![
-            // Keys are encoded too, so a key with a delimiter survives.
-            CredentialField::new("user:name&", "alice"),
-            CredentialField::new("token", "t=%ok"),
-        ]);
-        let keys = ["user:name&", "token"];
-        let restored = from_line(&to_line(&cred), &keys).unwrap();
-        assert_eq!(value(&restored, "user:name&"), Some("alice"));
-        assert_eq!(value(&restored, "token"), Some("t=%ok"));
-        assert_eq!(value(&restored, "missing"), None);
-    }
-
-    #[test]
-    fn fully_encoded_blob_is_accepted_for_migration() {
-        let restored = from_line("token%3Dabc.def%253Aghi", &["token"]).unwrap();
-        assert_eq!(value(&restored, "token"), Some("abc.def:ghi"));
-    }
-
-    #[test]
-    fn malformed_pairs_are_rejected() {
-        assert!(from_line("no-equals", &["token"]).is_none());
-        assert!(from_line("token=%ZZ", &["token"]).is_none());
-    }
-
-    #[test]
-    fn unknown_keys_are_rejected() {
-        // A stored key the schema doesn't declare rejects the whole credential.
-        assert!(from_line("ghost=value", &["token"]).is_none());
-    }
-
-    #[test]
-    fn missing_login_file_loads_empty_without_creating_it() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("LoginInfo");
-        let loaded = load::<()>(&path, |_, _| None).unwrap();
-        assert!(loaded.is_empty());
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn save_atomically_replaces_previous_contents() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("LoginInfo");
-        fs::write(&path, "old:value\nold:stale\n").unwrap();
-
-        save(&path, [("discord", "token=new")]).unwrap();
-
-        assert_eq!(fs::read_to_string(path).unwrap(), "discord:token=new\n");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn saved_credentials_are_owner_only() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("LoginInfo");
-        save(&path, [("discord", "token=secret")]).unwrap();
-        assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-}

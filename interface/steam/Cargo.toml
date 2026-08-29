@@ -12,38 +12,38 @@ async-trait = { workspace = true }
 # Futures compatibility for the steam-vent protocol crate.
 async-compat = "0.2.5"
 futures = { workspace = true }
-futures-timer = "3.0.3"
+futures-timer = { workspace = true }
 # Request builders for the shared downloader cache path.
-surf = "2.3.2"
+surf = { workspace = true }
 # Data structs
-dashmap = "6.1.0"
+dashmap = { workspace = true }
 # Bitflags
 bitflags = { workspace = true }
 # Time
 chrono = { workspace = true }
 # Security
-secure-string = "0.3.0"
-sha2 = "0.10.9"
+secure-string = { workspace = true }
+sha2 = { workspace = true }
 # Ed25519 identity keypair for the GNS networking cert (key_data) + handshake.
 ed25519-dalek = "2"
 # Random seed for the identity key.
 getrandom = "0.2"
 # Voice media: Opus codec (48 kHz stereo, matches the audio graph and Discord)
 # and the messenger-agnostic audio graph the bridge encodes from / decodes into.
-opus = "0.3.1"
-simple-audio-channels = { path = "../../crate/audio", version = "0.0.1" }
+opus = { workspace = true }
+simple-audio-channels = { workspace = true }
 # Steam network protocol (reverse-engineered Steam client protocol, SteamKit-style)
 steam-vent = "0.5.0"
 # Protobuf message types (CFriendMessages_*, CMsgClient*); not re-exported by
 # steam-vent 0.5, so depend on it directly.
 steam-vent-proto = "0.5.2"
 # Interface
-messenger_interface = { path = "../../crate/messenger_interface" }
-messenger_downloader = { path = "../../crate/messenger_downloader" }
+messenger_interface = { workspace = true }
+messenger_downloader = { workspace = true }
 
 [dev-dependencies]
 # Native tokio runtime for the manual voice-signaling capture test. steam-vent is
 # tokio-based; the app bridges via async-compat, but the test runs on tokio directly.
-tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 # Surfaces tracing output (incl. steam-vent's per-message debug logs) during capture.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

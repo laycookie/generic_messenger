@@ -198,19 +198,13 @@ impl<'a> QueryContext<'a> {
 
         sorted
             .into_iter()
-            .filter_map(|channel| {
-                if channel
-                    .permission_overwrites
-                    .as_ref()
-                    .is_some_and(|overwrites| {
-                        overwrites
-                            .iter()
-                            .any(|a| a.deny.parse::<u64>().unwrap_or(0) & (1 << 10) != 0)
-                    })
-                {
-                    return None;
-                };
-
+            .map(|channel| {
+                // The gateway/REST response is already scoped to this
+                // authenticated account. Do not treat an arbitrary deny
+                // overwrite as authoritative: Discord permissions require
+                // combining @everyone, every role, member-specific allows and
+                // administrator/owner state. The old any-deny check hid
+                // channels even when a later allow made them visible.
                 let channel_name = channel
                     .name
                     .clone()
@@ -234,7 +228,7 @@ impl<'a> QueryContext<'a> {
                 self.cache
                     .channel_routes
                     .insert(*identifier.id(), ChannelRoute::new(Some(guild_id)));
-                Some(identifier)
+                identifier
             })
             .collect::<Vec<_>>()
     }
@@ -358,12 +352,8 @@ impl Query for InnerDiscord {
         let rooms = if let Some(cached) = query.cache.guild_channels.get(&guild_id) {
             query.process_guild_channels(guild_id, &cached)
         } else {
-            query
-                .api
-                .rest_get_guild_channels(guild_id)
-                .await
-                .map(|channels| query.process_guild_channels(guild_id, &channels))
-                .unwrap_or_default()
+            let channels = query.api.rest_get_guild_channels(guild_id).await?;
+            query.process_guild_channels(guild_id, &channels)
         };
 
         Ok(House::new(Some(rooms)))
@@ -469,9 +459,25 @@ impl Query for InnerDiscord {
                 if !retained.is_active() {
                     return None;
                 }
+                if retained.get().runtime().take_realtime_state_invalidation() {
+                    return Some(QueryEvent::StateInvalidated);
+                }
+                if retained
+                    .get()
+                    .runtime()
+                    .gateway
+                    .current
+                    .load_full()
+                    .is_none()
+                {
+                    retained.get().retry_gateway_after_loss().await;
+                    continue;
+                }
                 let selected = {
                     let runtime = retained.get().runtime();
-                    let gateway = runtime.gateway.current.load_full()?;
+                    let Some(gateway) = runtime.gateway.current.load_full() else {
+                        continue;
+                    };
                     let mut event = pin!(gateway.events.next_query().fuse());
                     let mut turn = pin!(runtime.wait_for_gateway_turn().fuse());
                     futures::select! {
@@ -480,9 +486,12 @@ impl Query for InnerDiscord {
                     }
                 };
                 match selected {
-                    Either::Left(event) => return Some(event),
+                    Either::Left(event) => return event,
                     Either::Right(turn) => {
-                        retained = InnerDiscord::finish_gateway_turn(retained, turn?).await?;
+                        let Some(turn) = turn else {
+                            continue;
+                        };
+                        retained = InnerDiscord::finish_gateway_turn(retained, turn).await?;
                     }
                 }
             }

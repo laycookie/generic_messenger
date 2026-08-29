@@ -12,7 +12,10 @@
 
 use std::path::PathBuf;
 
+use futures::{StreamExt, stream};
 use messenger_interface::types::{Emoji, RichText, Span, Sticker, TextStyle};
+
+const MAX_ASSET_FETCH_CONCURRENCY: usize = 8;
 
 use crate::{
     api::{self, SNOWFLAKE},
@@ -209,30 +212,42 @@ async fn resolve_sticker(sticker: &api::StickerItem) -> Option<PathBuf> {
 /// Build the [`RichText`] for a message body plus its stickers, resolving
 /// emoji/sticker images into the cache as it goes.
 pub async fn build_content(content: &str, stickers: &[api::StickerItem]) -> RichText {
-    let mut spans = Vec::new();
-    for piece in tokenize(content) {
-        match piece {
-            Piece::Text { text, style } => spans.push(Span::Text { text, style }),
-            Piece::Link { text, href } => spans.push(Span::Link { text, href }),
-            Piece::Emoji { name, id, animated } => {
-                let image = resolve_emoji(id, animated).await;
-                let reference = Some(emoji_wire_tag(&name, id, animated));
-                spans.push(Span::Emoji(Emoji {
-                    shortcode: name,
-                    image,
-                    reference,
-                }));
+    // Asset fetches are independent and may each wait on the network. Resolve a
+    // bounded number concurrently so one emoji-heavy message cannot serialize
+    // dozens of request timeouts on the gateway dispatcher.
+    let content_spans = stream::iter(tokenize(content))
+        .map(|piece| async move {
+            match piece {
+                Piece::Text { text, style } => Span::Text { text, style },
+                Piece::Link { text, href } => Span::Link { text, href },
+                Piece::Emoji { name, id, animated } => {
+                    let image = resolve_emoji(id, animated).await;
+                    let reference = Some(emoji_wire_tag(&name, id, animated));
+                    Span::Emoji(Emoji {
+                        shortcode: name,
+                        image,
+                        reference,
+                    })
+                }
             }
-        }
-    }
-    for sticker in stickers {
-        let image = resolve_sticker(sticker).await;
-        spans.push(Span::Sticker(Sticker {
-            alt: sticker.name.clone(),
-            image,
-            reference: sticker.id.to_string(),
-        }));
-    }
+        })
+        .buffered(MAX_ASSET_FETCH_CONCURRENCY)
+        .collect::<Vec<_>>();
+
+    let sticker_spans = stream::iter(stickers.iter().cloned())
+        .map(|sticker| async move {
+            let image = resolve_sticker(&sticker).await;
+            Span::Sticker(Sticker {
+                alt: sticker.name,
+                image,
+                reference: sticker.id.to_string(),
+            })
+        })
+        .buffered(MAX_ASSET_FETCH_CONCURRENCY)
+        .collect::<Vec<_>>();
+
+    let (mut spans, sticker_spans) = futures::join!(content_spans, sticker_spans);
+    spans.extend(sticker_spans);
     RichText { spans }
 }
 

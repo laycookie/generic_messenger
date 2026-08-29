@@ -1,4 +1,4 @@
-#![feature(arbitrary_self_types)]
+#![feature(arbitrary_self_types, random)]
 
 use messenger_interface::{
     auth::{AuthMethod, Credential, InteractiveAuthMethod},
@@ -13,6 +13,7 @@ mod backend;
 mod cache;
 mod downloaders;
 mod gateways;
+mod random;
 mod remote_auth;
 mod rest_api;
 

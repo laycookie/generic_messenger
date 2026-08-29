@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use facet::Facet;
-use futures::future::join_all;
+use futures::{StreamExt, future::join_all, stream};
 use messenger_interface::types::{
     Identifier, Place, Revision, RichText, Room, RoomCapabilities, UserStatus,
 };
@@ -343,27 +343,31 @@ impl Message {
     /// Map the Discord reaction objects onto interface reactions. An absent
     /// `reactions` field maps to an empty list.
     pub async fn interface_reactions(&self) -> Vec<messenger_interface::types::Reaction> {
-        let mut reactions = Vec::new();
-        for reaction in self.reactions.as_deref().unwrap_or(&[]) {
-            // A custom emoji carries an id (→ resolve its image); a Unicode
-            // emoji has no id and renders from its name alone.
-            let image = match reaction.emoji.id {
-                Some(id) => crate::adapter::text::rich::resolve_emoji(id, false).await,
-                None => None,
-            };
-            reactions.push(messenger_interface::types::Reaction {
-                emoji: messenger_interface::types::Emoji {
-                    shortcode: reaction.emoji.name.clone(),
-                    image,
-                    // Reactions are sent by name:id, not the content wire
-                    // tag; the compose reference doesn't apply here.
-                    reference: None,
-                },
-                count: reaction.count,
-                reacted: reaction.me,
-            });
-        }
-        reactions
+        const MAX_REACTION_FETCH_CONCURRENCY: usize = 8;
+
+        stream::iter(self.reactions.as_deref().unwrap_or(&[]).iter().cloned())
+            .map(|reaction| async move {
+                // A custom emoji carries an id (→ resolve its image); a Unicode
+                // emoji has no id and renders from its name alone.
+                let image = match reaction.emoji.id {
+                    Some(id) => crate::adapter::text::rich::resolve_emoji(id, false).await,
+                    None => None,
+                };
+                messenger_interface::types::Reaction {
+                    emoji: messenger_interface::types::Emoji {
+                        shortcode: reaction.emoji.name,
+                        image,
+                        // Reactions are sent by name:id, not the content wire
+                        // tag; the compose reference doesn't apply here.
+                        reference: None,
+                    },
+                    count: reaction.count,
+                    reacted: reaction.me,
+                }
+            })
+            .buffered(MAX_REACTION_FETCH_CONCURRENCY)
+            .collect()
+            .await
     }
 
     /// Split this Discord message into `(content, history)` for the

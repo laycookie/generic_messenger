@@ -574,9 +574,22 @@ impl VideoTrait for InnerDiscord {
                 if !retained.is_active() {
                     return None;
                 }
+                if retained
+                    .get()
+                    .runtime()
+                    .gateway
+                    .current
+                    .load_full()
+                    .is_none()
+                {
+                    retained.get().retry_gateway_after_loss().await;
+                    continue;
+                }
                 let selected = {
                     let runtime = retained.get().runtime();
-                    let gateway = runtime.gateway.current.load_full()?;
+                    let Some(gateway) = runtime.gateway.current.load_full() else {
+                        continue;
+                    };
                     let mut event = pin!(gateway.events.next_video().fuse());
                     let mut drive = pin!(runtime.drive_media().fuse());
                     futures::select! {
@@ -585,8 +598,20 @@ impl VideoTrait for InnerDiscord {
                     }
                 };
                 match selected {
-                    Either::Left(event) => return Some(event),
-                    Either::Right(MediaDrive::Complete(result)) => result?,
+                    Either::Left(event) => return event,
+                    Either::Right(MediaDrive::Complete(Some(()))) => {}
+                    Either::Right(MediaDrive::Complete(None))
+                        if retained
+                            .get()
+                            .runtime()
+                            .gateway
+                            .current
+                            .load_full()
+                            .is_none() =>
+                    {
+                        continue;
+                    }
+                    Either::Right(MediaDrive::Complete(None)) => return None,
                     Either::Right(MediaDrive::Gateway(turn)) => {
                         retained = InnerDiscord::finish_gateway_turn(retained, turn).await?;
                     }

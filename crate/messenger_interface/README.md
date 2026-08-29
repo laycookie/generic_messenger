@@ -213,9 +213,9 @@ Video event flow:
 
 - `VideoStreamAvailable`: remote stream exists but requires explicit
   `subscribe_video`.
-- `AddVideoStream`: media delivery starts. Application creates
-  `frame_channel()` and returns `FrameProducer`; application displays frames
-  from `FrameConsumer`.
+- `AddVideoStream`: media delivery starts with decoded `initial_frame`.
+  Application displays it immediately, creates `frame_channel()`, returns
+  `FrameProducer`, then displays later frames from `FrameConsumer`.
 - `RemoveVideoStream`: advertisement or active stream ended.
 - `AddVideoInput`: backend requests camera/screen input for `start_video`.
   Application returns `VideoInput`, containing `FrameConsumer` and selected
@@ -271,7 +271,9 @@ closure when application opens nested source.
 | `ArcStream::next(self: Arc<Self>)` | Await next nested item using shared ownership; return `None` to end stream. |
 
 Each root or nested stream is intended for one active consumer unless backend
-explicitly documents broadcast behavior.
+explicitly documents broadcast behavior. A backend that detects a gap in its
+realtime delta stream emits `QueryEvent::StateInvalidated`; consumers must take
+a fresh authoritative snapshot before applying later events.
 
 ## Implementing a backend
 

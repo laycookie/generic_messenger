@@ -18,11 +18,24 @@ members = [
 ]
 
 [workspace.dependencies]
+# Workspace crates
+credential_macro = { path = "macro", version = "0.1.0" }
+messenger_downloader = { path = "crate/messenger_downloader", version = "0.1.0" }
+messenger_interface = { path = "crate/messenger_interface", version = "0.0.1" }
+simple-audio-channels = { path = "crate/audio", version = "0.0.1" }
+simple-video = { path = "crate/video", version = "0.0.1", default-features = false }
+
 # Logs
 tracing = "0.1.44"
-# Bitflags
+tracing-subscriber = "0.3.23"
+
+# Data structures
+base64 = "0.22"
 bitflags = "2.11.1"
-# Serilization/Deserilization
+dashmap = "6.1.0"
+uuid = { version = "1.23.4", features = ["v4"] }
+
+# Serialization/deserialization
 facet = "0.46.0"
 # facet = { git = "https://github.com/facet-rs/facet", branch = "main" }
 facet-value = "0.46.0"
@@ -32,12 +45,42 @@ facet-json = "0.46.0"
 facet-pretty = "0.46.0"
 # facet-pretty = { git = "https://github.com/facet-rs/facet", branch = "main" }
 facet-error = "0.46.0"
-facet-reflect = "0.46.0"
-# facet-reflect = { git = "https://github.com/facet-rs/facet", branch = "main" }
+
 # Async
+async-lock = "3.4.1"
 asyncs-sync = "0.4.0"
-futures = "0.3.32"
 async-trait = "0.1.89"
+futures = "0.3.32"
+futures-timer = "3.0.3"
+smol = "2.0.2"
+tokio = "1.52.3"
+
+# HTTP
+percent-encoding = "2"
+surf = "2.3.2"
+
+# Filesystem
+directories = "6.0.0"
+rustix = "1.1.4"
+tempfile = "3"
+
+# Security
+secure-string = "0.3.0"
+sha2 = "0.10.9"
+zeroize = "1.8.1"
+
+# Media
+nokhwa = "0.10.11"
+opus = "0.3.1"
+
+# Procedural macros
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+# Testing/benchmarking
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
 # Time
 chrono = "0.4"
 

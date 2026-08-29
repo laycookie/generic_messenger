@@ -1,105 +1,189 @@
+use std::{
+    collections::VecDeque,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
 use asyncs_sync::Notify;
-use crossbeam::queue::SegQueue;
 use messenger_interface::interface::{QueryEvent, TextEvent, VideoEvent, VoiceEvent};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::warn;
 
-const EVENT_QUEUE_WARN_AT: usize = 4096;
+const EVENT_QUEUE_CAPACITY: usize = 4096;
 
 /// Session-scoped interface-event routing.
 ///
 /// Producers submit through typed methods instead of reaching into queue
 /// storage. Each submission also wakes its matching listener stream, which
-/// matters for media events produced by a different stream's driver.
+/// matters for media events produced by a different stream's driver. If any
+/// route reaches its memory bound, the whole session is invalidated instead of
+/// silently losing a realtime delta.
 pub(crate) struct EventHub {
     query: EventQueue<QueryEvent>,
     text: EventQueue<TextEvent>,
     voice: EventQueue<VoiceEvent>,
     video: EventQueue<VideoEvent>,
+    invalidated: AtomicBool,
+    invalidation_reported: AtomicBool,
 }
 
 impl Default for EventHub {
     fn default() -> Self {
         Self {
-            query: EventQueue::new("query"),
-            text: EventQueue::new("text"),
-            voice: EventQueue::new("voice"),
-            video: EventQueue::new("video"),
+            query: EventQueue::new(),
+            text: EventQueue::new(),
+            voice: EventQueue::new(),
+            video: EventQueue::new(),
+            invalidated: AtomicBool::new(false),
+            invalidation_reported: AtomicBool::new(false),
         }
     }
 }
 
-macro_rules! event_routes {
-    ($(($submit:ident, $next:ident, $field:ident, $event:ty)),+ $(,)?) => {
+macro_rules! event_submitters {
+    ($(($submit:ident, $field:ident, $event:ty, $route:literal)),+ $(,)?) => {
         impl EventHub {
             $(
                 pub(crate) fn $submit(&self, event: $event) {
-                    self.$field.submit(event);
-                }
-
-                pub(crate) async fn $next(&self) -> $event {
-                    self.$field.next().await
+                    if self.$field.submit(event, &self.invalidated) == SubmitOutcome::Full {
+                        self.invalidate($route);
+                    }
                 }
             )+
         }
     };
 }
 
-event_routes!(
-    (submit_query, next_query, query, QueryEvent),
-    (submit_text, next_text, text, TextEvent),
-    (submit_voice, next_voice, voice, VoiceEvent),
-    (submit_video, next_video, video, VideoEvent),
+event_submitters!(
+    (submit_query, query, QueryEvent, "query"),
+    (submit_text, text, TextEvent, "text"),
+    (submit_voice, voice, VoiceEvent, "voice"),
+    (submit_video, video, VideoEvent, "video"),
 );
 
-struct EventQueue<T> {
-    events: SegQueue<T>,
-    queued: AtomicUsize,
-    ready: Notify,
-    route: &'static str,
-}
+impl EventHub {
+    pub(crate) fn is_invalidated(&self) -> bool {
+        self.invalidated.load(Ordering::Acquire)
+    }
 
-impl<T> EventQueue<T> {
-    fn new(route: &'static str) -> Self {
-        Self {
-            events: SegQueue::new(),
-            queued: AtomicUsize::new(0),
-            ready: Notify::new(),
+    fn invalidate(&self, route: &'static str) {
+        if self
+            .invalidated
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        warn!(
             route,
+            capacity = EVENT_QUEUE_CAPACITY,
+            "Discord interface event queue overflowed; invalidating session state"
+        );
+        self.query.clear_and_wake();
+        self.text.clear_and_wake();
+        self.voice.clear_and_wake();
+        self.video.clear_and_wake();
+    }
+
+    /// Query is the session-control route. Exactly one invalidation event asks
+    /// the application to rebuild the messenger and take a fresh snapshot.
+    pub(crate) async fn next_query(&self) -> Option<QueryEvent> {
+        match self.query.next(&self.invalidated).await {
+            Some(event) => Some(event),
+            None if self
+                .invalidation_reported
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok() =>
+            {
+                Some(QueryEvent::StateInvalidated)
+            }
+            None => None,
         }
     }
 
-    fn submit(&self, event: T) {
-        // Reserve the depth before publishing. This keeps `queued` from
-        // underflowing if a waiting consumer pops immediately after `push`.
-        let depth = self.queued.fetch_add(1, Ordering::Relaxed) + 1;
-        self.events.push(event);
-        if depth >= EVENT_QUEUE_WARN_AT && depth.is_power_of_two() {
-            warn!(
-                route = self.route,
-                queued = depth,
-                "Discord interface event consumer is falling behind"
-            );
+    pub(crate) async fn next_text(&self) -> Option<TextEvent> {
+        self.text.next(&self.invalidated).await
+    }
+
+    pub(crate) async fn next_voice(&self) -> Option<VoiceEvent> {
+        self.voice.next(&self.invalidated).await
+    }
+
+    pub(crate) async fn next_video(&self) -> Option<VideoEvent> {
+        self.video.next(&self.invalidated).await
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubmitOutcome {
+    Accepted,
+    Full,
+    Invalidated,
+}
+
+struct EventQueue<T> {
+    events: Mutex<VecDeque<T>>,
+    ready: Notify,
+}
+
+impl<T> EventQueue<T> {
+    fn new() -> Self {
+        Self {
+            events: Mutex::new(VecDeque::with_capacity(EVENT_QUEUE_CAPACITY)),
+            ready: Notify::new(),
         }
+    }
+
+    fn submit(&self, event: T, invalidated: &AtomicBool) -> SubmitOutcome {
+        {
+            let mut events = self.events.lock().unwrap();
+            // Read the session flag while holding this route's lock. An
+            // invalidator that raced an earlier read must then wait and clear
+            // anything inserted here before publishing the reset signal.
+            if invalidated.load(Ordering::Acquire) {
+                return SubmitOutcome::Invalidated;
+            }
+            if events.len() >= EVENT_QUEUE_CAPACITY {
+                return SubmitOutcome::Full;
+            }
+            events.push_back(event);
+        }
+
         // `notify_one` retains a permit when the consumer has not registered
         // yet, closing the pop -> wait race. Interface contracts specify one
         // long-lived consumer per event type.
         self.ready.notify_one();
+        SubmitOutcome::Accepted
     }
 
-    async fn next(&self) -> T {
+    fn pop(&self) -> Option<T> {
+        self.events.lock().unwrap().pop_front()
+    }
+
+    fn clear_and_wake(&self) {
+        self.events.lock().unwrap().clear();
+        self.ready.notify_all();
+    }
+
+    async fn next(&self, invalidated: &AtomicBool) -> Option<T> {
         loop {
-            if let Some(event) = self.events.pop() {
-                self.queued.fetch_sub(1, Ordering::Relaxed);
-                return event;
+            if invalidated.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(event) = self.pop() {
+                return Some(event);
             }
             let notified = self.ready.notified();
             // Register intent to wait, then check again. `notify_one` also
-            // retains a permit, but this second pop keeps correctness explicit
+            // retains a permit, but this second check keeps correctness explicit
             // if notification behavior changes later.
-            if let Some(event) = self.events.pop() {
-                self.queued.fetch_sub(1, Ordering::Relaxed);
-                return event;
+            if invalidated.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(event) = self.pop() {
+                return Some(event);
             }
             notified.await;
         }
@@ -108,65 +192,143 @@ impl<T> EventQueue<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{pin::pin, sync::atomic::Ordering, task::Poll};
+    use std::{
+        pin::pin,
+        sync::{Arc, Barrier, atomic::AtomicBool},
+        task::Poll,
+        thread,
+    };
 
     use futures::{Future as _, future::poll_fn};
+    use messenger_interface::{interface::QueryEvent, types::UserStatus};
 
-    use super::{EVENT_QUEUE_WARN_AT, EventQueue};
+    use super::{EVENT_QUEUE_CAPACITY, EventHub, EventQueue, SubmitOutcome};
 
     #[test]
-    fn queue_preserves_events_past_previous_capacity() {
-        let queue = EventQueue::new("test");
-        for event in 0..=EVENT_QUEUE_WARN_AT {
-            queue.submit(event);
+    fn queue_rejects_overflow_without_discarding_retained_events() {
+        let queue = EventQueue::new();
+        let invalidated = AtomicBool::new(false);
+        for event in 0..EVENT_QUEUE_CAPACITY {
+            assert_eq!(queue.submit(event, &invalidated), SubmitOutcome::Accepted);
         }
+        assert_eq!(
+            queue.submit(EVENT_QUEUE_CAPACITY, &invalidated),
+            SubmitOutcome::Full
+        );
 
+        assert_eq!(queue.events.lock().unwrap().len(), EVENT_QUEUE_CAPACITY);
         futures::executor::block_on(async {
-            for event in 0..=EVENT_QUEUE_WARN_AT {
-                assert_eq!(queue.next().await, event);
+            for event in 0..EVENT_QUEUE_CAPACITY {
+                assert_eq!(queue.next(&invalidated).await, Some(event));
             }
         });
-        assert_eq!(queue.queued.load(Ordering::Relaxed), 0);
+        assert!(queue.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_producers_keep_queue_bounded_without_over_eviction() {
+        const PRODUCERS: usize = 8;
+        const EVENTS_PER_PRODUCER: usize = 1024;
+
+        let queue = Arc::new(EventQueue::new());
+        let invalidated = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(Barrier::new(PRODUCERS));
+        let workers = (0..PRODUCERS)
+            .map(|producer| {
+                let queue = queue.clone();
+                let invalidated = invalidated.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    let mut full = 0;
+                    for event in 0..EVENTS_PER_PRODUCER {
+                        if queue.submit(producer * EVENTS_PER_PRODUCER + event, &invalidated)
+                            == SubmitOutcome::Full
+                        {
+                            full += 1;
+                        }
+                    }
+                    full
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let rejected = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .sum::<usize>();
+        let submitted = PRODUCERS * EVENTS_PER_PRODUCER;
+        assert_eq!(queue.events.lock().unwrap().len(), EVENT_QUEUE_CAPACITY);
+        assert_eq!(rejected, submitted - EVENT_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    fn overflow_invalidates_all_routes_and_reports_one_reset() {
+        let hub = EventHub::default();
+        for user_id in 0..EVENT_QUEUE_CAPACITY as u64 {
+            hub.submit_query(QueryEvent::UserStatusChanged {
+                user_id,
+                status: UserStatus::Online,
+            });
+        }
+        hub.submit_query(QueryEvent::UserStatusChanged {
+            user_id: EVENT_QUEUE_CAPACITY as u64,
+            status: UserStatus::Online,
+        });
+
+        futures::executor::block_on(async {
+            assert!(matches!(
+                hub.next_query().await,
+                Some(QueryEvent::StateInvalidated)
+            ));
+            assert!(hub.next_query().await.is_none());
+            assert!(hub.next_text().await.is_none());
+            assert!(hub.next_voice().await.is_none());
+            assert!(hub.next_video().await.is_none());
+        });
     }
 
     #[test]
     fn queue_is_fifo() {
-        let queue = EventQueue::new("test");
-        queue.submit(1);
-        queue.submit(2);
-        queue.submit(3);
+        let queue = EventQueue::new();
+        let invalidated = AtomicBool::new(false);
+        queue.submit(1, &invalidated);
+        queue.submit(2, &invalidated);
+        queue.submit(3, &invalidated);
 
         futures::executor::block_on(async {
-            assert_eq!(queue.next().await, 1);
-            assert_eq!(queue.next().await, 2);
-            assert_eq!(queue.next().await, 3);
+            assert_eq!(queue.next(&invalidated).await, Some(1));
+            assert_eq!(queue.next(&invalidated).await, Some(2));
+            assert_eq!(queue.next(&invalidated).await, Some(3));
         });
     }
 
     #[test]
     fn submit_before_wait_registration_is_not_missed() {
         futures::executor::block_on(async {
-            let queue = EventQueue::new("test");
-            let next = queue.next();
-            queue.submit(7);
+            let queue = EventQueue::new();
+            let invalidated = AtomicBool::new(false);
+            let next = queue.next(&invalidated);
+            queue.submit(7, &invalidated);
 
-            assert_eq!(next.await, 7);
+            assert_eq!(next.await, Some(7));
         });
     }
 
     #[test]
     fn submit_wakes_registered_waiter() {
         futures::executor::block_on(async {
-            let queue = EventQueue::new("test");
-            let mut next = pin!(queue.next());
+            let queue = EventQueue::new();
+            let invalidated = AtomicBool::new(false);
+            let mut next = pin!(queue.next(&invalidated));
             poll_fn(|cx| {
                 assert!(matches!(next.as_mut().poll(cx), Poll::Pending));
                 Poll::Ready(())
             })
             .await;
 
-            queue.submit(9);
-            assert_eq!(next.await, 9);
+            queue.submit(9, &invalidated);
+            assert_eq!(next.await, Some(9));
         });
     }
 }

@@ -9,13 +9,9 @@ use std::{
 
 use futures::{future::poll_fn, task::AtomicWaker};
 
-use crate::VideoFrame;
+use crate::{VideoFrame, timing::elapsed_micros};
 
 static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
-
-fn elapsed_micros(start: Instant) -> u64 {
-    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
-}
 
 /// Create two halves of a latest-frame channel.
 ///

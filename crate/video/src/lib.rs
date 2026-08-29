@@ -19,11 +19,16 @@ mod capture;
 mod channel;
 mod error;
 mod frame;
+mod geometry;
 #[cfg(feature = "h264")]
 mod h264;
+mod timing;
 
 #[cfg(feature = "av1")]
-pub use av1::{Av1Encoder, Av1EncoderUsage, MAX_AV1_TEMPORAL_UNIT_BYTES};
+pub use av1::{
+    Av1Encoder, Av1EncoderUsage, MAX_AV1_BITRATE_BPS, MAX_AV1_FRAMES_PER_SECOND,
+    MAX_AV1_TEMPORAL_UNIT_BYTES, MIN_AV1_BITRATE_BPS, MIN_AV1_FRAMES_PER_SECOND,
+};
 #[cfg(all(
     feature = "capture",
     any(target_os = "linux", target_os = "macos", target_os = "windows")
@@ -40,10 +45,14 @@ pub use capture::{
 pub use channel::{FrameConsumer, FrameProducer, frame_channel};
 pub use error::VideoError;
 pub use frame::{
-    EncodedVideoFrame, FrameScaler, PixelData, VideoCodec, VideoFrame, VideoFrameTiming,
+    EncodedVideoFrame, FrameScaler, PixelData, PixelFormat, VideoCodec, VideoFrame,
+    VideoFrameTiming,
 };
 #[cfg(feature = "h264")]
-pub use h264::{H264Decoder, H264Encoder, H264EncoderUsage, MAX_H264_ACCESS_UNIT_BYTES};
+pub use h264::{
+    H264Decoder, H264Encoder, H264EncoderUsage, MAX_H264_ACCESS_UNIT_BYTES, MAX_H264_BITRATE_BPS,
+    MAX_H264_FRAMES_PER_SECOND, MIN_H264_BITRATE_BPS, MIN_H264_FRAMES_PER_SECOND,
+};
 
 /// Scalar and SIMD kernels exposed only for differential benchmarks.
 #[cfg(feature = "bench-internals")]

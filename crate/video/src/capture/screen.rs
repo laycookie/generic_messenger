@@ -1,4 +1,7 @@
-use crate::{FrameScaler, PixelData, VideoError, VideoFrame, VideoFrameTiming};
+use crate::{
+    FrameScaler, PixelData, VideoError, VideoFrame, VideoFrameTiming, geometry::fitted_dimensions,
+    timing::elapsed_micros,
+};
 use scap::{
     Target,
     capturer::{
@@ -17,7 +20,7 @@ use std::{
     time::Instant,
 };
 
-use super::{CaptureError, CaptureResult, FrameCapture, elapsed_micros};
+use super::{CaptureError, CaptureResult, FrameCapture};
 
 #[cfg(target_os = "linux")]
 static SCREEN_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -289,7 +292,8 @@ pub struct ScreenCaptureConfig {
 }
 
 impl ScreenCaptureConfig {
-    fn validate(self) -> CaptureResult<()> {
+    /// Validate frame rate and optional crop geometry before opening a backend.
+    pub fn validate(self) -> CaptureResult<()> {
         if self.frames_per_second == 0 {
             return Err(CaptureError::InvalidConfiguration(
                 "screen frame rate must be greater than zero",
@@ -395,7 +399,8 @@ impl ScreenCapture {
         let total_started = timing_enabled.then(Instant::now);
         let wait_started = timing_enabled.then(Instant::now);
         loop {
-            let frame = self.capturer.get_next_frame()?;
+            let frame = catch_unwind(AssertUnwindSafe(|| self.capturer.get_next_frame()))
+                .map_err(|payload| CaptureError::ScreenBackendPanicked(panic_message(payload)))??;
             let (source_width, source_height, source_bytes, source_format) = frame_metadata(&frame);
             // macOS uses an empty frame to report an idle stream.
             if (source_width, source_height) == (0, 0) {
@@ -487,8 +492,14 @@ impl ScreenCapture {
             // Mark first so a backend panic cannot trigger a second stop while
             // unwinding through `Drop`.
             self.running = false;
-            self.capturer.stop_capture();
+            let stop_result = catch_unwind(AssertUnwindSafe(|| self.capturer.stop_capture()));
             self.reservation.take();
+            if let Err(payload) = stop_result {
+                tracing::warn!(
+                    error = %panic_message(payload),
+                    "screen backend panicked while stopping capture"
+                );
+            }
         }
     }
 }
@@ -667,6 +678,9 @@ impl RgbFrameNormalizer {
 
 pub(crate) fn packed_4_to_rgb_scalar(source: &[u8], output: &mut Vec<u8>, channels: [usize; 3]) {
     output.clear();
+    if channels.iter().any(|channel| *channel >= 4) {
+        return;
+    }
     output.reserve(source.len() / 4 * 3);
     for pixel in source.chunks_exact(4) {
         output.extend_from_slice(&[pixel[channels[0]], pixel[channels[1]], pixel[channels[2]]]);
@@ -674,27 +688,37 @@ pub(crate) fn packed_4_to_rgb_scalar(source: &[u8], output: &mut Vec<u8>, channe
 }
 
 pub(crate) fn packed_4_to_rgb_simd(source: &[u8], output: &mut Vec<u8>, channels: [usize; 3]) {
-    if !matches!(channels, [0, 1, 2] | [2, 1, 0] | [3, 2, 1]) {
-        packed_4_to_rgb_scalar(source, output, channels);
-        return;
+    #[derive(Clone, Copy)]
+    enum Layout {
+        Rgbx,
+        Bgrx,
+        Xbgr,
     }
+    let layout = match channels {
+        [0, 1, 2] => Layout::Rgbx,
+        [2, 1, 0] => Layout::Bgrx,
+        [3, 2, 1] => Layout::Xbgr,
+        _ => {
+            packed_4_to_rgb_scalar(source, output, channels);
+            return;
+        }
+    };
     output.clear();
     output.reserve(source.len() / 4 * 3);
     let mut chunks = source.chunks_exact(16);
     for chunk in &mut chunks {
         let source = u8x16::from_slice(chunk);
-        let rgb: u8x16 = match channels {
-            [0, 1, 2] => {
+        let rgb: u8x16 = match layout {
+            Layout::Rgbx => {
                 simd_swizzle!(source, [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 0, 0, 0, 0])
             }
-            [2, 1, 0] => {
+            Layout::Bgrx => {
                 simd_swizzle!(source, [2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, 0, 0, 0, 0])
             }
-            [3, 2, 1] => simd_swizzle!(
+            Layout::Xbgr => simd_swizzle!(
                 source,
                 [3, 2, 1, 7, 6, 5, 11, 10, 9, 15, 14, 13, 0, 0, 0, 0]
             ),
-            _ => unreachable!("unsupported layout handled above"),
         };
         output.extend_from_slice(&rgb.to_array()[..12]);
     }
@@ -726,34 +750,6 @@ pub(crate) fn bgr_to_rgb_simd(pixels: &mut [u8]) {
         output_second.copy_to_slice(&mut chunk[16..24]);
     }
     bgr_to_rgb_scalar(chunks.into_remainder());
-}
-
-fn fitted_dimensions(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
-    if width <= max_width && height <= max_height {
-        return (width, height);
-    }
-
-    let (mut width, mut height) =
-        if u64::from(max_width) * u64::from(height) <= u64::from(max_height) * u64::from(width) {
-            (
-                max_width,
-                (u64::from(height) * u64::from(max_width) / u64::from(width)) as u32,
-            )
-        } else {
-            (
-                (u64::from(width) * u64::from(max_height) / u64::from(height)) as u32,
-                max_height,
-            )
-        };
-    width = width.max(1);
-    height = height.max(1);
-    if width > 1 {
-        width &= !1;
-    }
-    if height > 1 {
-        height &= !1;
-    }
-    (width, height)
 }
 
 #[cfg(test)]
@@ -809,6 +805,13 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn packed_conversion_rejects_out_of_range_channel_indices_without_panicking() {
+        let mut output = vec![1, 2, 3];
+        packed_4_to_rgb_simd(&[0, 1, 2, 3], &mut output, [4, 1, 0]);
+        assert!(output.is_empty());
     }
 
     #[test]

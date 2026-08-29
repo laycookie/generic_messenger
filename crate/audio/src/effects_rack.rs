@@ -98,8 +98,7 @@ pub struct EffectsRack {
 
 /// Audio-side half of a rack: owned exclusively by its channel, which is the
 /// only thread to touch the live effects. Edits queued by the frontend are
-/// adopted at the head of [`prepare`](RackBackend::prepare) and
-/// [`apply`](RackBackend::apply).
+/// adopted at the head of its `prepare` and `apply` calls.
 pub struct RackBackend {
     commands: Arc<SegQueue<RackCommand>>,
     /// The channel's processing format, known once the backend is attached.

@@ -8,10 +8,13 @@ publish = false
 async-trait = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
-futures-timer = "3.0.3"
+futures-timer = { workspace = true }
 grammers-client = { version = "0.10.0", default-features = false }
 grammers-session = { version = "0.10.0", default-features = false, features = ["sqlite-storage"] }
-messenger_interface = { path = "../../crate/messenger_interface" }
-secure-string = "0.3.0"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "sync", "time"] }
+# libsql-ffi 0.9.30 was published with an empty default bindgen.rs. Enabling
+# its session feature selects the populated bindings shipped in the same crate.
+libsql-ffi-workaround = { package = "libsql-ffi", version = "0.9.30", features = ["session"] }
+messenger_interface = { workspace = true }
+secure-string = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }

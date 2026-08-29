@@ -198,10 +198,31 @@ pub(crate) struct ClientDisconnectPayload {
     pub(crate) user_id: SNOWFLAKE,
 }
 
+/// Opcode 21 (DAVE Protocol Prepare Transition).
+///
+/// This payload does not contain an epoch. Sharing one struct with opcodes 22
+/// and 24 made valid transition events fail deserialization and tore down the
+/// complete voice session.
 /// <https://docs.discord.food/topics/voice-connections#end-to-end-encryption>
 #[derive(Facet)]
-pub(crate) struct DAVEPrepareEpoch {
+pub(crate) struct DavePrepareTransitionPayload {
     pub(crate) transition_id: u16,
+    pub(crate) protocol_version: u16,
+}
+
+/// Opcode 22 (DAVE Protocol Execute Transition).
+/// <https://docs.discord.food/topics/voice-connections#end-to-end-encryption>
+#[derive(Facet)]
+pub(crate) struct DaveExecuteTransitionPayload {
+    pub(crate) transition_id: u16,
+}
+
+/// Opcode 24 (DAVE Protocol Prepare Epoch).
+///
+/// Unlike transition events, this payload does not contain a transition ID.
+/// <https://docs.discord.food/topics/voice-connections#end-to-end-encryption>
+#[derive(Facet)]
+pub(crate) struct DavePrepareEpochPayload {
     pub(crate) epoch: u64,
     pub(crate) protocol_version: u16,
 }
@@ -346,6 +367,33 @@ mod tests {
         assert_eq!(resolution.resolution_type.as_deref(), Some("source"));
         assert_eq!(resolution.width, Some(0));
         assert_eq!(resolution.height, Some(0));
+    }
+
+    #[test]
+    fn dave_control_opcodes_decode_their_distinct_wire_shapes() {
+        let prepare_transition = facet_json::from_str::<DavePrepareTransitionPayload>(
+            r#"{"transition_id":7,"protocol_version":1}"#,
+        )
+        .unwrap();
+        assert_eq!(prepare_transition.transition_id, 7);
+        assert_eq!(prepare_transition.protocol_version, 1);
+
+        let execute_transition =
+            facet_json::from_str::<DaveExecuteTransitionPayload>(r#"{"transition_id":7}"#).unwrap();
+        assert_eq!(execute_transition.transition_id, 7);
+
+        let prepare_epoch =
+            facet_json::from_str::<DavePrepareEpochPayload>(r#"{"epoch":1,"protocol_version":1}"#)
+                .unwrap();
+        assert_eq!(prepare_epoch.epoch, 1);
+        assert_eq!(prepare_epoch.protocol_version, 1);
+
+        assert!(
+            facet_json::from_str::<DavePrepareEpochPayload>(
+                r#"{"transition_id":7,"protocol_version":1}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]

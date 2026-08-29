@@ -57,13 +57,14 @@ impl Text for InnerDiscord {
             Ordering::Unordered => Box::new(messages.into_iter()),
         };
         let identifiers = stream::iter(messages_iter.map(async |message| {
-            let (content, history) = message.revisions().await;
-            let reactions = message.interface_reactions().await;
-
-            let icon = match &message.author.avatar {
-                Some(hash) => CdnImage::avatar(message.author.id, hash).fetch().await.ok(),
-                None => None,
+            let avatar = async {
+                match &message.author.avatar {
+                    Some(hash) => CdnImage::avatar(message.author.id, hash).fetch().await.ok(),
+                    None => None,
+                }
             };
+            let ((content, history), reactions, icon) =
+                futures::join!(message.revisions(), message.interface_reactions(), avatar);
 
             let author = messenger_interface::types::Identifier::new(
                 message.author.id,
@@ -229,9 +230,22 @@ impl Text for InnerDiscord {
                 if !retained.is_active() {
                     return None;
                 }
+                if retained
+                    .get()
+                    .runtime()
+                    .gateway
+                    .current
+                    .load_full()
+                    .is_none()
+                {
+                    retained.get().retry_gateway_after_loss().await;
+                    continue;
+                }
                 let selected = {
                     let runtime = retained.get().runtime();
-                    let gateway = runtime.gateway.current.load_full()?;
+                    let Some(gateway) = runtime.gateway.current.load_full() else {
+                        continue;
+                    };
                     let mut event = pin!(gateway.events.next_text().fuse());
                     let mut turn = pin!(runtime.wait_for_gateway_turn().fuse());
                     futures::select! {
@@ -240,10 +254,11 @@ impl Text for InnerDiscord {
                     }
                 };
                 match selected {
-                    Either::Left(event) => return Some(event),
-                    Either::Right(turn) => {
-                        retained = InnerDiscord::finish_gateway_turn(retained, turn?).await?;
+                    Either::Left(event) => return event,
+                    Either::Right(Some(turn)) => {
+                        retained = InnerDiscord::finish_gateway_turn(retained, turn).await?;
                     }
+                    Either::Right(None) => continue,
                 }
             }
         })
@@ -272,12 +287,14 @@ impl TextEdit for InnerDiscord {
             .rest_edit_message(channel_id, msg_id, content)
             .await?;
 
-        let (content, history) = msg.revisions().await;
-        let reactions = msg.interface_reactions().await;
-        let icon = match &msg.author.avatar {
-            Some(hash) => CdnImage::avatar(msg.author.id, hash).fetch().await.ok(),
-            None => None,
+        let avatar = async {
+            match &msg.author.avatar {
+                Some(hash) => CdnImage::avatar(msg.author.id, hash).fetch().await.ok(),
+                None => None,
+            }
         };
+        let ((content, history), reactions, icon) =
+            futures::join!(msg.revisions(), msg.interface_reactions(), avatar);
         let author = Identifier::new(
             msg.author.id,
             User {

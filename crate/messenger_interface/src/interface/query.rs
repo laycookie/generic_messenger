@@ -80,4 +80,8 @@ pub enum QueryEvent {
     },
     /// A user's presence/status changed.
     UserStatusChanged { user_id: ID, status: UserStatus },
+    /// The backend detected a realtime-event gap. Consumers must discard their
+    /// derived snapshot, fetch authoritative state again, and only then resume
+    /// applying realtime deltas.
+    StateInvalidated,
 }

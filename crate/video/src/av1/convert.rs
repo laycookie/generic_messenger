@@ -254,9 +254,9 @@ pub(super) fn rgb_to_limited_bt709(red: u8, green: u8, blue: u8) -> (u8, u8, u8)
     let u = 128 + ((-6_596 * red - 22_189 * green + 28_784 * blue + 32_768) >> 16);
     let v = 128 + ((28_784 * red - 26_145 * green - 2_639 * blue + 32_768) >> 16);
     (
-        u8::try_from(y.clamp(0, 255)).expect("clamped luma must fit u8"),
-        u8::try_from(u.clamp(0, 255)).expect("clamped chroma must fit u8"),
-        u8::try_from(v.clamp(0, 255)).expect("clamped chroma must fit u8"),
+        y.clamp(0, 255) as u8,
+        u.clamp(0, 255) as u8,
+        v.clamp(0, 255) as u8,
     )
 }
 

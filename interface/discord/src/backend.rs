@@ -1,17 +1,20 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bitflags::bitflags;
 use futures::lock::Mutex as AsyncMutex;
+use futures_timer::Delay;
 use messenger_interface::{
     interface::Messenger,
     owner::{Owner, Retained},
 };
 use secure_string::SecureString;
+use tracing::warn;
 
 use crate::{
     adapter,
@@ -26,6 +29,7 @@ use crate::{
 pub(crate) const INTERFACE_NAME: &str = "Discord";
 /// <https://docs.discord.food/reference#api-versioning>
 pub(crate) const DISCORD_API: &str = "https://discord.com/api/v10";
+const GATEWAY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 bitflags! {
     /// <https://docs.discord.food/gateway/using-gateway#gateway-intents>
@@ -98,6 +102,7 @@ pub(crate) struct DiscordRuntimeState {
     pub(crate) cache: DiscordCache,
     pub(crate) gateway: GatewaySupervisor,
     pub(crate) media: LocalMediaState,
+    realtime_state_invalidated: AtomicBool,
 }
 
 impl DiscordRuntimeState {
@@ -106,7 +111,18 @@ impl DiscordRuntimeState {
             cache: DiscordCache::default(),
             gateway: GatewaySupervisor::new(DEFAULT_INTENTS, DEFAULT_CAPABILITIES),
             media: LocalMediaState::default(),
+            realtime_state_invalidated: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn invalidate_realtime_state(&self) {
+        self.realtime_state_invalidated
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn take_realtime_state_invalidation(&self) -> bool {
+        self.realtime_state_invalidated
+            .swap(false, Ordering::AcqRel)
     }
 }
 
@@ -181,7 +197,25 @@ impl InnerDiscord {
     pub(crate) async fn ensure_gateway(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.runtime().gateway.ensure(&self.api).await
+        let runtime = self.runtime();
+        let result = runtime.gateway.ensure(&self.api).await;
+        // A failed Resume attempt falls back to Identify, which cannot replay
+        // the missing interval. Publish exactly one authoritative-reset signal
+        // whether or not that fallback connection itself succeeded.
+        if runtime.gateway.take_continuity_loss() {
+            runtime.invalidate_realtime_state();
+        }
+        result
+    }
+
+    /// Keep a listener alive while a disconnected generation is being rebuilt.
+    /// The supervisor serializes concurrent listener attempts and applies any
+    /// protocol-mandated reconnect deadline.
+    pub(crate) async fn retry_gateway_after_loss(&self) {
+        if let Err(error) = self.ensure_gateway().await {
+            warn!(%error, "Discord gateway reconnect attempt failed; retrying");
+            Delay::new(GATEWAY_RETRY_DELAY).await;
+        }
     }
 
     fn new(token: SecureString) -> Owner<Self> {
@@ -215,6 +249,15 @@ mod tests {
     use futures::{Future as _, channel::oneshot, future::poll_fn};
 
     use super::*;
+
+    #[test]
+    fn realtime_invalidation_is_reported_once() {
+        let runtime = DiscordRuntimeState::new();
+        assert!(!runtime.take_realtime_state_invalidation());
+        runtime.invalidate_realtime_state();
+        assert!(runtime.take_realtime_state_invalidation());
+        assert!(!runtime.take_realtime_state_invalidation());
+    }
 
     #[test]
     fn detached_completion_retains_closed_owner_until_work_finishes() {

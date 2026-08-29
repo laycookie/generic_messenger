@@ -1,7 +1,7 @@
 use std::{
     io,
     sync::{Arc, atomic::Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use facet_pretty::FacetPretty as _;
@@ -17,13 +17,16 @@ use super::{
     connection::{Connection, EncryptionMode, SessionDescription},
     gateway::MediaConnection,
     payloads::{
-        ClientDisconnectPayload, DAVEPrepareEpoch, MediaSinkWantsPayload, MlsProposalsPayload,
+        ClientDisconnectPayload, DaveExecuteTransitionPayload, DavePrepareEpochPayload,
+        DavePrepareTransitionPayload, MediaSinkWantsPayload, MlsProposalsPayload,
         MlsTransitionPayload, ReadyPayload, SelectProtocolConnection, SelectProtocolPayload,
         SessionUpdateEvent, SpeakingPayload, VideoPayload, supported_codecs,
     },
 };
 use crate::DiscordRuntimeState;
-use crate::gateways::{Gateway, GatewayFrame};
+use crate::gateways::{Gateway, GatewayFrame, with_timeout};
+
+const VOICE_IP_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 // Local types for IP discovery packet layout.
 // Only used in the VoiceOpcode::Ready handler below.
@@ -76,6 +79,47 @@ mod tests {
     }
 
     #[test]
+    fn ip_discovery_address_ignores_padding_after_null_and_validates_ip() {
+        let mut address = [0; 64];
+        address[..9].copy_from_slice(b"127.0.0.1");
+        address[10] = 0xff;
+        assert_eq!(ip_discovery_address(&address).unwrap(), "127.0.0.1");
+
+        address[..10].copy_from_slice(b"not-an-ip\0");
+        assert_eq!(
+            ip_discovery_address(&address).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn fallback_video_ssrcs_reject_overflow_and_zero() {
+        assert_eq!(fallback_video_ssrcs(41).unwrap(), (42, 43));
+        assert_eq!(
+            fallback_video_ssrcs(0).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            fallback_video_ssrcs(u32::MAX - 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            fallback_video_ssrcs(u32::MAX).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn explicit_rtx_ssrc_does_not_require_adjacent_id() {
+        assert_eq!(video_rtx_ssrc(u32::MAX, Some(1)).unwrap(), 1);
+        assert_eq!(video_rtx_ssrc(41, None).unwrap(), 42);
+        assert_eq!(
+            video_rtx_ssrc(u32::MAX, None).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn mls_commit_precedes_optional_welcome() {
         assert_eq!(
             mls_commit_welcome_payload(vec![1, 2], Some(vec![3, 4])),
@@ -87,6 +131,7 @@ mod tests {
 
 impl IpDiscovery {
     const BYTE_LEN: usize = 74;
+    const PAYLOAD_LEN: u16 = 70;
 
     fn encode(&self) -> [u8; Self::BYTE_LEN] {
         let mut bytes = [0; Self::BYTE_LEN];
@@ -111,6 +156,53 @@ impl IpDiscovery {
     }
 }
 
+fn ip_discovery_address(address_ascii: &[u8; 64]) -> io::Result<&str> {
+    let end = address_ascii
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(address_ascii.len());
+    let address = std::str::from_utf8(&address_ascii[..end]).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("voice IP discovery returned non-UTF-8 address: {error}"),
+        )
+    })?;
+    address.parse::<std::net::IpAddr>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("voice IP discovery returned invalid address: {error}"),
+        )
+    })?;
+    Ok(address)
+}
+
+fn next_ssrc(primary: u32, purpose: &'static str) -> io::Result<u32> {
+    primary.checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cannot derive {purpose} SSRC from {primary}"),
+        )
+    })
+}
+
+fn video_rtx_ssrc(video_ssrc: u32, assigned: Option<u32>) -> io::Result<u32> {
+    assigned
+        .filter(|ssrc| *ssrc != 0)
+        .map_or_else(|| next_ssrc(video_ssrc, "video retransmission"), Ok)
+}
+
+fn fallback_video_ssrcs(audio_ssrc: u32) -> io::Result<(u32, u32)> {
+    if audio_ssrc == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "voice server supplied a zero audio SSRC",
+        ));
+    }
+    let video_ssrc = next_ssrc(audio_ssrc, "video")?;
+    let rtx_ssrc = video_rtx_ssrc(video_ssrc, None)?;
+    Ok((video_ssrc, rtx_ssrc))
+}
+
 impl GatewayFrame<VoiceOpcode> {
     /// Handle one voice-gateway opcode against `voice_gateway`. The gateway is
     /// passed in (rather than loaded from `discord`) so the same handler serves
@@ -126,18 +218,11 @@ impl GatewayFrame<VoiceOpcode> {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let payload = self.payload()?;
         let remote_video_kind = role.remote_video_kind();
-        if let Some(s) = payload.sequence() {
-            voice_gateway
-                .state
-                .last_sequence_number
-                .get_or_init(|| s.into())
-                .store(s, Ordering::Relaxed);
-        };
-
         debug!("VoiceOpcode: {:?}", payload.opcode());
         match payload.opcode() {
             VoiceOpcode::SessionDescription => {
                 let session_description = payload.decode::<SessionDescription>()?;
+                session_description.validate()?;
                 let dave_protocol_version = session_description.dave_protocol_version();
                 debug!(
                     "Session description: video_codec={} dave_protocol_version={}",
@@ -173,7 +258,7 @@ impl GatewayFrame<VoiceOpcode> {
                 // keys take effect (send/recv load per packet), and we
                 // must not announce a second call stream for it.
                 let first_description = match voice_gateway.connection.load().as_ref() {
-                    Some(connection) => connection.set_description(session_description),
+                    Some(connection) => connection.set_description(session_description)?,
                     None => {
                         warn!("Session description arrived before the UDP connection was set up");
                         true
@@ -183,7 +268,7 @@ impl GatewayFrame<VoiceOpcode> {
                 // Go Live connections join existing shared coordination; only
                 // call connection creates media event stream.
                 if first_description && role == ConnectionRole::Call {
-                    // Runs while holding both receiver locks.
+                    // Runs inside the ordered gateway mutation turn.
                     trace!("SessionDescription: creating audio stream");
                     if let Some(gateway) = discord.gateway.current.load().as_ref()
                         && let Some(audio) = gateway.voice.open_audio_source_for(voice_gateway)
@@ -206,13 +291,12 @@ impl GatewayFrame<VoiceOpcode> {
                 }
             }
             VoiceOpcode::Video => {
-                // Keep raw payload logging so negotiated stream state can be
-                // compared with our outgoing announce during RTC debugging.
-                debug!(
-                    "Video payload: {}",
-                    payload.raw_json().unwrap_or("<binary>")
-                );
                 let video = payload.decode::<VideoPayload>()?;
+                debug!(
+                    user_id = ?video.user_id,
+                    stream_count = video.streams.as_ref().map_or(0, Vec::len),
+                    "Received voice video announcement"
+                );
 
                 // Only the server→client form names a user; our own echoed
                 // announcements (client→server has no user_id) carry nothing
@@ -290,11 +374,15 @@ impl GatewayFrame<VoiceOpcode> {
                 let user_id = disconnect.user_id;
 
                 if let Some(connection) = voice_gateway.connection.load_full() {
-                    connection.retire_user_video(discord, user_id, remote_video_kind);
+                    let audio_ssrcs = connection.retire_user_audio(user_id);
+                    let video_ssrcs =
+                        connection.retire_user_video(discord, user_id, remote_video_kind);
+                    debug!(
+                        ?audio_ssrcs,
+                        ?video_ssrcs,
+                        "Retired disconnected voice client"
+                    );
                 }
-                // TODO: retire the user's *audio* SSRC mappings/channels here
-                // too; today they linger until the call ends (harmless but
-                // untidy — the roster leave event already hides the user).
             }
             VoiceOpcode::SessionUpdate => {
                 let update = payload.decode::<SessionUpdateEvent>()?;
@@ -341,6 +429,13 @@ impl GatewayFrame<VoiceOpcode> {
                     .into());
                 }
 
+                if ready.ssrc == 0 || ready.port == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "voice Ready supplied a zero SSRC or port",
+                    )
+                    .into());
+                }
                 let mut address_ascii = [0; 64];
                 if ready.ip.len() > address_ascii.len() {
                     return Err(io::Error::new(
@@ -353,7 +448,7 @@ impl GatewayFrame<VoiceOpcode> {
 
                 let send_ip_discovery = IpDiscovery {
                     req_or_res: 1,
-                    length: 70,
+                    length: IpDiscovery::PAYLOAD_LEN,
                     ssrc: ready.ssrc,
                     address_ascii,
                     port: ready.port,
@@ -367,42 +462,51 @@ impl GatewayFrame<VoiceOpcode> {
                 // Wait for the discovery *response* (type 2). A recv error
                 // is fatal — proceeding would select the protocol with a
                 // zeroed address. Skip unrelated packets (keepalives/early
-                // RTP can land before the response), within a sane bound.
+                // RTP can land before the response), within both packet and
+                // wall-clock bounds.
                 const MAX_DISCOVERY_ATTEMPTS: usize = 64;
-                let mut buf = [0u8; IpDiscovery::BYTE_LEN];
-                let recv_ip_discovery = 'discovery: {
-                    for _ in 0..MAX_DISCOVERY_ATTEMPTS {
-                        let len = udp.recv(&mut buf).await?;
-                        if len != buf.len() {
-                            debug!("Ignoring non-discovery packet ({len} bytes)");
-                            continue;
+                let recv_ip_discovery = with_timeout(
+                    async {
+                        let mut buf = [0u8; IpDiscovery::BYTE_LEN];
+                        for _ in 0..MAX_DISCOVERY_ATTEMPTS {
+                            let len = udp.recv(&mut buf).await?;
+                            if len != buf.len() {
+                                debug!("Ignoring non-discovery packet ({len} bytes)");
+                                continue;
+                            }
+                            let response = IpDiscovery::decode(&buf);
+                            if response.req_or_res != 2
+                                || response.length != IpDiscovery::PAYLOAD_LEN
+                                || response.ssrc != ready.ssrc
+                                || response.port == 0
+                            {
+                                debug!("Ignoring malformed IP discovery response");
+                                continue;
+                            }
+                            if let Err(error) = ip_discovery_address(&response.address_ascii) {
+                                debug!("Ignoring IP discovery response with bad address: {error}");
+                                continue;
+                            }
+                            debug!("Received valid voice IP discovery response");
+                            return Ok(response);
                         }
-                        let response = IpDiscovery::decode(&buf);
-                        if response.req_or_res != 2 {
-                            debug!("Ignoring IP discovery packet that is not a response");
-                            continue;
-                        }
-                        debug!("Got IP discovery response\n{buf:?}");
-                        break 'discovery response;
-                    }
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "no IP discovery response among received packets",
-                    )
-                    .into());
-                };
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "no IP discovery response among received packets",
+                        ))
+                    },
+                    VOICE_IP_DISCOVERY_TIMEOUT,
+                    "Discord voice IP discovery",
+                )
+                .await
+                .map_err(|error| -> Box<dyn std::error::Error> { error })?;
 
-                let mut ip_address = str::from_utf8(&recv_ip_discovery.address_ascii)?;
-                if let Some(null_position) =
-                    recv_ip_discovery.address_ascii.iter().position(|c| *c == 0)
-                {
-                    ip_address = &ip_address[..null_position]
-                };
+                let ip_address = ip_discovery_address(&recv_ip_discovery.address_ascii)?;
                 // Send-capable connections use server-assigned video + RTX
                 // SSRCs, with the historical audio+1/+2 fallback. Watch-only
                 // Go Live connections have no outbound video SSRC.
                 let audio_ssrc = recv_ip_discovery.ssrc;
-                let assigned_pair = |rid: &str| {
+                let assigned_pair = |rid: &str| -> io::Result<Option<(u32, u32)>> {
                     ready
                         .streams
                         .as_deref()
@@ -410,12 +514,19 @@ impl GatewayFrame<VoiceOpcode> {
                         .iter()
                         .filter(|stream| stream.rid.as_deref() == Some(rid))
                         .find_map(|stream| {
-                            let ssrc = stream.ssrc.filter(|s| *s != 0)?;
-                            Some((ssrc, stream.rtx_ssrc.unwrap_or(ssrc + 1)))
+                            let ssrc = stream.ssrc.filter(|ssrc| *ssrc != 0)?;
+                            Some((ssrc, stream.rtx_ssrc.filter(|ssrc| *ssrc != 0)))
                         })
+                        .map(|(ssrc, rtx_ssrc)| {
+                            video_rtx_ssrc(ssrc, rtx_ssrc).map(|rtx_ssrc| (ssrc, rtx_ssrc))
+                        })
+                        .transpose()
                 };
                 let (video_ssrc, rtx_ssrc) = if voice_gateway.outbound_video_kind.is_some() {
-                    assigned_pair("100").unwrap_or((audio_ssrc + 1, audio_ssrc + 2))
+                    match assigned_pair("100")? {
+                        Some(pair) => pair,
+                        None => fallback_video_ssrcs(audio_ssrc)?,
+                    }
                 } else {
                     (0, 0)
                 };
@@ -452,21 +563,29 @@ impl GatewayFrame<VoiceOpcode> {
             }
             VoiceOpcode::DAVEProtocolPrepareTransition => {
                 let mut dave_session = voice_gateway.require_dave_session().await?;
-
-                let packet = payload.decode::<DAVEPrepareEpoch>()?;
-
+                let packet = payload.decode::<DavePrepareTransitionPayload>()?;
                 let transition_id = packet.transition_id;
+                let active_protocol_version = dave_session.protocol_version();
 
+                if packet.protocol_version != active_protocol_version.get() {
+                    warn!(
+                        active_protocol_version = active_protocol_version.get(),
+                        requested_protocol_version = packet.protocol_version,
+                        transition_id,
+                        "DAVE protocol-version change is not yet supported"
+                    );
+                }
                 voice_gateway
                     .dave_pending_transitions
-                    .insert(transition_id, dave_session.protocol_version());
+                    .insert(transition_id, active_protocol_version);
                 tracing::trace!(
                     target: "video_timing",
                     stage = "outgoing.control",
                     kind = "DAVE",
                     action = "dave_transition_prepared",
                     transition_id,
-                    protocol_version = u64::from(dave_session.protocol_version().get()),
+                    protocol_version = u64::from(active_protocol_version.get()),
+                    requested_protocol_version = u64::from(packet.protocol_version),
                     pending_transitions = voice_gateway.dave_pending_transitions.len(),
                     "DAVE transition prepared"
                 );
@@ -485,17 +604,15 @@ impl GatewayFrame<VoiceOpcode> {
             }
             VoiceOpcode::DAVEProtocolExecuteTransition => {
                 let mut dave_session = voice_gateway.require_dave_session().await?;
-
-                let packet = payload.decode::<DAVEPrepareEpoch>()?;
-                let transition_id = packet.transition_id;
+                let packet = payload.decode::<DaveExecuteTransitionPayload>()?;
                 execute_pending_transition(
                     &mut dave_session,
                     &voice_gateway.dave_pending_transitions,
-                    transition_id,
+                    packet.transition_id,
                 );
             }
             VoiceOpcode::DAVEProtocolPrepareEpoch => {
-                let packet = payload.decode::<DAVEPrepareEpoch>()?;
+                let packet = payload.decode::<DavePrepareEpochPayload>()?;
 
                 if packet.epoch == 1 {
                     // TODO: Investigate if this should be properly added

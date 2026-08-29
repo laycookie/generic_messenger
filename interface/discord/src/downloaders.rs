@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use messenger_downloader::DownloadResult;
+use messenger_downloader::DownloadError;
 pub(crate) use messenger_downloader::{Body, Cached, Fetch, Fresh};
 use messenger_interface::types::CacheCategory;
 
@@ -104,7 +104,7 @@ impl CdnImage {
     /// Fetch the image (or load it from the on-disk cache) and return its local
     /// path. A cache hit skips the network. The body is read via the [`Fetch`]
     /// pipeline, so 429s/retries and atomic writes are handled there.
-    pub(crate) async fn fetch(self) -> DownloadResult<PathBuf> {
+    pub(crate) async fn fetch(self) -> Result<PathBuf, DownloadError> {
         let url = self.url();
         let file_name = self.file_name();
         Fetch::<Cached>::cached_fetch(

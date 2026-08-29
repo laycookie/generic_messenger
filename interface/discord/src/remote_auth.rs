@@ -2,7 +2,12 @@
 //!
 //! <https://docs.discord.food/remote-authentication/desktop>
 
-use std::{error::Error, io, time::Duration};
+use std::{
+    error::Error,
+    future::Future,
+    io,
+    time::{Duration, Instant},
+};
 
 use async_tungstenite::{
     WebSocketReceiver, WebSocketSender,
@@ -24,7 +29,6 @@ use futures::{
 };
 use futures_timer::Delay;
 use messenger_interface::auth::Credential;
-use rand::rngs::OsRng;
 use rsa::{
     Oaep, RsaPrivateKey, RsaPublicKey,
     pkcs8::EncodePublicKey,
@@ -37,6 +41,7 @@ use crate::{
     DISCORD_API, api,
     auth::{DiscordAuth, login_headers},
     downloaders::{Body as _, Fetch, Fresh},
+    random::SystemRandom,
 };
 
 type BoxError = Box<dyn Error + Send + Sync>;
@@ -45,6 +50,8 @@ const REMOTE_AUTH_GATEWAY: &str = "wss://remote-auth-gateway.discord.gg/?v=2";
 const DISCORD_ORIGIN: &str = "https://discord.com";
 const QR_URL_PREFIX: &str = "https://discord.com/ra/";
 const RSA_BITS: usize = 2048;
+const REMOTE_AUTH_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_REMOTE_AUTH_SESSION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Facet)]
 struct RemoteAuthEvent {
@@ -77,6 +84,7 @@ struct HeartbeatCommand {
 enum SocketWake {
     Message(Option<Result<WebsocketMessage, async_tungstenite::tungstenite::Error>>),
     Heartbeat,
+    SessionExpired,
 }
 
 struct RemoteAuthSocket {
@@ -84,6 +92,7 @@ struct RemoteAuthSocket {
     receiver: WebSocketReceiver<ConnectStream>,
     heartbeat_interval: Duration,
     heartbeat: Fuse<Delay>,
+    session_timeout: Fuse<Delay>,
     heartbeat_acked: bool,
 }
 
@@ -92,12 +101,14 @@ impl RemoteAuthSocket {
         sender: WebSocketSender<ConnectStream>,
         receiver: WebSocketReceiver<ConnectStream>,
         heartbeat_interval: Duration,
+        session_timeout: Duration,
     ) -> Self {
         Self {
             sender,
             receiver,
             heartbeat_interval,
             heartbeat: Delay::new(heartbeat_interval).fuse(),
+            session_timeout: Delay::new(session_timeout).fuse(),
             heartbeat_acked: true,
         }
     }
@@ -107,8 +118,12 @@ impl RemoteAuthSocket {
         T: for<'facet> Facet<'facet>,
     {
         let json = String::from_utf8(facet_json::to_vec(payload)?)?;
-        self.sender.send(WebsocketMessage::text(json)).await?;
-        Ok(())
+        remote_auth_timeout(
+            self.sender.send(WebsocketMessage::text(json)),
+            REMOTE_AUTH_OPERATION_TIMEOUT,
+            "Discord remote-auth gateway send",
+        )
+        .await
     }
 
     async fn next_event(&mut self) -> Result<RemoteAuthEvent, BoxError> {
@@ -116,9 +131,16 @@ impl RemoteAuthSocket {
             let wake = {
                 let incoming = self.receiver.next();
                 futures::pin_mut!(incoming);
-                match select(incoming, &mut self.heartbeat).await {
-                    Either::Left((message, _heartbeat)) => SocketWake::Message(message),
-                    Either::Right(((), _incoming)) => SocketWake::Heartbeat,
+                let activity = select(incoming, &mut self.heartbeat);
+                futures::pin_mut!(activity);
+                match select(activity, &mut self.session_timeout).await {
+                    Either::Left((Either::Left((message, _heartbeat)), _timeout)) => {
+                        SocketWake::Message(message)
+                    }
+                    Either::Left((Either::Right(((), _incoming)), _timeout)) => {
+                        SocketWake::Heartbeat
+                    }
+                    Either::Right(((), _activity)) => SocketWake::SessionExpired,
                 }
             };
 
@@ -147,6 +169,13 @@ impl RemoteAuthSocket {
                     self.heartbeat_acked = false;
                     self.heartbeat = Delay::new(self.heartbeat_interval).fuse();
                 }
+                SocketWake::SessionExpired => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Discord QR login session expired",
+                    )
+                    .into());
+                }
             }
         }
     }
@@ -167,10 +196,20 @@ impl QrLoginSession {
         request
             .headers_mut()
             .insert(ORIGIN, HeaderValue::from_static(DISCORD_ORIGIN));
-        let (websocket, _) = connect_async(request).await?;
+        let (websocket, _) = remote_auth_timeout(
+            connect_async(request),
+            REMOTE_AUTH_OPERATION_TIMEOUT,
+            "Discord remote-auth gateway connect",
+        )
+        .await?;
         let (mut sender, mut receiver) = websocket.split();
 
-        let hello = next_event_without_heartbeat(&mut receiver).await?;
+        let hello = remote_auth_timeout(
+            next_event_without_heartbeat(&mut receiver),
+            REMOTE_AUTH_OPERATION_TIMEOUT,
+            "Discord remote-auth gateway Hello",
+        )
+        .await?;
         if hello.op != "hello" {
             return Err(invalid_data(format!(
                 "Discord remote-auth gateway sent '{}' before hello",
@@ -182,12 +221,21 @@ impl QrLoginSession {
             .filter(|interval| *interval > 0)
             .map(Duration::from_millis)
             .ok_or_else(|| invalid_data("Discord remote-auth hello omitted heartbeat interval"))?;
-        hello
+        let session_timeout = hello
             .timeout_ms
             .filter(|timeout| *timeout > 0)
+            .map(Duration::from_millis)
+            .map(|timeout| timeout.min(MAX_REMOTE_AUTH_SESSION_TIMEOUT))
             .ok_or_else(|| invalid_data("Discord remote-auth hello omitted session timeout"))?;
+        let session_deadline = Instant::now()
+            .checked_add(session_timeout)
+            .ok_or_else(|| invalid_data("Discord remote-auth session timeout is invalid"))?;
 
-        let private_key = smol::unblock(|| RsaPrivateKey::new(&mut OsRng, RSA_BITS)).await?;
+        let private_key = smol::unblock(|| {
+            let mut random = SystemRandom::default();
+            RsaPrivateKey::new(&mut random, RSA_BITS)
+        })
+        .await?;
         let public_key = RsaPublicKey::from(&private_key);
         let public_key_der = public_key.to_public_key_der()?;
         let encoded_public_key = STANDARD.encode(public_key_der.as_ref());
@@ -202,7 +250,15 @@ impl QrLoginSession {
         )
         .await?;
 
-        let mut socket = RemoteAuthSocket::new(sender, receiver, heartbeat_interval);
+        let remaining = session_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Discord QR login session expired during setup",
+            )
+            .into());
+        }
+        let mut socket = RemoteAuthSocket::new(sender, receiver, heartbeat_interval, remaining);
         loop {
             let event = socket.next_event().await?;
             match event.op.as_str() {
@@ -318,6 +374,25 @@ impl QrLoginSession {
     }
 }
 
+async fn remote_auth_timeout<F, T, E>(
+    future: F,
+    timeout: Duration,
+    operation: &str,
+) -> Result<T, BoxError>
+where
+    F: Future<Output = Result<T, E>>,
+    E: Into<BoxError>,
+{
+    match select(Box::pin(future), Box::pin(Delay::new(timeout))).await {
+        Either::Left((result, _timeout)) => result.map_err(Into::into),
+        Either::Right(((), _operation)) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{operation} exceeded {} second deadline", timeout.as_secs()),
+        )
+        .into()),
+    }
+}
+
 async fn send_payload<T>(
     sender: &mut WebSocketSender<ConnectStream>,
     payload: &T,
@@ -326,8 +401,12 @@ where
     T: for<'facet> Facet<'facet>,
 {
     let json = String::from_utf8(facet_json::to_vec(payload)?)?;
-    sender.send(WebsocketMessage::text(json)).await?;
-    Ok(())
+    remote_auth_timeout(
+        sender.send(WebsocketMessage::text(json)),
+        REMOTE_AUTH_OPERATION_TIMEOUT,
+        "Discord remote-auth gateway initialization send",
+    )
+    .await
 }
 
 async fn next_event_without_heartbeat(
@@ -393,6 +472,22 @@ mod tests {
         assert_eq!(event.op, "hello");
         assert_eq!(event.timeout_ms, Some(142_637));
         assert_eq!(event.heartbeat_interval, Some(41_250));
+    }
+
+    #[test]
+    fn remote_auth_operation_timeout_is_bounded() {
+        let error = futures::executor::block_on(remote_auth_timeout(
+            futures::future::pending::<Result<(), io::Error>>(),
+            Duration::from_millis(1),
+            "test remote auth operation",
+        ))
+        .unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::TimedOut)
+        );
+        assert!(error.to_string().contains("test remote auth operation"));
     }
 
     #[test]

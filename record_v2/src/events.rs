@@ -178,6 +178,9 @@ pub fn process_query_event(
                 apply_user_status(data, user_id, status);
             }
         }
+        // The application intercepts this control event before reducer
+        // dispatch and rebuilds the whole messenger snapshot.
+        QueryEvent::StateInvalidated => {}
     }
     Task::none()
 }
@@ -405,6 +408,87 @@ fn capture_limits(resolution: VideoResolution, frames_per_second: u32) -> Captur
     }
 }
 
+/// Preserve discovery frame before sampling latest channel frames. Without this
+/// separate first item, Discord's frame that creates `AddVideoStream` is lost
+/// while application returns producer half of frame channel.
+fn preview_frames(
+    initial_frame: VideoFrame,
+    consumer: messenger_interface::interface::FrameConsumer,
+    cancelled: futures::channel::oneshot::Receiver<()>,
+) -> impl futures::Stream<Item = VideoFrame> + Send + 'static {
+    futures::stream::unfold(
+        (
+            consumer,
+            Box::pin(cancelled),
+            Some(initial_frame),
+            None::<Instant>,
+            FrameScaler::new(),
+        ),
+        |(mut consumer, cancelled, mut initial_frame, next_refresh, mut scaler)| async move {
+            let cancelled = if let Some(deadline) = next_refresh {
+                match deadline.checked_duration_since(Instant::now()) {
+                    Some(wait) => match select(Box::pin(Delay::new(wait)), cancelled).await {
+                        Either::Left(((), cancelled)) => cancelled,
+                        Either::Right(_) => return None,
+                    },
+                    None => cancelled,
+                }
+            } else {
+                cancelled
+            };
+            let (mut frame, cancelled, is_initial) = match initial_frame.take() {
+                Some(frame) => (frame, cancelled, true),
+                None => match select(Box::pin(consumer.pop()), cancelled).await {
+                    Either::Left((Some(frame), cancelled)) => (frame, cancelled, false),
+                    Either::Left((None, _)) | Either::Right(_) => return None,
+                },
+            };
+            let mut newer_frames = 0_u32;
+            if !is_initial {
+                while let Some(newer) = consumer.try_pop() {
+                    frame = newer;
+                    newer_frames = newer_frames.saturating_add(1);
+                }
+            }
+            let source_width = frame.width;
+            let source_height = frame.height;
+            let scale_started = Instant::now();
+            let frame = match frame.downscale_to_fit_with(
+                &mut scaler,
+                PREVIEW_MAX_WIDTH,
+                PREVIEW_MAX_HEIGHT,
+            ) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    warn!(error = %err, "Couldn't scale incoming video preview");
+                    return None;
+                }
+            };
+            trace!(
+                target: "video_timing",
+                stage = "ui.preview_select",
+                source_width,
+                source_height,
+                output_width = frame.width,
+                output_height = frame.height,
+                newer_frames,
+                scale_us = elapsed_micros(scale_started),
+                "video stage complete"
+            );
+            Some((
+                frame,
+                (
+                    consumer,
+                    cancelled,
+                    initial_frame,
+                    Some(Instant::now() + PREVIEW_INTERVAL),
+                    scaler,
+                ),
+            ))
+        },
+    )
+}
+
 pub fn process_video_event(
     id: MessengerId,
     event: VideoEvent,
@@ -423,6 +507,7 @@ pub fn process_video_event(
         VideoEvent::AddVideoStream {
             id: stream,
             metadata,
+            initial_frame,
             channel,
         } => {
             debug!("Video stream started: {stream:?}");
@@ -436,75 +521,9 @@ pub fn process_video_event(
                 }
                 return Task::none();
             }
-            // Realtime preview: emit first decoded frame immediately, then
-            // sample newest frame at display cadence. Downscale before iced
-            // uploads it; sidebar renders only 160 logical pixels wide.
-            let frames = futures::stream::unfold(
-                (
-                    consumer,
-                    Box::pin(cancelled),
-                    None::<Instant>,
-                    FrameScaler::new(),
-                ),
-                |(mut consumer, cancelled, next_refresh, mut scaler)| async move {
-                    let cancelled = if let Some(deadline) = next_refresh {
-                        match deadline.checked_duration_since(Instant::now()) {
-                            Some(wait) => match select(Box::pin(Delay::new(wait)), cancelled).await
-                            {
-                                Either::Left(((), cancelled)) => cancelled,
-                                Either::Right(_) => return None,
-                            },
-                            None => cancelled,
-                        }
-                    } else {
-                        cancelled
-                    };
-                    let (mut frame, cancelled) =
-                        match select(Box::pin(consumer.pop()), cancelled).await {
-                            Either::Left((Some(frame), cancelled)) => (frame, cancelled),
-                            Either::Left((None, _)) | Either::Right(_) => return None,
-                        };
-                    let mut newer_frames = 0_u32;
-                    while let Some(newer) = consumer.try_pop() {
-                        frame = newer;
-                        newer_frames = newer_frames.saturating_add(1);
-                    }
-                    let source_width = frame.width;
-                    let source_height = frame.height;
-                    let scale_started = Instant::now();
-                    let frame = match frame.downscale_to_fit_with(
-                        &mut scaler,
-                        PREVIEW_MAX_WIDTH,
-                        PREVIEW_MAX_HEIGHT,
-                    ) {
-                        Ok(frame) => frame,
-                        Err(err) => {
-                            warn!(error = %err, "Couldn't scale incoming video preview");
-                            return None;
-                        }
-                    };
-                    trace!(
-                        target: "video_timing",
-                        stage = "ui.preview_select",
-                        source_width,
-                        source_height,
-                        output_width = frame.width,
-                        output_height = frame.height,
-                        newer_frames,
-                        scale_us = elapsed_micros(scale_started),
-                        "video stage complete"
-                    );
-                    Some((
-                        frame,
-                        (
-                            consumer,
-                            cancelled,
-                            Some(Instant::now() + PREVIEW_INTERVAL),
-                            scaler,
-                        ),
-                    ))
-                },
-            );
+            // Sidebar renders only 160 logical pixels wide; helper preserves
+            // discovery frame and downsizes before iced uploads it.
+            let frames = preview_frames(initial_frame, consumer, cancelled);
             Task::stream(frames.map(move |frame| AppMessage::VideoPreview {
                 messenger: id,
                 stream,
@@ -803,6 +822,7 @@ mod video_tests {
             VideoEvent::AddVideoStream {
                 id: stream,
                 metadata,
+                initial_frame: VideoFrame::new(1, 1, PixelData::Rgba8(vec![1, 2, 3, 255])),
                 channel,
             },
             &mut video,
@@ -818,6 +838,23 @@ mod video_tests {
         );
         assert!(matches!(reply.try_recv(), Ok(Some(_))));
         drop(task);
+    }
+
+    #[test]
+    fn preview_emits_discovery_frame_without_channel_activity() {
+        futures::executor::block_on(async {
+            let pixels = vec![1, 2, 3, 255, 5, 6, 7, 255];
+            let initial = VideoFrame::new(2, 1, PixelData::Rgba8(pixels.clone()));
+            let (_producer, consumer) = frame_channel();
+            let (_cancel, cancelled) = oneshot::channel();
+            let mut frames = Box::pin(preview_frames(initial, consumer, cancelled));
+
+            let first = frames.next().await.expect("discovery frame should render");
+
+            assert_eq!(first.width, 2);
+            assert_eq!(first.height, 1);
+            assert_eq!(first.pixel_data, PixelData::Rgba8(pixels));
+        });
     }
 
     #[test]

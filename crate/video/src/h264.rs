@@ -1,8 +1,8 @@
 use openh264::{
     decoder::Decoder,
     encoder::{
-        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, Level, Profile,
-        RateControlMode, UsageType,
+        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, Profile,
+        RateControlMode, UsageType, VuiConfig,
     },
     formats::{RgbSliceU8, RgbaSliceU8, YUVBuffer},
 };
@@ -11,16 +11,25 @@ use std::{
     time::Instant,
 };
 
-use crate::{EncodedVideoFrame, PixelData, VideoCodec, VideoError, VideoFrame};
+use crate::{
+    EncodedVideoFrame, PixelData, VideoCodec, VideoError, VideoFrame,
+    geometry::checked_codec_pixels, timing::elapsed_micros,
+};
 
 /// Hard cap for one encoded H264 access unit.
 ///
 /// Bounds encoder output and transport reassembly of untrusted remote frames.
 pub const MAX_H264_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
-const MIN_H264_BITRATE_BPS: u32 = 200_000;
-const MAX_H264_BITRATE_BPS: u32 = 10_000_000;
-const MAX_VIDEO_PIXELS: usize = 4096 * 2160;
-const MAX_VIDEO_DIMENSION: usize = 4096;
+/// Lowest accepted realtime H264 target bitrate.
+pub const MIN_H264_BITRATE_BPS: u32 = 200_000;
+/// Highest accepted realtime H264 target bitrate.
+pub const MAX_H264_BITRATE_BPS: u32 = 10_000_000;
+/// Lowest accepted realtime H264 frame rate.
+pub const MIN_H264_FRAMES_PER_SECOND: u32 = 1;
+/// Highest accepted realtime H264 frame rate.
+pub const MAX_H264_FRAMES_PER_SECOND: u32 = 60;
+const MAX_OPENH264_LONG_EDGE: usize = 3840;
+const MAX_OPENH264_SHORT_EDGE: usize = 2160;
 const MAX_OPENH264_THREADS: usize = 4;
 // openh264-rust marks nonzero decoder thread configuration unsafe because it
 // can segfault; default zero uses caller-thread decoding.
@@ -35,10 +44,6 @@ const OPENH264_MAX_SLICE_BYTES: u32 = 64 * 1024;
 /// Camera and screen encoders may run together. Divide CPU budget between both
 /// and leave at least one logical CPU for audio/device work.
 const MAX_CONCURRENT_ENCODERS: usize = 2;
-
-fn elapsed_micros(start: Instant) -> u64 {
-    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
-}
 
 fn encoder_thread_count(parallelism: usize) -> u16 {
     let shared_budget = parallelism.saturating_sub(1) / MAX_CONCURRENT_ENCODERS;
@@ -79,6 +84,15 @@ impl H264Decoder {
     ///
     /// Returns `None` while decoder buffers input or waits for a keyframe.
     pub fn decode(&mut self, access_unit: &[u8]) -> Result<Option<VideoFrame>, VideoError> {
+        if access_unit.len() > MAX_H264_ACCESS_UNIT_BYTES {
+            return Err(VideoError::EncodedFrameTooLarge {
+                limit: MAX_H264_ACCESS_UNIT_BYTES,
+                actual: access_unit.len(),
+            });
+        }
+        if access_unit.is_empty() {
+            return Ok(None);
+        }
         let timing_enabled = tracing::enabled!(target: "video_timing", tracing::Level::TRACE);
         let total_started = timing_enabled.then(Instant::now);
         let codec_started = timing_enabled.then(Instant::now);
@@ -133,7 +147,7 @@ impl H264Decoder {
             }
         };
         let (width, height) = openh264::formats::YUVSource::dimensions(&yuv);
-        let pixels = checked_pixels(width, height)?;
+        let pixels = checked_h264_pixels(width, height)?;
         let data_len = pixels.checked_mul(4).ok_or(VideoError::FrameSizeOverflow)?;
         let rgba_started = timing_enabled.then(Instant::now);
         let rgba_alloc_started = timing_enabled.then(Instant::now);
@@ -225,12 +239,24 @@ impl H264Encoder {
         frames_per_second: u32,
         bitrate_bps: u32,
     ) -> Result<Self, VideoError> {
-        let frames_per_second = frames_per_second.clamp(1, 60);
+        if !(MIN_H264_FRAMES_PER_SECOND..=MAX_H264_FRAMES_PER_SECOND).contains(&frames_per_second) {
+            return Err(VideoError::InvalidFrameRate {
+                minimum: MIN_H264_FRAMES_PER_SECOND,
+                maximum: MAX_H264_FRAMES_PER_SECOND,
+                actual: frames_per_second,
+            });
+        }
+        if !(MIN_H264_BITRATE_BPS..=MAX_H264_BITRATE_BPS).contains(&bitrate_bps) {
+            return Err(VideoError::InvalidBitrate {
+                minimum: MIN_H264_BITRATE_BPS,
+                maximum: MAX_H264_BITRATE_BPS,
+                actual: bitrate_bps,
+            });
+        }
         let usage_type = match usage {
             H264EncoderUsage::Camera => UsageType::CameraVideoRealTime,
             H264EncoderUsage::Screen => UsageType::ScreenContentRealTime,
         };
-        let bitrate_bps = bitrate_bps.clamp(MIN_H264_BITRATE_BPS, MAX_H264_BITRATE_BPS);
         let frames_per_second = frames_per_second as f32;
         let encoder_threads = std::thread::available_parallelism()
             .map(|parallelism| encoder_thread_count(parallelism.get()))
@@ -245,7 +271,11 @@ impl H264Encoder {
             .skip_frames(true)
             .rate_control_mode(RateControlMode::Bitrate)
             .profile(Profile::Baseline)
-            .level(Level::Level_3_1)
+            // OpenH264 chooses the smallest valid level from actual geometry
+            // and cadence. Hard-coding 3.1 produces invalid 1080p SPS data.
+            // Its RGB conversion emits limited-range BT.601, so signal that
+            // exact matrix/range in VUI rather than leaving color unspecified.
+            .vui(VuiConfig::bt601())
             .usage_type(usage_type)
             .complexity(Complexity::Low)
             // Prefer predictable realtime cost over optional quality analysis.
@@ -288,7 +318,7 @@ impl H264Encoder {
         let frame_timing = frame.timing();
         let frame_id = frame_timing.map_or(encoder_sequence, |timing| timing.id());
         let (width, height) = (frame.width as usize, frame.height as usize);
-        checked_pixels(width, height)?;
+        checked_h264_encoder_pixels(width, height)?;
         frame.validate()?;
 
         let fill_yuv = |buf: &mut YUVBuffer| -> Result<(), VideoError> {
@@ -315,8 +345,9 @@ impl H264Encoder {
                 buffer
             }
             slot => {
-                *slot = Some((frame.width, frame.height, YUVBuffer::new(width, height)));
-                &mut slot.as_mut().unwrap().2
+                let inserted =
+                    slot.insert((frame.width, frame.height, YUVBuffer::new(width, height)));
+                &mut inserted.2
             }
         };
         let yuv_started = timing_enabled.then(Instant::now);
@@ -368,18 +399,40 @@ impl H264Encoder {
     }
 }
 
-fn checked_pixels(width: usize, height: usize) -> Result<usize, VideoError> {
-    (width <= MAX_VIDEO_DIMENSION && height <= MAX_VIDEO_DIMENSION)
-        .then(|| width.checked_mul(height))
-        .flatten()
-        .filter(|pixels| *pixels > 0 && *pixels <= MAX_VIDEO_PIXELS)
-        .ok_or(VideoError::InvalidDimensions)
+fn checked_h264_pixels(width: usize, height: usize) -> Result<usize, VideoError> {
+    let pixels = checked_codec_pixels(width, height)?;
+    let long_edge = width.max(height);
+    let short_edge = width.min(height);
+    if long_edge > MAX_OPENH264_LONG_EDGE || short_edge > MAX_OPENH264_SHORT_EDGE {
+        return Err(VideoError::InvalidDimensions);
+    }
+    Ok(pixels)
+}
+
+fn checked_h264_encoder_pixels(width: usize, height: usize) -> Result<usize, VideoError> {
+    let pixels = checked_h264_pixels(width, height)?;
+    // openh264's RGB/YUV wrappers assert on odd dimensions. Reject before
+    // constructing them so malformed public input remains a typed error.
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return Err(VideoError::InvalidDimensions);
+    }
+    Ok(pixels)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::VideoFrameTiming;
+
+    fn sps_level_idc(access_unit: &[u8]) -> Option<u8> {
+        openh264::nal_units(access_unit).find_map(|nal| {
+            let start = nal.windows(3).position(|window| window == [0, 0, 1])?;
+            let header = start + 3;
+            (nal.get(header).copied()? & 0x1f == 7)
+                .then(|| nal.get(header + 3).copied())
+                .flatten()
+        })
+    }
 
     #[test]
     fn encoder_threads_reserve_realtime_capacity() {
@@ -410,6 +463,35 @@ mod tests {
     }
 
     #[test]
+    fn encoder_selects_level_4_or_higher_for_1080p() {
+        let mut encoder = H264Encoder::new_for_frame_rate(H264EncoderUsage::Camera, 30).unwrap();
+        let frame = VideoFrame::new(1920, 1080, PixelData::Rgb8(vec![0; 1920 * 1080 * 3]));
+        let encoded = encoder.encode(&frame).unwrap().unwrap();
+        let level = sps_level_idc(&encoded.data).expect("IDR must carry an SPS");
+        assert!(level >= 40, "1080p stream advertised H264 level {level}");
+    }
+
+    #[test]
+    fn rgba_color_channels_survive_encode_decode_without_swapping() {
+        let mut encoder = H264Encoder::new().unwrap();
+        let frame = VideoFrame::new(64, 64, PixelData::Rgba8([240, 16, 8, 255].repeat(64 * 64)));
+        let encoded = encoder.encode(&frame).unwrap().unwrap();
+        let mut decoder = H264Decoder::new().unwrap();
+        let decoded = decoder.decode(&encoded.data).unwrap().unwrap();
+        let PixelData::Rgba8(pixels) = decoded.pixel_data else {
+            panic!("H264 decoder must output RGBA8");
+        };
+        let center = (32 * 64 + 32) * 4;
+        let red = pixels[center];
+        let green = pixels[center + 1];
+        let blue = pixels[center + 2];
+        let alpha = pixels[center + 3];
+        assert!(red > green.saturating_mul(2));
+        assert!(red > blue.saturating_mul(2));
+        assert_eq!(alpha, 255);
+    }
+
+    #[test]
     fn encoder_rejects_mismatched_frame_size() {
         let mut encoder = H264Encoder::new().unwrap();
         let error = encoder
@@ -419,10 +501,67 @@ mod tests {
     }
 
     #[test]
-    fn explicit_bitrate_is_retained_and_bounded() {
-        let encoder =
-            H264Encoder::new_for_frame_rate_and_bitrate(H264EncoderUsage::Screen, 30, 100_000)
-                .unwrap();
+    fn encoder_rejects_odd_dimensions_before_openh264_wrappers_can_panic() {
+        let mut encoder = H264Encoder::new().unwrap();
+        let error = encoder
+            .encode(&VideoFrame::new(
+                17,
+                16,
+                PixelData::Rgb8(vec![0; 17 * 16 * 3]),
+            ))
+            .unwrap_err();
+        assert!(matches!(error, VideoError::InvalidDimensions));
+    }
+
+    #[test]
+    fn encoder_rejects_geometry_outside_openh264_limits_before_allocation() {
+        let mut encoder = H264Encoder::new().unwrap();
+        let error = encoder
+            .encode(&VideoFrame::new(4096, 2160, PixelData::Rgb8(Vec::new())))
+            .unwrap_err();
+        assert!(matches!(error, VideoError::InvalidDimensions));
+    }
+
+    #[test]
+    fn decoder_rejects_oversized_input_and_treats_empty_input_as_no_frame() {
+        let mut decoder = H264Decoder::new().unwrap();
+        assert!(decoder.decode(&[]).unwrap().is_none());
+        let error = decoder
+            .decode(&vec![0; MAX_H264_ACCESS_UNIT_BYTES + 1])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            VideoError::EncodedFrameTooLarge {
+                limit: MAX_H264_ACCESS_UNIT_BYTES,
+                actual
+            } if actual == MAX_H264_ACCESS_UNIT_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn explicit_rate_settings_are_validated_instead_of_silently_clamped() {
+        assert!(matches!(
+            H264Encoder::new_for_frame_rate_and_bitrate(
+                H264EncoderUsage::Screen,
+                MIN_H264_FRAMES_PER_SECOND - 1,
+                MIN_H264_BITRATE_BPS,
+            ),
+            Err(VideoError::InvalidFrameRate { .. })
+        ));
+        assert!(matches!(
+            H264Encoder::new_for_frame_rate_and_bitrate(
+                H264EncoderUsage::Screen,
+                30,
+                MIN_H264_BITRATE_BPS - 1,
+            ),
+            Err(VideoError::InvalidBitrate { .. })
+        ));
+        let encoder = H264Encoder::new_for_frame_rate_and_bitrate(
+            H264EncoderUsage::Screen,
+            30,
+            MIN_H264_BITRATE_BPS,
+        )
+        .unwrap();
         assert_eq!(encoder.bitrate_bps(), MIN_H264_BITRATE_BPS);
     }
 

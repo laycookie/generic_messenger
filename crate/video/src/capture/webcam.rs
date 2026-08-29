@@ -1,6 +1,6 @@
 use std::{fmt, time::Instant};
 
-use crate::{PixelData, VideoFrame, VideoFrameTiming};
+use crate::{PixelData, VideoFrame, VideoFrameTiming, timing::elapsed_micros};
 use nokhwa::{
     Camera,
     pixel_format::RgbFormat,
@@ -15,7 +15,7 @@ use v4l::{
     video::Capture as V4lCapture,
 };
 
-use super::{CaptureResult, FrameCapture, elapsed_micros};
+use super::{CaptureError, CaptureResult, FrameCapture};
 
 /// Stable, owned identifier used to reopen a webcam.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -99,6 +99,18 @@ pub struct WebcamFormat {
     pub pixel_format: WebcamPixelFormat,
 }
 
+impl WebcamFormat {
+    /// Validate geometry and cadence before asking a native backend to use it.
+    pub fn validate(self) -> CaptureResult<()> {
+        if self.width == 0 || self.height == 0 || self.frames_per_second == 0 {
+            return Err(CaptureError::InvalidConfiguration(
+                "webcam format dimensions and frame rate must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl From<CameraFormat> for WebcamFormat {
     fn from(format: CameraFormat) -> Self {
         Self {
@@ -138,6 +150,17 @@ pub struct WebcamCaptureConfig {
 }
 
 impl WebcamCaptureConfig {
+    /// Validate an exact or closest format request before opening a backend.
+    pub fn validate(self) -> CaptureResult<()> {
+        match self.format {
+            WebcamFormatPreference::Exact(format) | WebcamFormatPreference::Closest(format) => {
+                format.validate()
+            }
+            WebcamFormatPreference::HighestResolution
+            | WebcamFormatPreference::HighestFrameRate => Ok(()),
+        }
+    }
+
     fn requested_format(self) -> RequestedFormat<'static> {
         let requested = match self.format {
             WebcamFormatPreference::HighestResolution => {
@@ -196,6 +219,7 @@ impl WebcamSource {
 
     /// Open and start this webcam using `config`.
     pub fn open(&self, config: WebcamCaptureConfig) -> CaptureResult<WebcamCapture> {
+        config.validate()?;
         let mut camera = Camera::new(CameraIndex::from(&self.id), config.requested_format())?;
         camera.open_stream()?;
         Ok(WebcamCapture { camera })
@@ -209,6 +233,11 @@ impl WebcamSource {
         max_height: u32,
         max_frames_per_second: u32,
     ) -> CaptureResult<WebcamCapture> {
+        if max_width == 0 || max_height == 0 || max_frames_per_second == 0 {
+            return Err(CaptureError::InvalidConfiguration(
+                "webcam capture bounds and frame rate must be greater than zero",
+            ));
+        }
         let format = bounded_format(
             &self.formats()?,
             max_width,
@@ -232,8 +261,13 @@ fn bounded_format(
         |format: &&WebcamFormat| format.width <= max_width && format.height <= max_height;
     let area = |format: &WebcamFormat| u64::from(format.width) * u64::from(format.height);
 
+    let is_valid = |format: &&WebcamFormat| {
+        format.width > 0 && format.height > 0 && format.frames_per_second > 0
+    };
+
     formats
         .iter()
+        .filter(is_valid)
         .filter(fits_dimensions)
         // Prefer closest device cadence. A slightly faster mode is better
         // than a much slower one because latest-frame pacing drops excess.
@@ -249,6 +283,9 @@ fn bounded_format(
             // then software downscaling enforces dimensions.
             formats
                 .iter()
+                .filter(|format| {
+                    format.width > 0 && format.height > 0 && format.frames_per_second > 0
+                })
                 .min_by_key(|format| {
                     (
                         area(format),
@@ -459,6 +496,22 @@ mod tests {
     }
 
     #[test]
+    fn exact_webcam_configuration_rejects_zero_geometry_or_cadence() {
+        let config = WebcamCaptureConfig {
+            format: WebcamFormatPreference::Exact(WebcamFormat {
+                width: 0,
+                height: 720,
+                frames_per_second: 30,
+                pixel_format: WebcamPixelFormat::Mjpeg,
+            }),
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(CaptureError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
     fn webcam_format_round_trips() {
         let format = WebcamFormat {
             width: 1920,
@@ -489,6 +542,17 @@ mod tests {
             bounded_format(&formats, 1280, 720, 30),
             Some(format(1280, 720, 30))
         );
+    }
+
+    #[test]
+    fn bounded_format_ignores_invalid_backend_descriptors() {
+        let invalid = WebcamFormat {
+            width: 0,
+            height: 720,
+            frames_per_second: 30,
+            pixel_format: WebcamPixelFormat::Mjpeg,
+        };
+        assert_eq!(bounded_format(&[invalid], 1280, 720, 30), None);
     }
 
     #[test]

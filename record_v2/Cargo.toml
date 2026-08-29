@@ -14,28 +14,32 @@ full = ["steam", "slack", "telegram"]
 [dependencies]
 # Tracer
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # UI
 iced = { version = "0.14.0", features = ["image", "advanced", "lazy", "qr_code", "sipper"] }
 iced_aw = { version = "0.13.0", features = ["context_menu", "wrap"] }
 iced_palace = { version = "0.14.0", features = [] }
 font-kit = "0.14.3"
 # Audio
-simple-audio-channels = { path = "../crate/audio" }
+simple-audio-channels = { workspace = true }
 # Video frames and capture
-simple-video = { path = "../crate/video", version = "0.0.1", features = ["capture"] }
+simple-video = { workspace = true, features = ["capture"] }
 # Interface
-messenger_interface = { path = "../crate/messenger_interface" }
+messenger_interface = { workspace = true }
 messenger_unifier = { path = "../crate/messenger_unifier" }
 login_store = { path = "../crate/login_store" }
+directories = { workspace = true }
 discord = { path = "../interface/discord" }
 slack = { path = "../interface/slack", optional = true }
 steam = { path = "../interface/steam", optional = true }
 telegram = { path = "../interface/telegram", optional = true }
 
 futures = { workspace = true }
-async-lock = "3.4.1"
-smol = "2.0.2"
-strum = { version = "0.28.0", features = ["derive"] }
+async-lock = { workspace = true }
+smol = { workspace = true }
 emojis = "0.9.0"
-futures-timer = "3.0.3"
+futures-timer = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -5,6 +5,14 @@ edition = "2024"
 publish = false
 
 [dependencies]
-messenger_interface = { path = "../messenger_interface" }
-secure-string = "0.3.0"
-tempfile = "3"
+messenger_interface = { workspace = true }
+secure-string = { workspace = true }
+tempfile = { workspace = true }
+zeroize = { workspace = true }
+uuid = { workspace = true }
+keyring = "4.1.6"
+tracing = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs", "process"] }

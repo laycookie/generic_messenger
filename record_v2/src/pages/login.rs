@@ -1,4 +1,4 @@
-use std::{collections::HashMap, future::Future, pin::Pin, sync::LazyLock};
+use std::{collections::HashMap, fmt, future::Future, pin::Pin, sync::LazyLock};
 
 use discord::Discord;
 use iced::{
@@ -18,6 +18,7 @@ use slack::Slack;
 use steam::Steam;
 #[cfg(feature = "telegram")]
 use telegram::Telegram;
+use zeroize::Zeroize as _;
 
 /// The future returned by a backend's async constructor, type-erased so the
 /// registry can hold heterogeneous backends behind one fn pointer.
@@ -97,7 +98,7 @@ enum SelectedLogin {
     Interactive(InteractiveAuthMethod),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Message {
     PlatformInput(&'static str),
     MethodInput(usize),
@@ -105,11 +106,35 @@ pub enum Message {
     FieldInput(&'static str, String),
     Submit,
     Cancel,
+    OpenSettings,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlatformInput(platform) => formatter
+                .debug_tuple("PlatformInput")
+                .field(platform)
+                .finish(),
+            Self::MethodInput(method) => {
+                formatter.debug_tuple("MethodInput").field(method).finish()
+            }
+            Self::FieldInput(key, _) => formatter
+                .debug_struct("FieldInput")
+                .field("key", key)
+                .field("value", &"[redacted]")
+                .finish(),
+            Self::Submit => formatter.write_str("Submit"),
+            Self::Cancel => formatter.write_str("Cancel"),
+            Self::OpenSettings => formatter.write_str("OpenSettings"),
+        }
+    }
 }
 
 pub enum Action {
     None,
     Cancel,
+    OpenSettings,
     /// The user submitted a login; the app resolves it into a live messenger
     /// (which may require async work, e.g. a Discord token fetch).
     Login {
@@ -124,7 +149,6 @@ pub enum Action {
     },
 }
 
-#[derive(Debug)]
 pub struct Login {
     /// Combo-box state over the backend names.
     platform: State<&'static str>,
@@ -143,6 +167,32 @@ pub struct Login {
     /// Last login error, shown under the form. Cleared on a new submit.
     error: Option<String>,
 }
+
+impl fmt::Debug for Login {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value_keys = self.values.keys().copied().collect::<Vec<_>>();
+        formatter
+            .debug_struct("Login")
+            .field("selected_platform", &self.selected_platform)
+            .field("selected_method", &self.selected_method)
+            .field("value_keys", &value_keys)
+            .field("next_attempt", &self.next_attempt)
+            .field("pending_attempt", &self.pending_attempt)
+            .field("has_qr_code", &self.qr_code.is_some())
+            .field("status", &self.status)
+            .field("has_error", &self.error.is_some())
+            .finish()
+    }
+}
+
+impl Drop for Login {
+    fn drop(&mut self) {
+        for value in self.values.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
 impl Default for Login {
     fn default() -> Self {
         let names: Vec<&'static str> = backends().iter().map(|backend| backend.name).collect();
@@ -189,11 +239,18 @@ impl Login {
                 }
             }
             Message::FieldInput(key, value) => {
-                self.values.insert(key, value);
+                if let Some(mut previous) = self.values.insert(key, value) {
+                    previous.zeroize();
+                }
             }
             Message::Cancel => {
                 if self.cancel_attempt() {
                     return Action::Cancel;
+                }
+            }
+            Message::OpenSettings => {
+                if self.pending_attempt.is_none() {
+                    return Action::OpenSettings;
                 }
             }
             Message::Submit => {
@@ -218,11 +275,13 @@ impl Login {
                         };
                     }
                     SelectedLogin::Credential(method) => {
+                        let credential = self.build_credential(method);
+                        self.clear_secret_values();
                         self.status = Some("Signing in…");
                         return Action::Login {
                             attempt,
                             backend: self.selected_platform,
-                            credential: self.build_credential(method),
+                            credential,
                         };
                     }
                 }
@@ -250,9 +309,22 @@ impl Login {
 
     fn cancel_attempt(&mut self) -> bool {
         let canceled = self.pending_attempt.take().is_some();
+        self.clear_secret_values();
         self.qr_code = None;
         self.status = None;
         canceled
+    }
+
+    fn clear_secret_values(&mut self) {
+        for backend in backends() {
+            for method in (backend.auth_methods)() {
+                for field in method.fields.iter().filter(|field| field.secret) {
+                    if let Some(mut value) = self.values.remove(field.key) {
+                        value.zeroize();
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn is_pending(&self, attempt: u64) -> bool {
@@ -293,6 +365,7 @@ impl Login {
             return false;
         }
         self.pending_attempt = None;
+        self.clear_secret_values();
         self.qr_code = None;
         self.status = None;
         self.error = None;
@@ -402,7 +475,11 @@ impl Login {
             };
             Button::new(label).on_press(Message::Submit)
         };
-        let mut content = content.push(button);
+        let mut settings = Button::new("Settings");
+        if self.pending_attempt.is_none() {
+            settings = settings.on_press(Message::OpenSettings);
+        }
+        let mut content = content.push(Row::new().spacing(10).push(button).push(settings));
         if let Some(error) = &self.error {
             content = content.push(text(error.clone()).style(iced::widget::text::danger));
         }
@@ -470,5 +547,47 @@ mod tests {
                 )
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn login_debug_output_redacts_field_values() {
+        let field = Message::FieldInput("token", "debug-secret-token".to_owned());
+        assert!(!format!("{field:?}").contains("debug-secret-token"));
+
+        let mut login = Login::default();
+        assert!(matches!(login.update(field), Action::None));
+        let debug = format!("{login:?}");
+        assert!(debug.contains("token"));
+        assert!(!debug.contains("debug-secret-token"));
+    }
+
+    #[test]
+    fn settings_can_open_without_a_logged_in_account() {
+        let mut login = Login::default();
+
+        assert!(matches!(
+            login.update(Message::OpenSettings),
+            Action::OpenSettings
+        ));
+    }
+
+    #[test]
+    fn credential_submit_removes_ui_secret_copy() {
+        let mut login = Login::default();
+        assert!(matches!(
+            login.update(Message::FieldInput(
+                "token",
+                "submitted-secret-token".to_owned(),
+            )),
+            Action::None
+        ));
+
+        let credential = match login.update(Message::Submit) {
+            Action::Login { credential, .. } => credential,
+            _ => panic!("token method did not start credential login"),
+        };
+
+        assert!(!login.values.contains_key("token"));
+        assert_eq!(credential.0[0].value.unsecure(), "submitted-secret-token");
     }
 }

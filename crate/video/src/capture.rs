@@ -15,6 +15,7 @@ use futures::{Stream, channel::oneshot, future::poll_fn, task::AtomicWaker};
 
 use crate::{
     FrameConsumer, FrameProducer, FrameScaler, VideoFrame, VideoFrameTiming, frame_channel,
+    timing::elapsed_micros,
 };
 
 mod error;
@@ -32,10 +33,6 @@ pub use webcam::{
     WebcamPixelFormat, WebcamSource, has_webcam_permission, initialize_webcams, webcams,
 };
 
-pub(crate) fn elapsed_micros(start: Instant) -> u64 {
-    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
-}
-
 /// Upper bounds applied to realtime capture before frames reach an encoder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureLimits {
@@ -45,7 +42,19 @@ pub struct CaptureLimits {
 }
 
 impl CaptureLimits {
-    fn validate(self) -> CaptureResult<()> {
+    /// Build validated realtime capture limits.
+    pub fn new(max_width: u32, max_height: u32, max_frames_per_second: u32) -> CaptureResult<Self> {
+        let limits = Self {
+            max_width,
+            max_height,
+            max_frames_per_second,
+        };
+        limits.validate()?;
+        Ok(limits)
+    }
+
+    /// Validate that every bound is non-zero.
+    pub fn validate(self) -> CaptureResult<()> {
         if self.max_width == 0 || self.max_height == 0 || self.max_frames_per_second == 0 {
             return Err(CaptureError::InvalidConfiguration(
                 "capture limits must be greater than zero",
@@ -492,10 +501,9 @@ impl CaptureStream {
     pub async fn shutdown(mut self) -> CaptureResult<()> {
         self.request_stop();
         drop(self.frames.take());
-        let completion = self
-            .completion
-            .take()
-            .expect("capture stream always owns completion before shutdown");
+        let Some(completion) = self.completion.take() else {
+            return Ok(());
+        };
         completion.wait().await
     }
 
@@ -831,6 +839,15 @@ mod tests {
         assert_send::<CaptureSource>();
         assert_send::<CaptureStream>();
         assert_stream::<CaptureStream>();
+    }
+
+    #[test]
+    fn capture_limits_constructor_rejects_zero_values() {
+        assert!(CaptureLimits::new(1280, 720, 30).is_ok());
+        assert!(matches!(
+            CaptureLimits::new(0, 720, 30),
+            Err(CaptureError::InvalidConfiguration(_))
+        ));
     }
 
     #[test]

@@ -25,7 +25,8 @@ use super::{
     payloads::{HelloPayload, SessionUpdatePayload},
 };
 use crate::gateways::{
-    Gateway, GatewayFrame, GatewayState, Handshake, Handshaking, Heartbeat, Websocket, expect_hello,
+    Gateway, GatewayFrame, GatewayState, Handshake, Handshaking, Heartbeat, Websocket,
+    expect_hello, with_timeout,
 };
 use crate::{DiscordRuntimeState, adapter::video::VideoControls, api::SNOWFLAKE};
 
@@ -35,6 +36,7 @@ use crate::{DiscordRuntimeState, adapter::video::VideoControls, api::SNOWFLAKE};
 /// warning threshold for its op-12 (Video) announcement — ~1.7s at 30fps —
 /// but never exposes video without Discord's SSRC→user mapping.
 const MAX_IDENTITY_WAIT_FRAMES: u8 = 50;
+const VOICE_GATEWAY_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Media {
     heartbeat_version: u8,
@@ -296,6 +298,7 @@ impl MediaConnection {
                     gateway.events.submit_video(VideoEvent::AddVideoStream {
                         id,
                         metadata,
+                        initial_frame: frame,
                         channel: sender,
                     });
                 }
@@ -329,6 +332,9 @@ impl MediaConnection {
                         gateway.events.submit_video(VideoEvent::AddVideoStream {
                             id,
                             metadata,
+                            initial_frame: frame
+                                .take()
+                                .expect("initial video frame remains available"),
                             channel: sender,
                         });
                     }
@@ -375,6 +381,22 @@ impl MediaConnection {
                 }
             };
         }
+    }
+
+    /// Retire every audio SSRC owned by `user_id`, including its playback
+    /// channel. Dropping a connected producer detaches it from the app mixer.
+    pub(crate) fn retire_user_audio(&self, user_id: SNOWFLAKE) -> Vec<Ssrc> {
+        let stale: Vec<_> = self
+            .ssrc_to_user_id
+            .iter()
+            .filter(|entry| *entry.value() == user_id)
+            .map(|entry| *entry.key())
+            .collect();
+        for ssrc in &stale {
+            self.ssrc_to_user_id.remove(ssrc);
+            self.ssrc_to_audio_channel.remove(ssrc);
+        }
+        stale
     }
 
     /// Retire every video SSRC owned by `user_id` — dropping its SSRC→user,
@@ -438,10 +460,13 @@ impl Gateway<Media, Handshaking> {
         user_id: u64,
         outbound_video_kind: Option<VideoBroadcastKind>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // TLS connect has no timeout and is a freeze suspect during VC entry.
         trace!("voice gateway: connecting websocket to {}", endpoint.wss);
-        let (voice_websocket, _) = connect_async(
-            "wss://".to_string() + &endpoint.wss + "/?v=" + &Self::VERSION.to_string(),
+        let (voice_websocket, _) = with_timeout(
+            connect_async(
+                "wss://".to_string() + &endpoint.wss + "/?v=" + &Self::VERSION.to_string(),
+            ),
+            VOICE_GATEWAY_OPERATION_TIMEOUT,
+            "Discord voice gateway connect",
         )
         .await?;
         trace!("voice gateway: websocket connected");
@@ -484,7 +509,13 @@ impl Gateway<Media, Handshaking> {
             "max_dave_protocol_version": DAVE_PROTOCOL_VERSION,
           }
         });
-        debug!("{identify:#?}");
+        debug!(
+            server_id,
+            channel_id,
+            user_id,
+            outbound_video = outbound_video_kind.is_some(),
+            "Prepared voice gateway Identify"
+        );
 
         Ok(Self {
             websocket,
@@ -503,8 +534,6 @@ impl Handshake for Gateway<Media, Handshaking> {
     type Output = Gateway<Media>;
 
     async fn handshake(self) -> Result<Self::Output, Box<dyn std::error::Error + Send + Sync>> {
-        // Identify send and Hello wait have no timeout; both are freeze suspects
-        // during VC entry.
         let Gateway {
             websocket, state, ..
         } = self;
@@ -514,12 +543,21 @@ impl Handshake for Gateway<Media, Handshaking> {
             dave_group_id,
             outbound_video_kind,
         } = state;
-        websocket.send(identify.into_message()).await?;
+        with_timeout(
+            websocket.send(identify.into_message()),
+            VOICE_GATEWAY_OPERATION_TIMEOUT,
+            "Discord voice gateway Identify",
+        )
+        .await?;
         trace!("voice gateway: identify sent, waiting for hello");
-        let hello: HelloPayload = expect_hello(
-            &websocket,
-            |opcode| matches!(opcode, VoiceOpcode::Hello),
-            "voice gateway",
+        let hello: HelloPayload = with_timeout(
+            expect_hello(
+                &websocket,
+                |opcode| matches!(opcode, VoiceOpcode::Hello),
+                "voice gateway",
+            ),
+            VOICE_GATEWAY_OPERATION_TIMEOUT,
+            "Discord voice gateway Hello",
         )
         .await?;
         debug!("{}", hello.pretty());
@@ -560,31 +598,62 @@ impl Gateway<Media> {
     }
 }
 
-impl Heartbeat for Gateway<Media> {
-    /// <https://docs.discord.food/topics/voice-connections#heartbeating>
-    async fn heartbeat(&self) -> Result<(), async_tungstenite::tungstenite::Error> {
-        self.state.heartbeat_timer.lock().await.wait().await;
+impl Gateway<Media> {
+    async fn send_heartbeat(
+        &self,
+        wait_for_deadline: bool,
+    ) -> Result<(), async_tungstenite::tungstenite::Error> {
+        let mut timer = self.state.heartbeat_timer.lock().await;
+        if wait_for_deadline {
+            timer.wait().await;
+        }
+        self.state
+            .heartbeat_acknowledged
+            .allow_dispatch_grace()
+            .await;
+        self.state.heartbeat_acknowledged.check_before_heartbeat()?;
         let sequence = self
             .state
             .last_sequence_number
             .get()
             .map(|sequence| sequence.load(Ordering::Relaxed));
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
         let payload = match self.heartbeat_version {
             ver if 7 < ver => json!({
                     "op": VoiceOpcode::Heartbeat as u8,
                     "d": {
-                        "t": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                        "t": nonce,
                         "seq_ack": sequence
                     },
             })
             .to_string(),
             _ => json!({
                     "op": VoiceOpcode::Heartbeat as u8,
-                    "d": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                    "d": nonce,
             })
             .to_string(),
         };
 
-        self.websocket.send(payload.into()).await
+        self.state.heartbeat_acknowledged.mark_sent();
+        if let Err(error) = self.websocket.send(payload.into()).await {
+            self.state.heartbeat_acknowledged.acknowledge();
+            return Err(error);
+        }
+        timer.mark_sent();
+        Ok(())
+    }
+}
+
+impl Heartbeat for Gateway<Media> {
+    /// <https://docs.discord.food/topics/voice-connections#heartbeating>
+    async fn heartbeat(&self) -> Result<(), async_tungstenite::tungstenite::Error> {
+        self.send_heartbeat(true).await
+    }
+
+    async fn heartbeat_now(&self) -> Result<(), async_tungstenite::tungstenite::Error> {
+        self.send_heartbeat(false).await
     }
 }
